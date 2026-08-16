@@ -45,7 +45,7 @@ fn main() {
             "initialize" => Ok(json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "pkg-mcp", "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": { "name": "mecha-graph-mcp", "version": env!("CARGO_PKG_VERSION") }
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),

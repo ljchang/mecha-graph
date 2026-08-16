@@ -28,29 +28,29 @@ pub fn register_vec_extension() {
     });
 }
 
-/// Default DB path: `~/pkg/graph.db` (spec §8.4), overridable via `PKG_DB`.
+/// Default DB path: `~/.mecha-graph/graph.db` (spec §8.4), overridable via `MECHA_GRAPH_DB`.
 pub fn default_db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("PKG_DB") {
+    if let Ok(p) = std::env::var("MECHA_GRAPH_DB") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join("pkg").join("graph.db")
+    PathBuf::from(home).join(".mecha-graph").join("graph.db")
 }
 
 /// Default keyfile location: `db.key` next to the database.
 pub fn keyfile_path(db_path: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("PKG_DB_KEYFILE") {
+    if let Ok(p) = std::env::var("MECHA_GRAPH_DB_KEYFILE") {
         return PathBuf::from(p);
     }
     db_path.with_file_name("db.key")
 }
 
 /// Resolve the SQLCipher key, if any:
-/// 1. `PKG_DB_KEY` env — used verbatim (passphrase, or `x'HEX'` raw form)
+/// 1. `MECHA_GRAPH_DB_KEY` env — used verbatim (passphrase, or `x'HEX'` raw form)
 /// 2. keyfile next to the DB — 64 hex chars, wrapped as a raw `x'…'` key
 /// 3. none → plaintext
 pub fn resolve_key(db_path: &Path) -> Option<String> {
-    if let Ok(key) = std::env::var("PKG_DB_KEY") {
+    if let Ok(key) = std::env::var("MECHA_GRAPH_DB_KEY") {
         if !key.is_empty() {
             return Some(key);
         }
@@ -67,7 +67,7 @@ pub fn resolve_key(db_path: &Path) -> Option<String> {
 
 /// Open (creating if necessary) the database at `path` and run migrations.
 ///
-/// Encryption (§10): if `PKG_DB_KEY` is set or a `db.key` file sits next to
+/// Encryption (§10): if `MECHA_GRAPH_DB_KEY` is set or a `db.key` file sits next to
 /// the DB, the database is opened with SQLCipher (raw-key form for keyfiles —
 /// no per-open KDF cost). `pkg encrypt` migrates an existing plaintext DB.
 /// The DuckDB analysis path (§8.4) can't read SQLCipher — use
@@ -96,7 +96,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     migrations::run_migrations(&conn).map_err(|e| {
         crate::error::Error::Other(format!(
             "cannot read {} ({e}) — if the DB is encrypted, the key is wrong or missing \
-             (PKG_DB_KEY / {})",
+             (MECHA_GRAPH_DB_KEY / {})",
             path.display(),
             keyfile_path(path).display()
         ))
@@ -336,7 +336,7 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
                 .into(),
         ));
     }
-    // Deliberately NOT keyfile_path(): a PKG_DB_KEYFILE env override points
+    // Deliberately NOT keyfile_path(): a MECHA_GRAPH_DB_KEYFILE env override points
     // at the LIVE key and must never name where a fork's fresh key lands.
     let dest_key = out.with_file_name("db.key");
     if dest_key.exists() {
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_roundtrip_and_snapshot() {
-        // NOTE: relies on PKG_DB_KEY / PKG_DB_KEYFILE not being set in the
+        // NOTE: relies on MECHA_GRAPH_DB_KEY / MECHA_GRAPH_DB_KEYFILE not being set in the
         // test environment; keyfile resolution is per-tempdir so tests don't
         // collide.
         let dir = tempfile::tempdir().unwrap();

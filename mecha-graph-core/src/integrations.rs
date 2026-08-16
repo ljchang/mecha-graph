@@ -1,6 +1,6 @@
 //! Integration registry: named, configured source instances.
 //!
-//! Config lives at `~/pkg/config.toml` (chmod 600), one `[sources.<name>]`
+//! Config lives at `~/.mecha-graph/config.toml` (chmod 600), one `[sources.<name>]`
 //! block per integration. Secrets (Slack token, secret ICS URL) live inline —
 //! this is a single-user local box; the file is the credential boundary.
 //!
@@ -47,11 +47,11 @@ pub struct Config {
 }
 
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("PKG_CONFIG") {
+    if let Ok(p) = std::env::var("MECHA_GRAPH_CONFIG") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join("pkg").join("config.toml")
+    PathBuf::from(home).join(".mecha-graph").join("config.toml")
 }
 
 pub fn load_config() -> Result<Config> {

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "pkg", about = "Personal knowledge graph", version)]
 struct Cli {
-    /// Database path (default: ~/pkg/graph.db, or $PKG_DB)
+    /// Database path (default: ~/.mecha-graph/graph.db, or $MECHA_GRAPH_DB)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
@@ -429,7 +429,7 @@ enum Command {
     },
     /// Weekly review: stalled projects, waiting-on, inbox, orphan goals (§8.4)
     Gtd,
-    /// Manage integrations (~/pkg/config.toml)
+    /// Manage integrations (~/.mecha-graph/config.toml)
     Source {
         #[command(subcommand)]
         action: SourceAction,
@@ -448,7 +448,7 @@ enum Command {
     /// Fork the DB: full encrypted copy under a FRESH key — the probing/eval
     /// test bed. Must land in its own directory (db.key is directory-scoped)
     Fork {
-        /// Destination, e.g. ~/pkg/forks/probe.db
+        /// Destination, e.g. ~/.mecha-graph/forks/probe.db
         #[arg(long)]
         out: PathBuf,
     },
@@ -663,7 +663,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let key = db::fork_db(&db_path, out)?;
             println!("fork:  {}", out.display());
             println!("key:   {}", key.display());
-            println!("use:   PKG_DB={} pkg …   (or --db)", out.display());
+            println!("use:   MECHA_GRAPH_DB={} pkg …   (or --db)", out.display());
             println!("note:  a fork is a full second copy of your life — deleting it");
             println!("       (db + key) when the experiment ends is a deliberate step.");
             return Ok(());

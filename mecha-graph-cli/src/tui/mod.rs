@@ -1021,7 +1021,7 @@ fn ghost_tag(conn: &Connection, partial: &str) -> Option<(String, String)> {
 }
 
 /// Suspend the TUI, open `$EDITOR` on the text, return the edited content
-/// (None on abort or no change). The temp file lives under ~/pkg (0600) and
+/// (None on abort or no change). The temp file lives under ~/.mecha-graph (0600) and
 /// is removed before returning.
 fn spawn_editor(initial: &str) -> mecha_graph_core::Result<Option<String>> {
     let editor = std::env::var("EDITOR")

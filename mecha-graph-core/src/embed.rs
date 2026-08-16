@@ -15,9 +15,9 @@ pub struct OllamaEmbedder {
 impl Default for OllamaEmbedder {
     fn default() -> Self {
         OllamaEmbedder {
-            base_url: std::env::var("PKG_OLLAMA_URL")
+            base_url: std::env::var("MECHA_GRAPH_OLLAMA_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
-            model: std::env::var("PKG_EMBED_MODEL")
+            model: std::env::var("MECHA_GRAPH_EMBED_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
         }
     }

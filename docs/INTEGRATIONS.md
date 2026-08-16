@@ -6,13 +6,13 @@ access to graph contents; auth only flows toward *fetching* your own data.
 
 ## The `mecha-graph source` CLI
 
-Integrations are managed through a registry at `~/pkg/config.toml` (chmod 600):
+Integrations are managed through a registry at `~/.mecha-graph/config.toml` (chmod 600):
 
 ```bash
 mecha-graph source list                                # table: kind, enabled, auth state, last ok, items
 mecha-graph source add ics --url '<secret-ical>' --me you@example.edu
 mecha-graph source add slack --token xoxp-…            # validated via auth.test before saving
-mecha-graph source add imessage --db ~/pkg/chat.db --self-handles '+16035550123'
+mecha-graph source add imessage --db ~/.mecha-graph/chat.db --self-handles '+16035550123'
 mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@example.edu
 mecha-graph source test [name]                         # auth/connectivity, no writes
 mecha-graph source sync [name] [--full]                # ingest all enabled (cursored, idempotent)
@@ -74,14 +74,14 @@ need zero config.
   - Google: Calendar → Settings → (your calendar) → *Integrate calendar* →
     **Secret address in iCal format**. If leaked: *Reset* on that same page.
   - Outlook: Settings → Calendar → *Shared calendars* → Publish → ICS link.
-- **Config**: put it in `~/pkg/nightly.env` (chmod 600, never in the repo):
+- **Config**: put it in `~/.mecha-graph/nightly.env` (chmod 600, never in the repo):
   ```
-  PKG_ICS_URL=https://calendar.google.com/calendar/ical/.../basic.ics
-  PKG_SELF_EMAIL=you@example.edu
+  MECHA_GRAPH_ICS_URL=https://calendar.google.com/calendar/ical/.../basic.ics
+  MECHA_GRAPH_SELF_EMAIL=you@example.edu
   ```
   (See docs/OPERATIONS.md — gitignored — for this machine's values.)
-  The nightly fetches it to `~/pkg/calendar.ics` and ingests. Manual
-  alternative: drop any exported `.ics` at `~/pkg/calendar.ics`, or run
+  The nightly fetches it to `~/.mecha-graph/calendar.ics` and ingests. Manual
+  alternative: drop any exported `.ics` at `~/.mecha-graph/calendar.ics`, or run
   `pkg ingest ics <file> --me <your-email>` directly.
 - Multiple calendars: add more `pkg ingest ics` lines in the nightly, or
   concatenate ICS files — events are idempotent by UID.
@@ -95,16 +95,16 @@ need zero config.
 
 ### Ollama (embeddings + Tier-7 extraction)
 - **Auth**: none — localhost service.
-- **Config**: `PKG_OLLAMA_URL` (default `http://127.0.0.1:11434`),
-  `PKG_EMBED_MODEL` (default `nomic-embed-text`), extraction model via
+- **Config**: `MECHA_GRAPH_OLLAMA_URL` (default `http://127.0.0.1:11434`),
+  `MECHA_GRAPH_EMBED_MODEL` (default `nomic-embed-text`), extraction model via
   `pkg extract --model` / `EXTRACT_MODEL` in `nightly.env`.
 - Models must be pulled once: `ollama pull nomic-embed-text` (done),
   `gemma4:e4b` + `qwen3.6:35b` (already present).
 
 ### Database & encryption
-- DB: `~/pkg/graph.db` (override `PKG_DB` or `--db`). Dir is chmod 700.
+- DB: `~/.mecha-graph/graph.db` (override `MECHA_GRAPH_DB` or `--db`). Dir is chmod 700.
 - **SQLCipher-encrypted at rest.** Key resolution on every open:
-  `PKG_DB_KEY` env → `PKG_DB_KEYFILE` → a local keyfile (0600) →
+  `MECHA_GRAPH_DB_KEY` env → `MECHA_GRAPH_DB_KEYFILE` → a local keyfile (0600) →
   plaintext; see docs/OPERATIONS.md (gitignored) for this machine's
   values. `pkg encrypt` migrated the store in place with count
   verification; `pkg decrypt --out <path>` writes an ephemeral plaintext
@@ -148,7 +148,7 @@ The design converged on **stream-first + encrypted archive**, which made a
 separate encrypted vault unnecessary (a gocryptfs vault was built, then
 removed before ever being used — see git history if it's ever wanted again):
 
-1. **SQLCipher on `~/pkg/graph.db` is the at-rest layer.** It holds the
+1. **SQLCipher on `~/.mecha-graph/graph.db` is the at-rest layer.** It holds the
    distilled graph AND the full raw archive (`episode_raw`) for every
    streamed/captured episode — the DB is the system of record.
 2. **No long-lived plaintext exists.** Bee streams from its API; calendar
@@ -212,7 +212,7 @@ design is queued — the schema already carries sync identities.
 ### DuckDB
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '~/pkg/graph.db' AS pkg (TYPE sqlite);
+ATTACH '~/.mecha-graph/graph.db' AS pkg (TYPE sqlite);
 ```
 Read-only analytics; never the system of record. (DuckDB wants a literal
 path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
@@ -236,10 +236,10 @@ path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
 
 ### SMS / iMessage
 - **No API — a file**: sync a *copy* of the Mac's `chat.db` over Tailscale:
-  `rsync mac:~/Library/Messages/chat.db ~/pkg/chat.db`
+  `rsync mac:~/Library/Messages/chat.db ~/.mecha-graph/chat.db`
   (grant the Mac-side terminal Full Disk Access once; add the rsync to the
   nightly or a Mac-side launchd job). The DB is only ever opened read-only.
-- `mecha-graph source add imessage --db ~/pkg/chat.db --self-handles '+1603…,you@x.com'`
+- `mecha-graph source add imessage --db ~/.mecha-graph/chat.db --self-handles '+1603…,you@x.com'`
 - Identity: `handle.id` (E.164 phone or email) → deterministic
   `node_identifier`. Phone-only contacts get named after the number until a
   richer source supplies the real name — the identifier makes the merge
@@ -258,7 +258,7 @@ path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
 
 ## Credential hygiene
 
-- `~/pkg/nightly.env` is chmod 600 and outside the repo; nothing secret is
+- `~/.mecha-graph/nightly.env` is chmod 600 and outside the repo; nothing secret is
   ever committed (`.gitignore` also excludes `*.db`).
 - The ICS URL and the Bee token are the only two credentials in the pipeline
   today; both are revocable at their source (Google reset / `bee logout`).

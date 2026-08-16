@@ -189,7 +189,7 @@ they have nothing to say:
 
 - **Future episodes are not interactions**: a scheduled meeting is not
   "last met". Rollups exclude `occurred_at > now`.
-- **At rest**: the DB is SQLCipher-encrypted (`~/pkg/db.key`, 0600);
+- **At rest**: the DB is SQLCipher-encrypted (`~/.mecha-graph/db.key`, 0600);
   plaintext source files are deleted after verified capture; analytical
   snapshots come from `pkg decrypt` and are transaction-pinned.
 - **Nightly** (03:30 cron): source sync → bee-facts two-way sync →
@@ -309,7 +309,7 @@ residue ("tried X, it failed") is procedural and does not.
 
 ### One graph, not many
 
-`PKG_DB`/`--db` makes a second graph free today, and it is still
+`MECHA_GRAPH_DB`/`--db` makes a second graph free today, and it is still
 usually the wrong move: a second graph **splits the entity space**.
 The same person in two graphs means schema drift, identity mismatch,
 no cross-graph query, and a reconciliation problem needing machinery

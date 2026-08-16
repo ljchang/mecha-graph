@@ -4,9 +4,9 @@
 # fights research work for the UMA box.
 #
 # Install:  crontab -e  →  30 3 * * *  $HOME/Github/personalized_knowledge_graph/scripts/nightly.sh
-# Optional config in ~/pkg/nightly.env:
-#   PKG_ICS_URL=https://calendar.google.com/.../basic.ics   # secret iCal address
-#   PKG_SELF_EMAIL=you@example.edu
+# Optional config in ~/.mecha-graph/nightly.env:
+#   MECHA_GRAPH_ICS_URL=https://calendar.google.com/.../basic.ics   # secret iCal address
+#   MECHA_GRAPH_SELF_EMAIL=you@example.edu
 #   EXTRACT_LIMIT=100        # Tier-7 episodes per night
 #   EXTRACT_MODEL=gemma4:e4b
 #   SUMMARIZE_LIMIT=30       # scope summaries refreshed per night (§4.5)
@@ -35,17 +35,17 @@ else
     BEE_BUS_MISSING=1
 fi
 
-PKG_DIR="$HOME/pkg"
+MECHA_GRAPH_DIR="$HOME/pkg"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKG="$REPO_DIR/target/release/mecha-graph"
-LOG_DIR="$PKG_DIR/logs"
+LOG_DIR="$MECHA_GRAPH_DIR/logs"
 LOG="$LOG_DIR/nightly-$(date +%Y%m%d).log"
 
 mkdir -p "$LOG_DIR"
 # Keep 30 days of logs.
 find "$LOG_DIR" -name 'nightly-*.log' -mtime +30 -delete 2>/dev/null
 
-[ -f "$PKG_DIR/nightly.env" ] && . "$PKG_DIR/nightly.env"
+[ -f "$MECHA_GRAPH_DIR/nightly.env" ] && . "$MECHA_GRAPH_DIR/nightly.env"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
@@ -63,7 +63,7 @@ once so the keyring is unlocked)."
 fi
 
 # ── Cheap ingestion (always) ─────────────────────────────────────────────────
-# All configured integrations (~/pkg/config.toml): bee (streamed), sessions,
+# All configured integrations (~/.mecha-graph/config.toml): bee (streamed), sessions,
 # calendar, slack, imessage, mbox — whatever is enabled.
 # Manage with `mecha-graph source list|add|test`.
 run "$PKG" source sync
@@ -157,7 +157,7 @@ else
 fi
 
 # ── Boot context + health ────────────────────────────────────────────────────
-run "$PKG" memory-md --out "$PKG_DIR/MEMORY.md"
+run "$PKG" memory-md --out "$MECHA_GRAPH_DIR/MEMORY.md"
 "$PKG" stats >>"$LOG" 2>&1
 
 # Surface §11.4 alert signals into the log header for quick scanning.

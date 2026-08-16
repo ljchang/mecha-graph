@@ -1,7 +1,7 @@
 //! SMS / iMessage source (§5.1, ★★★★☆): phone numbers are strong identity.
 //!
 //! Reads a **copy** of macOS `chat.db` (sync it over from the Mac, e.g.
-//! `rsync mac:~/Library/Messages/chat.db ~/pkg/chat.db` via Tailscale;
+//! `rsync mac:~/Library/Messages/chat.db ~/.mecha-graph/chat.db` via Tailscale;
 //! the Mac-side process needs Full Disk Access). Always opened read-only.
 //!
 //! Segmentation: one episode per (chat, day) — semantic units, not single

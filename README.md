@@ -49,7 +49,7 @@ beliefs, the context pack is the product.*
 ```bash
 cargo build --release
 
-# 1. Register integrations (config: ~/pkg/config.toml; bee + sessions
+# 1. Register integrations (config: ~/.mecha-graph/config.toml; bee + sessions
 #    self-register). See docs/INTEGRATIONS.md for auth details.
 mecha-graph source add bee --mode stream                  # API → DB, no plaintext files
 mecha-graph source add ics --url '<secret-ical-url>' --me you@example.edu
@@ -75,7 +75,7 @@ mecha-graph source sync
 eval/synthetic/run.sh                # or the self-contained synthetic eval
 ```
 
-DB lives at `~/pkg/graph.db` (override: `--db` or `PKG_DB`). Cheap ingestion is
+DB lives at `~/.mecha-graph/graph.db` (override: `--db` or `MECHA_GRAPH_DB`). Cheap ingestion is
 separated from expensive enrichment (§5.4): `ingest` is fast and idempotent —
 re-runs are no-ops via `UNIQUE(source, source_id)` + content hash; run `embed`
 in nightly batches when the GPU is free.
@@ -108,9 +108,9 @@ Disambiguation answers (`kind='alias'`) land immediately as permanent aliases
   the encrypted DB*, then the file is deleted after the archive row is
   verified. "Raw stays raw" (§2) is satisfied by the archive — `pkg raw
   <uid>` shows it, and re-enrichment/re-extraction read from it.
-- **SQLCipher at rest** (§10): the raw key lives in `~/pkg/db.key` (0600),
-  picked up automatically by every `pkg`/`pkg-mcp` open (`PKG_DB_KEY`/
-  `PKG_DB_KEYFILE` override). Back the key up separately (password manager).
+- **SQLCipher at rest** (§10): the raw key lives in `~/.mecha-graph/db.key` (0600),
+  picked up automatically by every `pkg`/`pkg-mcp` open (`MECHA_GRAPH_DB_KEY`/
+  `MECHA_GRAPH_DB_KEYFILE` override). Back the key up separately (password manager).
   DuckDB can't read SQLCipher, so analytics use an ephemeral snapshot:
   `pkg decrypt --out /tmp/analytics.db` (chmod 600) and attach that instead.
 - **FTS5 arm first** (open decision §13): tantivy can be swapped in behind the
