@@ -1,0 +1,18 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+/bee-sync/
+
+# Python bytecode from scripts/
+__pycache__/
+*.pyc
+
+# secrets and local data — never track these even if they wander in
+*.key
+*.env
+.env
+config.toml
+docs/OPERATIONS.md
+/.claude/

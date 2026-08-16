@@ -1,0 +1,27 @@
+# Synthetic gold set — every query answerable from eval/synthetic/corpus/ alone.
+# Same format as the eval harness expects; expect_contains keys on strings that
+# exist in exactly one corpus item, so ranking is graded without brittle ids.
+{"query": "what did Nadia's pilot study find?", "job": "memory", "expect_contains": "r=0.82", "note": "reliability figure lives only in syn-0001"}
+{"query": "what was the dropout rate in the pilot?", "job": "memory", "expect_contains": "under 10 percent"}
+{"query": "what did I decide about the fall protocol?", "job": "memory", "expect_contains": "preregister"}
+{"query": "what book did Iris recommend?", "job": "memory", "expect_contains": "The Alignment Problem"}
+{"query": "what is new in sigtools 0.9?", "job": "memory", "expect_contains": "alignment module"}
+{"query": "what did Vera flag in the licensing agreement?", "job": "memory", "expect_contains": "indemnification"}
+{"query": "what notice period did the lawyer recommend?", "job": "memory", "expect_contains": "60 days"}
+{"query": "when is Nadia's defense?", "job": "memory", "expect_contains": "September 18"}
+{"query": "where is Nadia's defense happening?", "job": "memory", "expect_contains": "Alder Hall 108"}
+{"query": "what happened at the Sigma Lab retreat?", "job": "memory", "expect_contains": "rooftop"}
+{"query": "what is the goal of the atlas project?", "job": "memory", "expect_contains": "normative map"}
+{"query": "when must the harmonization pipeline be frozen?", "job": "memory", "expect_contains": "September"}
+{"query": "what grant did Iris propose writing together?", "job": "memory", "expect_contains": "tools grant"}
+{"query": "when is the tools grant deadline?", "job": "memory", "expect_contains": "October 15"}
+{"query": "what am I waiting on from June?", "job": "tasks", "expect_contains": "perception module"}
+{"query": "when did June promise the Hypercourse draft?", "job": "tasks", "expect_contains": "August 21", "note": "the RE-commitment, not the original July 6 promise"}
+{"query": "what do I owe Vera before signing?", "job": "tasks", "expect_contains": "section 4"}
+{"query": "what should I pull into the pipeline next sprint?", "job": "tasks", "expect_contains": "alignment module"}
+{"query": "who reviews my contracts?", "job": "insight", "expect_contains": "Vera Holt"}
+{"query": "who at Westfield do I collaborate with?", "job": "insight", "expect_contains": "Iris"}
+{"query": "whose dissertation defense is coming up?", "job": "insight", "expect_contains": "Nadia", "note": "derivable: 'student' was not — no corpus item states Nadia's role, and a gold row whose answer the corpus cannot yield measures nothing"}
+{"query": "who organizes lab retreat logistics?", "job": "insight", "expect_contains": "Casey"}
+{"query": "what recurring meeting do I have with Priya?", "job": "insight", "expect_contains": "atlas"}
+{"query": "why did June's draft slip?", "job": "memory", "expect_contains": "eye-tracking figures"}

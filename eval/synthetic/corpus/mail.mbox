@@ -1,0 +1,174 @@
+From nadia@example.edu Mon Jun  1 14:02:11 2026
+From: Nadia Petrova <nadia@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: pilot study results
+Date: Mon, 1 Jun 2026 14:02:11 -0400
+Message-ID: <syn-0001@example.edu>
+
+Hi Ada,
+
+The pilot is done. Test-retest reliability came out at r=0.82 with n=24
+participants, and the dropout rate stayed under 10 percent. I think we
+can commit to the full protocol for the fall cohort.
+
+Nadia
+
+From ada.lovelace@example.edu Mon Jun  1 16:20:04 2026
+From: Ada Lovelace <ada.lovelace@example.edu>
+To: Nadia Petrova <nadia@example.edu>
+Subject: Re: pilot study results
+Date: Mon, 1 Jun 2026 16:20:04 -0400
+Message-ID: <syn-0002@example.edu>
+
+r=0.82 is better than I hoped. Let's preregister the full protocol
+before the fall cohort starts — draft the analysis plan and I'll review
+it Thursday.
+
+Ada
+
+From iris.calder@example.com Wed Jun 10 09:15:33 2026
+From: Iris Calder <iris.calder@example.com>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: sigtools 0.9 release and a book
+Date: Wed, 10 Jun 2026 09:15:33 -0700
+Message-ID: <syn-0003@example.com>
+
+Ada,
+
+sigtools 0.9 is tagged — the new alignment module is in, and the
+Westfield cluster benchmarks look clean. Separately: I finally read
+"The Alignment Problem" and you would like it more than you expect.
+Recommended.
+
+Iris
+
+From ada.lovelace@example.edu Wed Jun 10 12:41:00 2026
+From: Ada Lovelace <ada.lovelace@example.edu>
+To: Iris Calder <iris.calder@example.com>
+Subject: Re: sigtools 0.9 release and a book
+Date: Wed, 10 Jun 2026 12:41:00 -0400
+Message-ID: <syn-0004@example.edu>
+
+Congratulations on 0.9. I'll pull the alignment module into our
+pipeline next sprint. Adding the book to my list.
+
+Ada
+
+From june.chen@example.edu Mon Jun 22 11:05:42 2026
+From: June Chen <june.chen@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: Hypercourse module draft
+Date: Mon, 22 Jun 2026 11:05:42 -0400
+Message-ID: <syn-0005@example.edu>
+
+Ada,
+
+I owe you the perception module draft for Hypercourse. It's about half
+written — I'll have the full draft to you by July 6, promise. The demo
+notebooks are already done.
+
+June
+
+From vera@holt-legal.example.com Tue Jul  7 10:30:19 2026
+From: Vera Holt <vera@holt-legal.example.com>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: licensing agreement review
+Date: Tue, 7 Jul 2026 10:30:19 -0400
+Message-ID: <syn-0006@holt-legal.example.com>
+
+Dear Ada,
+
+I've reviewed the sigtools licensing agreement. Two clauses need
+attention before you sign: the indemnification clause in section 4 is
+broader than standard, and the termination notice period should be 60
+days rather than 30. Redline attached.
+
+Vera Holt
+Holt Legal
+
+From ada.lovelace@example.edu Tue Jul  7 15:12:55 2026
+From: Ada Lovelace <ada.lovelace@example.edu>
+To: Vera Holt <vera@holt-legal.example.com>
+Subject: Re: licensing agreement review
+Date: Tue, 7 Jul 2026 15:12:55 -0400
+Message-ID: <syn-0007@example.edu>
+
+Thank you Vera — I'll push back on section 4 and ask for the 60-day
+notice period. Will send the counterparty your redline this week.
+
+Ada
+
+From priya@example.edu Thu Jul 16 13:44:07 2026
+From: Priya Raman <priya@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: atlas project kickoff
+Date: Thu, 16 Jul 2026 13:44:07 -0400
+Message-ID: <syn-0008@example.edu>
+
+Hi Ada,
+
+Kicking off the atlas project formally: the goal for phase one is a
+normative map from 400 sessions of the public dataset, with the
+harmonization pipeline frozen by September. Can we book a recurring
+Tuesday slot?
+
+Priya
+
+From nadia@example.edu Mon Jul 27 09:58:26 2026
+From: Nadia Petrova <nadia@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: defense scheduled
+Date: Mon, 27 Jul 2026 09:58:26 -0400
+Message-ID: <syn-0009@example.edu>
+
+Ada,
+
+It's official — my defense is scheduled for September 18 at 2pm in
+Alder Hall 108. Committee confirmed. Thank you for everything.
+
+Nadia
+
+From casey.bloom@example.edu Fri Jul 31 17:21:48 2026
+From: Casey Bloom <casey.bloom@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: retreat logistics
+Date: Fri, 31 Jul 2026 17:21:48 -0400
+Message-ID: <syn-0010@example.edu>
+
+Ada,
+
+Sigma Lab retreat logistics are set: August 7, talks in the morning,
+poster session after lunch, and dinner on the Juniper Hall rooftop at
+6pm. I'll circulate the schedule Monday.
+
+Casey
+
+From june.chen@example.edu Mon Aug 10 08:17:39 2026
+From: June Chen <june.chen@example.edu>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: Re: Hypercourse module draft
+Date: Mon, 10 Aug 2026 08:17:39 -0400
+Message-ID: <syn-0011@example.edu>
+
+Ada,
+
+Apologies — the perception module draft slipped. New commitment:
+you'll have it by August 21. The delay was the eye-tracking figures;
+they're rendering now.
+
+June
+
+From iris.calder@example.com Wed Aug 12 19:03:12 2026
+From: Iris Calder <iris.calder@example.com>
+To: Ada Lovelace <ada.lovelace@example.edu>
+Subject: joint grant idea
+Date: Wed, 12 Aug 2026 19:03:12 -0700
+Message-ID: <syn-0012@example.com>
+
+Ada,
+
+What if we wrote the tools grant together — Westfield covers the
+infrastructure aim, Sigma Lab covers the validation aim? Deadline is
+October 15. I can draft the specific aims page next week if you're in.
+
+Iris

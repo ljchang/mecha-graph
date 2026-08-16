@@ -1,0 +1,23 @@
+[package]
+name = "pkg-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Personal knowledge graph core: ingest, enrich, resolve+link, retrieve. Knows nothing about any agent (spec §2)."
+
+[dependencies]
+rusqlite.workspace = true
+sqlite-vec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+sha2.workspace = true
+toml = "0.8"
+mailparse = "0.15"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

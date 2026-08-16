@@ -1,0 +1,24 @@
+[workspace]
+members = ["pkg-core", "pkg-cli", "pkg-mcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Same stack as FlowMail's db layer (spec §3) so the two stay mergeable.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "functions"] }
+sqlite-vec = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"

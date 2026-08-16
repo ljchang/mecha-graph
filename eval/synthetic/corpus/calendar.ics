@@ -1,0 +1,65 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example University//Synthetic Eval Corpus//EN
+BEGIN:VEVENT
+UID:syn-ev-0001@example.edu
+DTSTART:20260601T190000Z
+DTEND:20260601T200000Z
+SUMMARY:Pilot debrief with Nadia
+ORGANIZER;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+ATTENDEE;CN=Nadia Petrova:mailto:nadia@example.edu
+LOCATION:Alder Hall 254
+DESCRIPTION:Walk through pilot reliability numbers and decide on the fall protocol.
+END:VEVENT
+BEGIN:VEVENT
+UID:syn-ev-0002@example.edu
+DTSTART:20260714T170000Z
+DTEND:20260714T173000Z
+SUMMARY:atlas project weekly
+ORGANIZER;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+ATTENDEE;CN=Priya Raman:mailto:priya@example.edu
+RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=12
+LOCATION:Alder Hall 254
+DESCRIPTION:Recurring atlas project sync — harmonization pipeline status.
+END:VEVENT
+BEGIN:VEVENT
+UID:syn-ev-0003@example.edu
+DTSTART:20260807T130000Z
+DTEND:20260808T000000Z
+SUMMARY:Sigma Lab retreat
+ORGANIZER;CN=Casey Bloom:mailto:casey.bloom@example.edu
+ATTENDEE;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+ATTENDEE;CN=Nadia Petrova:mailto:nadia@example.edu
+ATTENDEE;CN=June Chen:mailto:june.chen@example.edu
+LOCATION:Juniper Hall
+DESCRIPTION:Talks in the morning\, posters after lunch\, rooftop dinner at 6pm.
+END:VEVENT
+BEGIN:VEVENT
+UID:syn-ev-0004@example.edu
+DTSTART:20260918T180000Z
+DTEND:20260918T200000Z
+SUMMARY:Nadia Petrova dissertation defense
+ORGANIZER;CN=Nadia Petrova:mailto:nadia@example.edu
+ATTENDEE;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+LOCATION:Alder Hall 108
+DESCRIPTION:Defense followed by reception.
+END:VEVENT
+BEGIN:VEVENT
+UID:syn-ev-0005@example.edu
+DTSTART:20260903T150000Z
+DTEND:20260903T160000Z
+SUMMARY:Call with Vera Holt re: licensing counterparty
+ORGANIZER;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+ATTENDEE;CN=Vera Holt:mailto:vera@holt-legal.example.com
+LOCATION:Zoom
+DESCRIPTION:Section 4 indemnification pushback and the 60-day notice ask.
+END:VEVENT
+BEGIN:VEVENT
+UID:syn-ev-0006@example.edu
+DTSTART:20261015T160000Z
+DTEND:20261015T170000Z
+SUMMARY:Tools grant deadline
+ORGANIZER;CN=Ada Lovelace:mailto:ada.lovelace@example.edu
+DESCRIPTION:Joint Westfield / Sigma Lab tools grant due.
+END:VEVENT
+END:VCALENDAR
