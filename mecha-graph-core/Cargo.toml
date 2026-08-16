@@ -3,7 +3,8 @@ name = "mecha-graph-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Personal knowledge graph core: ingest, enrich, resolve+link, retrieve. Knows nothing about any agent (spec §2)."
+repository.workspace = true
+description = "Personal knowledge graph core: ingest, enrich, resolve and link, retrieve. Knows nothing about any agent."
 
 [dependencies]
 rusqlite.workspace = true

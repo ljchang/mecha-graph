@@ -24,7 +24,7 @@ export MECHA_GRAPH_CONFIG="$tmp/config.toml"
 # design, so secrecy would protect nothing.
 export MECHA_GRAPH_DB_KEY="synthetic-eval"
 
-cargo build --release -p mecha-graph-cli >/dev/null
+cargo build --release -p mecha-graph >/dev/null
 bin="./target/release/mecha-graph"
 
 # `add` registers; `sync` ingests. Both are needed — an added source with no

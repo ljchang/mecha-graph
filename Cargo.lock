@@ -800,7 +800,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mecha-graph-cli"
+name = "mecha-graph"
 version = "0.1.0"
 dependencies = [
  "clap",

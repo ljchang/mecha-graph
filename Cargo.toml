@@ -1,11 +1,12 @@
 [workspace]
-members = ["mecha-graph-core", "mecha-graph-cli", "mecha-graph-mcp"]
+members = ["mecha-graph-core", "mecha-graph", "mecha-graph-mcp"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/ljchang/mecha-graph"
 
 [workspace.dependencies]
 # Same stack as FlowMail's db layer (spec §3) so the two stay mergeable.
