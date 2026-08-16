@@ -51,27 +51,27 @@ cargo build --release
 
 # 1. Register integrations (config: ~/pkg/config.toml; bee + sessions
 #    self-register). See docs/INTEGRATIONS.md for auth details.
-pkg source add bee --mode stream                  # API → DB, no plaintext files
-pkg source add ics --url '<secret-ical-url>' --me you@example.edu
-pkg source add slack --token xoxp-…
-pkg source add mbox --path ~/Takeout/mail.mbox --me you@x.edu --retention capture_delete
-pkg source list          # kind, enabled, auth state, last ok, items
+mecha-graph source add bee --mode stream                  # API → DB, no plaintext files
+mecha-graph source add ics --url '<secret-ical-url>' --me you@example.edu
+mecha-graph source add slack --token xoxp-…
+mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@x.edu --retention capture_delete
+mecha-graph source list          # kind, enabled, auth state, last ok, items
 
 # 2. Ingest everything enabled (cursored, idempotent):
-pkg source sync
+mecha-graph source sync
 
 # 3. Re-run linkers over already-ingested episodes after new aliases land:
-./target/release/pkg link --auto
+./target/release/mecha-graph link --auto
 
 # 4. Embeddings (ollama + nomic-embed-text, 768d):
-./target/release/pkg embed
+./target/release/mecha-graph embed
 
 # Query — returns a context pack (JSON):
-./target/release/pkg query "what did we discuss about the pilot data?"
-./target/release/pkg query "when did I last meet with Nadia?"
-./target/release/pkg entity "Nadia"
-./target/release/pkg stats
-./target/release/pkg eval            # against your graph and gold set
+./target/release/mecha-graph query "what did we discuss about the pilot data?"
+./target/release/mecha-graph query "when did I last meet with Nadia?"
+./target/release/mecha-graph entity "Nadia"
+./target/release/mecha-graph stats
+./target/release/mecha-graph eval            # against your graph and gold set
 eval/synthetic/run.sh                # or the self-contained synthetic eval
 ```
 
@@ -85,17 +85,17 @@ in nightly batches when the GPU is free.
 Claude Code:
 
 ```bash
-claude mcp add pkg -- ~/Github/personalized_knowledge_graph/target/release/pkg-mcp
+claude mcp add pkg -- ~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
 ```
 
 Hermes (or any MCP client) — stdio transport:
 
 ```json
-{ "mcpServers": { "pkg": { "command": "~/Github/personalized_knowledge_graph/target/release/pkg-mcp" } } }
+{ "mcpServers": { "pkg": { "command": "~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp" } } }
 ```
 
 Agent writes go through `kg_upsert` → `fact_candidate` staging with
-`source='agent:<harness>'`; review with `pkg review`, `pkg accept/reject`.
+`source='agent:<harness>'`; review with `mecha-graph review`, `mecha-graph accept/reject`.
 Disambiguation answers (`kind='alias'`) land immediately as permanent aliases
 (§11.2 — resolve at the point of use).
 
@@ -126,7 +126,7 @@ Disambiguation answers (`kind='alias'`) land immediately as permanent aliases
 ## Privacy (§10)
 
 `public < personal < private < secret`. Default retrieval excludes `private+`.
-`pkg redact --episode <uid>` is the true-delete path: purges the episode, its
+`mecha-graph redact --episode <uid>` is the true-delete path: purges the episode, its
 raw archive, mentions, embeddings, FTS rows, enrichment, and derived facts.
 
 ## Analytics (§8.4)

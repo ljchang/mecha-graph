@@ -36,7 +36,7 @@ channel-day, one GitHub repo-day, one agent session, one Reflect note.
 - `sensitivity` tiers gate retrieval: `private` episodes (all Bee
   transcripts) are excluded from default search; callers opt in.
 - Episodes are **never edited or deleted**. The two exceptions are
-  deliberate: `pkg redact` (true delete, §10) and nothing else. When a fact
+  deliberate: `mecha-graph redact` (true delete, §10) and nothing else. When a fact
   turns out wrong you supersede the fact — the episode that spawned it
   stays, because it's the answer to "where did we learn this?"
 - For file-based sources the full original is archived to `episode_raw`

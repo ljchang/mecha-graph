@@ -149,7 +149,7 @@ everything else. (b) **query_log + retrieval_touch + event_log** —
 one migration; the demand signal every ranking rule assumes and the
 measurement substrate ("corrections per 100 retrievals falls" is the
 north star). (c) **`pkg fork`** — encrypted copy, fresh key; the test
-bed. (d) **precheck tightening + `pkg review --clusters` + D1
+bed. (d) **precheck tightening + `mecha-graph review --clusters` + D1
 auto-lanes** — drains the backlog in a handful of interactions and
 flips the autonomy posture.
 

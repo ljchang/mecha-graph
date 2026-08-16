@@ -24,16 +24,16 @@ export PKG_CONFIG="$tmp/config.toml"
 # design, so secrecy would protect nothing.
 export PKG_DB_KEY="synthetic-eval"
 
-cargo build --release -p pkg-cli >/dev/null
-pkg="./target/release/pkg"
+cargo build --release -p mecha-graph-cli >/dev/null
+bin="./target/release/mecha-graph"
 
 # `add` registers; `sync` ingests. Both are needed — an added source with no
 # sync is an empty graph, and every query misses.
-"$pkg" source add mbox --path eval/synthetic/corpus/mail.mbox \
+"$bin" source add mbox --path eval/synthetic/corpus/mail.mbox \
     --me ada.lovelace@example.edu
-"$pkg" source add ics --path eval/synthetic/corpus/calendar.ics \
+"$bin" source add ics --path eval/synthetic/corpus/calendar.ics \
     --me ada.lovelace@example.edu
-"$pkg" source sync mbox
-"$pkg" source sync ics
+"$bin" source sync mbox
+"$bin" source sync ics
 
-"$pkg" eval --gold eval/synthetic/gold.jsonl
+"$bin" eval --gold eval/synthetic/gold.jsonl

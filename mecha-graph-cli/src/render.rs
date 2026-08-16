@@ -2,8 +2,8 @@
 //! by default the choice is automatic (TTY → human, pipe → JSON), with
 //! --text / --json forcing either way. MCP always speaks JSON envelopes.
 
-use pkg_core::router::ContextPack;
-use pkg_core::stats::HealthStats;
+use mecha_graph_core::router::ContextPack;
+use mecha_graph_core::stats::HealthStats;
 
 /// ANSI helpers — only applied when writing to a TTY.
 pub struct Style {

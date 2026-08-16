@@ -37,7 +37,7 @@ fi
 
 PKG_DIR="$HOME/pkg"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PKG="$REPO_DIR/target/release/pkg"
+PKG="$REPO_DIR/target/release/mecha-graph"
 LOG_DIR="$PKG_DIR/logs"
 LOG="$LOG_DIR/nightly-$(date +%Y%m%d).log"
 
@@ -65,7 +65,7 @@ fi
 # ── Cheap ingestion (always) ─────────────────────────────────────────────────
 # All configured integrations (~/pkg/config.toml): bee (streamed), sessions,
 # calendar, slack, imessage, mbox — whatever is enabled.
-# Manage with `pkg source list|add|test`.
+# Manage with `mecha-graph source list|add|test`.
 run "$PKG" source sync
 
 # ── Linkers (cheap, CPU-only) ────────────────────────────────────────────────
@@ -93,7 +93,7 @@ run "$PKG" invalidate-phantoms
 # Decay sweep (§11.5): re-derive co-occurrence beliefs against the mentions
 # the linkers just rebuilt, close the collapsed ones (valid time only) and
 # refresh drifted numbers. Capped per run, so a backlog drains gradually and
-# visibly via `pkg stats`. MUST follow link: it reads the fresh mention table.
+# visibly via `mecha-graph stats`. MUST follow link: it reads the fresh mention table.
 run "$PKG" decay
 
 # Bee suggested-facts two-way sync: pull unconfirmed → review queue, push

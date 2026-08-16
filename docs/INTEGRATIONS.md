@@ -4,19 +4,19 @@ Every source and consumer, what it needs, and where credentials live.
 Principle (spec §10): local-first — no credential here grants a cloud service
 access to graph contents; auth only flows toward *fetching* your own data.
 
-## The `pkg source` CLI
+## The `mecha-graph source` CLI
 
 Integrations are managed through a registry at `~/pkg/config.toml` (chmod 600):
 
 ```bash
-pkg source list                                # table: kind, enabled, auth state, last ok, items
-pkg source add ics --url '<secret-ical>' --me you@example.edu
-pkg source add slack --token xoxp-…            # validated via auth.test before saving
-pkg source add imessage --db ~/pkg/chat.db --self-handles '+16035550123'
-pkg source add mbox --path ~/Takeout/mail.mbox --me you@example.edu
-pkg source test [name]                         # auth/connectivity, no writes
-pkg source sync [name] [--full]                # ingest all enabled (cursored, idempotent)
-pkg source enable|disable|remove <name>
+mecha-graph source list                                # table: kind, enabled, auth state, last ok, items
+mecha-graph source add ics --url '<secret-ical>' --me you@example.edu
+mecha-graph source add slack --token xoxp-…            # validated via auth.test before saving
+mecha-graph source add imessage --db ~/pkg/chat.db --self-handles '+16035550123'
+mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@example.edu
+mecha-graph source test [name]                         # auth/connectivity, no writes
+mecha-graph source sync [name] [--full]                # ingest all enabled (cursored, idempotent)
+mecha-graph source enable|disable|remove <name>
 ```
 
 `add` runs the connectivity test before saving (`--no-test` to skip);
@@ -28,12 +28,12 @@ need zero config.
 | Integration | Direction | Auth | Status |
 |---|---|---|---|
 | Bee | source | `bee login` (token in Bee CLI config) | ✅ authenticated, synced nightly |
-| Calendar (ICS) | source | secret iCal URL (capability URL) | ⚠️ one `pkg source add ics --url …` away |
+| Calendar (ICS) | source | secret iCal URL (capability URL) | ⚠️ one `mecha-graph source add ics --url …` away |
 | Hermes sessions | source | none (local file, read-only) | ✅ |
 | Claude Code sessions | source | none (local files) | ✅ |
-| Slack | source | user token `xoxp-…` (or bot `xoxb-…`) | ✅ built — `pkg source add slack --token …` |
-| SMS / iMessage | source | synced copy of chat.db (Mac: Full Disk Access) | ✅ built — `pkg source add imessage --db …` |
-| Email (mbox) | source | none — mbox export (Gmail Takeout etc.) | ✅ built — `pkg source add mbox --path …` |
+| Slack | source | user token `xoxp-…` (or bot `xoxb-…`) | ✅ built — `mecha-graph source add slack --token …` |
+| SMS / iMessage | source | synced copy of chat.db (Mac: Full Disk Access) | ✅ built — `mecha-graph source add imessage --db …` |
+| Email (mbox) | source | none — mbox export (Gmail Takeout etc.) | ✅ built — `mecha-graph source add mbox --path …` |
 | Ollama (embed + extract) | infra | none (localhost) | ✅ |
 | Hermes (agent) | consumer | none (local stdio MCP) | ✅ wired |
 | Claude Code (agent) | consumer | none (local stdio MCP) | ✅ wired |
@@ -57,7 +57,7 @@ need zero config.
   ingestion until 2026-08-13. Second time cron's thinner environment has
   hit this source — the first was `PATH` missing `~/.local/bin`. **Any
   source shelling out to a user-installed CLI needs its environment
-  reconstructed explicitly**, and `pkg stats` staleness is what catches
+  reconstructed explicitly**, and `mecha-graph stats` staleness is what catches
   it (that alert is the reason this was found).
 - **Config**: `mode = "stream"` (current setup) — conversations + dailies are
   pulled straight from the Bee API (`bee … --json`) into the encrypted DB;
@@ -117,7 +117,7 @@ need zero config.
 **Decision (2026-08-02, revised): stream where possible; capture-then-delete
 where files are unavoidable. Plaintext residue trends to zero.**
 
-Three retention modes per source (`--retention` on `pkg source add`, or
+Three retention modes per source (`--retention` on `mecha-graph source add`, or
 `retention = "…"` in config.toml):
 
 | Mode | What happens | When |
@@ -139,7 +139,7 @@ Three retention modes per source (`--retention` on `pkg source add`, or
 **Re-processing after deletion is guaranteed**: enrichment, embedding, and
 Tier-7 extraction all read from the DB (`episode_raw` fallback where needed),
 so prompt/schema improvements re-run against the archive — `pkg raw <uid>`
-shows exactly what's preserved. `pkg redact` deletes the archive row along
+shows exactly what's preserved. `mecha-graph redact` deletes the archive row along
 with everything else.
 
 ### At-rest architecture (final, 2026-08-02)
@@ -176,7 +176,7 @@ surface; access = ability to execute the binary as you.
 - **Hermes** — wired in `~/.hermes/config.yaml` under `mcp_servers.pkg`
   (backup kept alongside). Restart Hermes to pick it up.
 - **Claude Code** — wired at user scope:
-  `claude mcp add --scope user pkg -- ~/Github/personalized_knowledge_graph/target/release/pkg-mcp`.
+  `claude mcp add --scope user pkg -- ~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp`.
   Verify with `claude mcp list`; remove with `claude mcp remove pkg`.
 - Any other MCP client: point it at the same binary, stdio transport.
 - After `cargo build --release`, running servers keep the old binary until
@@ -192,12 +192,12 @@ docs/OPERATIONS.md (gitignored) for this machine's values:
 # on the laptop — verify the transport first:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | \
   ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/Github/personalized_knowledge_graph/target/release/pkg-mcp
+  $HOME/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
 # expect a single JSON line back ({"id":1,...serverInfo...})
 
 # then register it:
 claude mcp add --scope user pkg -- ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/Github/personalized_knowledge_graph/target/release/pkg-mcp
+  $HOME/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
 ```
 
 Notes: `-T` + `LogLevel=ERROR` keep stdio clean (any motd/banner corrupts
@@ -206,7 +206,7 @@ JSON-RPC); use the absolute binary path (non-login shell, no PATH); writes
 queue, episode writes (kind='episode') land as source-owned evidence whose
 extracted facts stage on the next nightly.
 Multiple simultaneous clients are fine (SQLite WAL + busy_timeout).
-If full offline replicas are ever wanted instead, the uid-based `pkg sync`
+If full offline replicas are ever wanted instead, the uid-based `mecha-graph sync`
 design is queued — the schema already carries sync identities.
 
 ### DuckDB
@@ -226,7 +226,7 @@ path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
   `mpim:read`, `users:read`, `users:read.email` → *Install to Workspace* →
   copy the `xoxp-…` token. (A bot `xoxb-…` token also works but can't see
   your DMs or channels it isn't invited to.)
-- `pkg source add slack --token xoxp-…` — validated via `auth.test` first.
+- `mecha-graph source add slack --token xoxp-…` — validated via `auth.test` first.
 - What it does: `users.list` seeds every workspace member as a person with
   `slack_uid` **and** email identifiers (merges with calendar/email people
   deterministically); messages land one episode per channel-day. DMs are
@@ -239,7 +239,7 @@ path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
   `rsync mac:~/Library/Messages/chat.db ~/pkg/chat.db`
   (grant the Mac-side terminal Full Disk Access once; add the rsync to the
   nightly or a Mac-side launchd job). The DB is only ever opened read-only.
-- `pkg source add imessage --db ~/pkg/chat.db --self-handles '+1603…,you@x.com'`
+- `mecha-graph source add imessage --db ~/pkg/chat.db --self-handles '+1603…,you@x.com'`
 - Identity: `handle.id` (E.164 phone or email) → deterministic
   `node_identifier`. Phone-only contacts get named after the number until a
   richer source supplies the real name — the identifier makes the merge
@@ -250,7 +250,7 @@ path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
 ### Email (mbox)
 - **No credentials**: point at any mbox export — Gmail Takeout
   (takeout.google.com → Mail), Apple Mail export, mutt archives.
-- `pkg source add mbox --path ~/Takeout/mail.mbox --me you@example.edu`
+- `mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@example.edu`
 - One episode per thread (References/In-Reply-To chains); bulk mail
   (List-Unsubscribe / List-Id / Precedence: bulk) is dropped at ingest (§5.3).
 - Live sync remains FlowMail's job on macOS (it holds the Gmail/Outlook

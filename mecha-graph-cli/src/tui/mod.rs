@@ -11,8 +11,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use pkg_core::rusqlite::Connection;
-use pkg_core::{episode, fact, graph, gtd, precheck, rollup, router, stats};
+use mecha_graph_core::rusqlite::Connection;
+use mecha_graph_core::{episode, fact, graph, gtd, precheck, rollup, router, stats};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -370,7 +370,7 @@ struct GtdState {
 
 struct App {
     conn: Connection,
-    embedder: Option<pkg_core::embed::OllamaEmbedder>,
+    embedder: Option<mecha_graph_core::embed::OllamaEmbedder>,
     screen: Screen,
     review: ReviewState,
     merge: MergeState,
@@ -394,8 +394,8 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
     ]
 }
 
-pub fn run(conn: Connection) -> pkg_core::Result<()> {
-    let embedder = pkg_core::embed::OllamaEmbedder::default();
+pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
+    let embedder = mecha_graph_core::embed::OllamaEmbedder::default();
     let embedder = embedder.available().then_some(embedder);
 
     let mut app = App {
@@ -483,8 +483,8 @@ pub fn run(conn: Connection) -> pkg_core::Result<()> {
     result
 }
 
-fn io_err(e: std::io::Error) -> pkg_core::Error {
-    pkg_core::Error::Io(e)
+fn io_err(e: std::io::Error) -> mecha_graph_core::Error {
+    mecha_graph_core::Error::Io(e)
 }
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -492,7 +492,7 @@ const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(15
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-) -> pkg_core::Result<()> {
+) -> mecha_graph_core::Result<()> {
     loop {
         if app.needs_clear {
             terminal.clear().map_err(io_err)?;
@@ -647,7 +647,7 @@ fn event_loop(
 
 /// Run the router for the current input. `deep` adds the vector arm (ollama
 /// round-trip); the live path is BM25 + lookup/aggregate routing — instant.
-fn run_search(app: &mut App, deep: bool) -> pkg_core::Result<()> {
+fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
     app.search.dirty_since = None;
     let q = app.search.input.text().trim().to_string();
     if q.is_empty() {
@@ -706,7 +706,7 @@ fn run_search(app: &mut App, deep: bool) -> pkg_core::Result<()> {
             items,
             truncated: false,
             budget_tokens: 0,
-            generated_at: pkg_core::ids::now(),
+            generated_at: mecha_graph_core::ids::now(),
             scope: router::Scope::Both,
             sources: vec![],
             window: None,
@@ -747,7 +747,7 @@ fn run_search(app: &mut App, deep: bool) -> pkg_core::Result<()> {
 // ─── Data plumbing ───────────────────────────────────────────────────────────
 
 impl App {
-    fn reload_review(&mut self) -> pkg_core::Result<()> {
+    fn reload_review(&mut self) -> mecha_graph_core::Result<()> {
         self.review.items = match &self.review.cluster_filter {
             // Drilled into one cluster: select members by exactly the key
             // rule the cluster was built with (precheck::cluster_key).
@@ -777,7 +777,7 @@ impl App {
         Ok(())
     }
 
-    fn reload_clusters(&mut self) -> pkg_core::Result<()> {
+    fn reload_clusters(&mut self) -> mecha_graph_core::Result<()> {
         self.review.clusters = precheck::review_clusters(&self.conn, 3)?;
         let len = self.review.clusters.len();
         let sel = self.review.cluster_list.selected().unwrap_or(0);
@@ -796,7 +796,7 @@ impl App {
     }
 
     /// Pending candidate ids belonging to one cluster.
-    fn cluster_member_ids(&self, proposer: &str, predicate: &str) -> pkg_core::Result<Vec<i64>> {
+    fn cluster_member_ids(&self, proposer: &str, predicate: &str) -> mecha_graph_core::Result<Vec<i64>> {
         Ok(fact::pending_candidates(&self.conn, 100_000)?
             .into_iter()
             .filter(|c| {
@@ -807,7 +807,7 @@ impl App {
             .collect())
     }
 
-    fn reload_merge(&mut self) -> pkg_core::Result<()> {
+    fn reload_merge(&mut self) -> mecha_graph_core::Result<()> {
         self.merge.items = graph::duplicate_person_candidates(&self.conn)?;
         self.merge
             .items
@@ -826,7 +826,7 @@ impl App {
         self.review.items.get(self.review.list.selected()?)
     }
 
-    fn reload_gtd(&mut self) -> pkg_core::Result<()> {
+    fn reload_gtd(&mut self) -> mecha_graph_core::Result<()> {
         self.gtd.items = gtd::list_tasks(&self.conn, self.gtd.show_closed)?;
         let len = self.gtd.items.len();
         let sel = self.gtd.list.selected().unwrap_or(0);
@@ -840,14 +840,14 @@ impl App {
 
     /// Load a node's page and switch to the entity screen. Reachable from the
     /// lookup box, search results (Enter on a person/fact hit), and GTD tasks.
-    fn open_entity(&mut self, node_id: &str) -> pkg_core::Result<()> {
+    fn open_entity(&mut self, node_id: &str) -> mecha_graph_core::Result<()> {
         let Some(node) = graph::get_node(&self.conn, node_id)? else {
             self.status = format!("node {node_id} not found");
             return Ok(());
         };
         graph::increment_node_access(&self.conn, node_id)?;
         self.entity.interaction = rollup::get_person_interaction(&self.conn, node_id)?;
-        self.entity.summary = pkg_core::context::get_node_context(&self.conn, node_id)?
+        self.entity.summary = mecha_graph_core::context::get_node_context(&self.conn, node_id)?
             .map(|c| c.summary)
             .filter(|s| !s.is_empty());
         self.entity.facts = fact::facts_for_node(&self.conn, node_id, 200)?;
@@ -872,7 +872,7 @@ impl App {
     }
 
     /// Reload the open entity page in place (after a supersede).
-    fn refresh_entity(&mut self) -> pkg_core::Result<()> {
+    fn refresh_entity(&mut self) -> mecha_graph_core::Result<()> {
         if let Some(node) = &self.entity.node {
             let id = node.id.clone();
             self.entity.facts = fact::facts_for_node(&self.conn, &id, 200)?;
@@ -1023,7 +1023,7 @@ fn ghost_tag(conn: &Connection, partial: &str) -> Option<(String, String)> {
 /// Suspend the TUI, open `$EDITOR` on the text, return the edited content
 /// (None on abort or no change). The temp file lives under ~/pkg (0600) and
 /// is removed before returning.
-fn spawn_editor(initial: &str) -> pkg_core::Result<Option<String>> {
+fn spawn_editor(initial: &str) -> mecha_graph_core::Result<Option<String>> {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
         .unwrap_or_else(|_| "vi".into());
@@ -1065,7 +1065,7 @@ fn alias_worthy(s: &str) -> bool {
 /// Ids a review action applies to: in cluster view, every member of the
 /// selected cluster; otherwise the marked set (in list order) when
 /// non-empty, else just the selection.
-fn review_targets(app: &App) -> pkg_core::Result<Vec<i64>> {
+fn review_targets(app: &App) -> mecha_graph_core::Result<Vec<i64>> {
     if app.review.cluster_view {
         return match app.selected_cluster() {
             Some(cl) => app.cluster_member_ids(&cl.proposed_by, &cl.predicate),
@@ -1088,7 +1088,7 @@ fn review_targets(app: &App) -> pkg_core::Result<Vec<i64>> {
 /// (no prompt — the owner almost never has prose to add, and an empty
 /// prompt was pure decision tax); `R` routes through the reason prompt
 /// first for the rare case where the why matters.
-fn reject_targets(app: &mut App, reason: &str) -> pkg_core::Result<()> {
+fn reject_targets(app: &mut App, reason: &str) -> mecha_graph_core::Result<()> {
     let ids = review_targets(app)?;
     for id in &ids {
         fact::reject_candidate(&app.conn, *id, reason)?;
@@ -1102,12 +1102,12 @@ fn reject_targets(app: &mut App, reason: &str) -> pkg_core::Result<()> {
     Ok(())
 }
 
-fn accept_selected(app: &mut App, create_missing: bool) -> pkg_core::Result<()> {
+fn accept_selected(app: &mut App, create_missing: bool) -> mecha_graph_core::Result<()> {
     let ids = review_targets(app)?;
     let (mut ok, mut failed) = (0usize, 0usize);
     let mut last_err = String::new();
     for id in &ids {
-        match pkg_core::extract::accept_commitment(&app.conn, *id) {
+        match mecha_graph_core::extract::accept_commitment(&app.conn, *id) {
             Ok(_) => ok += 1,
             Err(_) => match fact::accept_candidate_opts(&app.conn, *id, create_missing, true) {
                 Ok(_) => ok += 1,
@@ -1128,7 +1128,7 @@ fn accept_selected(app: &mut App, create_missing: bool) -> pkg_core::Result<()> 
     Ok(())
 }
 
-fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Result<()> {
+fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     match &mut app.review.mode {
         ReviewMode::Reason(buf) => {
             match key {
@@ -1417,7 +1417,7 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::R
     Ok(())
 }
 
-fn handle_merge(app: &mut App, key: KeyCode) -> pkg_core::Result<()> {
+fn handle_merge(app: &mut App, key: KeyCode) -> mecha_graph_core::Result<()> {
     match key {
         KeyCode::Char('j') | KeyCode::Down => {
             move_sel(&mut app.merge.list, app.merge.items.len(), 1)
@@ -1450,7 +1450,7 @@ fn handle_merge(app: &mut App, key: KeyCode) -> pkg_core::Result<()> {
     Ok(())
 }
 
-fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Result<()> {
+fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     if let Some(detail) = &mut app.search.detail {
         // Annotation entry line (t tag / n note on an episode).
         if let Some((kind, buf)) = &mut detail.annotate {
@@ -1690,7 +1690,7 @@ fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::R
     Ok(())
 }
 
-fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Result<()> {
+fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     // Ctrl-T toggles note ↔ fact.
     if key == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
         app.capture.kind = match app.capture.kind {
@@ -1710,10 +1710,10 @@ fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::
                     id: 0,
                     uid: String::new(),
                     source: "note".into(),
-                    source_id: pkg_core::ids::new_uid(),
+                    source_id: mecha_graph_core::ids::new_uid(),
                     source_ref: None,
                     body: text.clone(),
-                    occurred_at: pkg_core::ids::now(),
+                    occurred_at: mecha_graph_core::ids::now(),
                     occurred_end: None,
                     ingested_at: String::new(),
                     lat: None,
@@ -1773,7 +1773,7 @@ fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::
                     object: Some(get("object")).filter(|s| !s.is_empty()),
                     object_value: None,
                     statement,
-                    valid_from: Some(pkg_core::ids::now()),
+                    valid_from: Some(mecha_graph_core::ids::now()),
                     confidence: Some(0.95),
                     tags: Some(get("tags")).filter(|s| !s.is_empty()),
                 };
@@ -1804,7 +1804,7 @@ fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::
     Ok(())
 }
 
-fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Result<()> {
+fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     match app.entity.mode {
         EntityMode::Input => match key {
             KeyCode::Esc => {
@@ -1989,7 +1989,7 @@ fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::R
     Ok(())
 }
 
-fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Result<()> {
+fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     if let GtdMode::Form {
         fields,
         idx,
@@ -2065,7 +2065,7 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> pkg_core::Resu
         return Ok(());
     }
 
-    let set_status = |app: &mut App, status: &str| -> pkg_core::Result<()> {
+    let set_status = |app: &mut App, status: &str| -> mecha_graph_core::Result<()> {
         let task = app
             .gtd
             .list
@@ -2295,7 +2295,7 @@ fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
                         "ladder:     {} · streak {}/{}\n",
                         cl.rung,
                         cl.streak,
-                        pkg_core::ladder::PROMOTE_STREAK
+                        mecha_graph_core::ladder::PROMOTE_STREAK
                     ));
                     text.push_str("\n─ typical samples (spread over the cluster) ─\n");
                     for s in &cl.samples {
@@ -3089,7 +3089,7 @@ fn draw_gtd(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let today = pkg_core::ids::now();
+    let today = mecha_graph_core::ids::now();
     let items: Vec<ListItem> = app
         .gtd
         .items

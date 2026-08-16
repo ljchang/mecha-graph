@@ -5,8 +5,8 @@
 //! prose. All agent writes route through fact_candidate with
 //! source='agent:<harness>' — agents hallucinate; provenance lets you undo it.
 
-use pkg_core::rusqlite::Connection;
-use pkg_core::{context, db, embed, episode, fact, graph, gtd, rollup, router};
+use mecha_graph_core::rusqlite::Connection;
+use mecha_graph_core::{context, db, embed, episode, fact, graph, gtd, rollup, router};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -285,7 +285,7 @@ fn handle_tool_call(
         "kg_task_list" => kg_task_list(conn, &args),
         "kg_task_create" => kg_task_create(conn, &args),
         "kg_task_update" => kg_task_update(conn, &args),
-        _ => Err(pkg_core::Error::Other(format!("unknown tool {name}"))),
+        _ => Err(mecha_graph_core::Error::Other(format!("unknown tool {name}"))),
     };
 
     match out {
@@ -301,7 +301,7 @@ fn kg_search(
     conn: &Connection,
     embedder: &embed::OllamaEmbedder,
     args: &Value,
-) -> pkg_core::Result<Value> {
+) -> mecha_graph_core::Result<Value> {
     let mut query = args["query"].as_str().unwrap_or_default().to_string();
     let k = args["k"].as_u64().unwrap_or(10) as usize;
     let include_private = args["include_private"].as_bool().unwrap_or(false);
@@ -340,7 +340,7 @@ fn kg_search(
     let scope = match args["scope"].as_str() {
         None => router::Scope::Both,
         Some(s) => router::Scope::parse(s).ok_or_else(|| {
-            pkg_core::Error::Other(format!(
+            mecha_graph_core::Error::Other(format!(
                 "bad scope '{s}' (both | facts_only | evidence_only)"
             ))
         })?,
@@ -351,10 +351,10 @@ fn kg_search(
     // does not exist.
     let mut sources: Vec<String> = vec![];
     if let Some(arr) = args["sources"].as_array() {
-        let known = pkg_core::search::known_sources(conn)?;
+        let known = mecha_graph_core::search::known_sources(conn)?;
         for s in arr.iter().filter_map(|s| s.as_str()) {
             if !known.contains(&s.to_string()) {
-                return Err(pkg_core::Error::Other(format!(
+                return Err(mecha_graph_core::Error::Other(format!(
                     "unknown source '{s}'; known: {}",
                     known.join(", ")
                 )));
@@ -404,7 +404,7 @@ fn kg_search(
     Ok(v)
 }
 
-fn kg_entity(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let name = args["name_or_id"].as_str().unwrap_or_default();
 
     let mut matches = graph::resolve_entity_all(conn, name)?;
@@ -483,10 +483,10 @@ fn kg_entity(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     }))
 }
 
-fn kg_timeline(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_timeline(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let entity = args["entity"].as_str().unwrap_or_default();
     let node = graph::resolve_entity(conn, entity)?
-        .ok_or_else(|| pkg_core::Error::Other(format!("no entity '{entity}'")))?;
+        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no entity '{entity}'")))?;
 
     let facts: Vec<Value> =
         fact::timeline(conn, &node.id, args["from"].as_str(), args["to"].as_str())?
@@ -527,7 +527,7 @@ fn kg_timeline(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     }))
 }
 
-fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let source = args["source"].as_str().unwrap_or("agent:unknown");
     let kind = args["kind"].as_str().unwrap_or("fact");
 
@@ -536,10 +536,10 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
         // deterministic user-confirmed input, so it lands directly.
         let node_id = args["node_id"]
             .as_str()
-            .ok_or_else(|| pkg_core::Error::Other("alias upsert needs node_id".into()))?;
+            .ok_or_else(|| mecha_graph_core::Error::Other("alias upsert needs node_id".into()))?;
         let alias = args["alias"]
             .as_str()
-            .ok_or_else(|| pkg_core::Error::Other("alias upsert needs alias".into()))?;
+            .ok_or_else(|| mecha_graph_core::Error::Other("alias upsert needs alias".into()))?;
         graph::add_alias(conn, node_id, alias, source)?;
         return Ok(json!({ "v": 1, "status": "alias_added", "node_id": node_id, "alias": alias }));
     }
@@ -553,11 +553,11 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
         // evidence; provenance (`source`) is what lets you undo the evidence.
         let body = args["body"].as_str().unwrap_or_default();
         if body.is_empty() {
-            return Err(pkg_core::Error::Other("episode upsert needs body".into()));
+            return Err(mecha_graph_core::Error::Other("episode upsert needs body".into()));
         }
         let source_id = args["source_id"].as_str().unwrap_or_default();
         if source_id.is_empty() {
-            return Err(pkg_core::Error::Other(
+            return Err(mecha_graph_core::Error::Other(
                 "episode upsert needs source_id (stable within the source; \
                  re-upserting the same source_id updates instead of duplicating)"
                     .into(),
@@ -565,7 +565,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
         }
         let sensitivity = args["sensitivity"].as_str().unwrap_or("personal");
         if !episode::SENSITIVITY_TIERS.contains(&sensitivity) {
-            return Err(pkg_core::Error::Other(format!(
+            return Err(mecha_graph_core::Error::Other(format!(
                 "sensitivity '{sensitivity}' not in {:?}",
                 episode::SENSITIVITY_TIERS
             )));
@@ -580,7 +580,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
             occurred_at: args["occurred_at"]
                 .as_str()
                 .map(|s| s.to_string())
-                .unwrap_or_else(pkg_core::ids::now),
+                .unwrap_or_else(mecha_graph_core::ids::now),
             occurred_end: args["occurred_end"].as_str().map(|s| s.to_string()),
             ingested_at: String::new(),
             lat: None,
@@ -596,7 +596,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
             return Ok(json!({
                 "v": 1, "status": "tombstoned", "episode_id": 0, "uid": "",
                 "entities_linked": 0,
-                "note": "a deleted episode with this source id blocks re-capture; `pkg tombstone rm` lifts it"
+                "note": "a deleted episode with this source id blocks re-capture; `mecha-graph tombstone rm` lifts it"
             }));
         }
         let linked = match outcome {
@@ -621,7 +621,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
         // fact must not keep being served until the nightly gets to it.
         // (Idempotent per fact, so a retry upsert cannot double-repair.)
         let corrections = if outcome != episode::IngestOutcome::Unchanged {
-            let s = pkg_core::corrections::process_episode(conn, id)?;
+            let s = mecha_graph_core::corrections::process_episode(conn, id)?;
             (s.processed > 0).then(|| serde_json::to_value(&s).unwrap_or_default())
         } else {
             None
@@ -651,7 +651,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
         tags: args["tags"].as_str().map(|s| s.to_string()),
     };
     if proposed.subject.is_empty() || proposed.statement.is_empty() {
-        return Err(pkg_core::Error::Other(
+        return Err(mecha_graph_core::Error::Other(
             "fact upsert needs subject and statement".into(),
         ));
     }
@@ -676,12 +676,12 @@ fn kg_upsert(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     Ok(json!({ "v": 1, "status": "staged", "candidate_id": id }))
 }
 
-fn kg_related(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_related(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let id_or_name = args["id"].as_str().unwrap_or_default();
     let node = match graph::get_node(conn, id_or_name)? {
         Some(n) => n,
         None => graph::resolve_entity(conn, id_or_name)?
-            .ok_or_else(|| pkg_core::Error::Other(format!("no node '{id_or_name}'")))?,
+            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node '{id_or_name}'")))?,
     };
     let hops = args["hops"].as_i64().unwrap_or(1).clamp(1, 2) as i32;
     let limit = args["limit"].as_u64().unwrap_or(25) as usize;
@@ -720,8 +720,8 @@ fn kg_related(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pkg_core::db::open_memory;
-    use pkg_core::graph::{upsert_node, Node};
+    use mecha_graph_core::db::open_memory;
+    use mecha_graph_core::graph::{upsert_node, Node};
 
     #[test]
     fn episode_upsert_is_idempotent_on_source_id() {
@@ -811,7 +811,7 @@ mod tests {
         let extracted: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM extract_state WHERE episode_id = ?1",
-                pkg_core::rusqlite::params![id],
+                mecha_graph_core::rusqlite::params![id],
                 |r| r.get(0),
             )
             .unwrap();
@@ -903,7 +903,7 @@ mod tests {
 /// 589 real problems on the day blind model probing found none.
 /// Pending candidates in one review class, with the evidence they came from.
 /// File an agent's opinion beside a candidate. Never decides it.
-fn kg_verdict(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_verdict(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let (Some(cid), Some(mech), Some(verdict)) = (
         args["candidate_id"].as_i64(),
         args["mechanism"].as_str(),
@@ -914,7 +914,7 @@ fn kg_verdict(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
             "error": "candidate_id, mechanism and verdict are all required"
         }));
     };
-    let id = pkg_core::fact::record_verdict(
+    let id = mecha_graph_core::fact::record_verdict(
         conn,
         cid,
         mech,
@@ -942,7 +942,7 @@ fn subject_now(conn: &Connection, payload: &Value) -> Value {
     let Some(text) = payload["statement"].as_str() else {
         return Value::Null;
     };
-    match pkg_core::router::detect_entities(conn, text) {
+    match mecha_graph_core::router::detect_entities(conn, text) {
         Ok((detected, ambiguous)) => {
             if let Some(d) = detected
                 .iter()
@@ -985,12 +985,12 @@ fn subject_is_guessed(conn: &Connection, payload: &Value) -> bool {
         return false;
     };
     matches!(
-        pkg_core::router::detect_entities(conn, text),
+        mecha_graph_core::router::detect_entities(conn, text),
         Ok((detected, ambiguous)) if detected.is_empty() && !ambiguous.is_empty()
     )
 }
 
-fn kg_pending(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_pending(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let proposer = args["proposed_by"].as_str().unwrap_or_default();
     let predicate = args["predicate"].as_str().unwrap_or_default();
     // `entity` is the OTHER axis, not an extra filter on the class one. A
@@ -1013,16 +1013,16 @@ fn kg_pending(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     // search for what the row already cites.
     let include_evidence = args["include_evidence"].as_bool().unwrap_or(false);
     let items = if entity.is_empty() {
-        pkg_core::fact::pending_in_class(conn, proposer, predicate, limit, unjudged_by)?
+        mecha_graph_core::fact::pending_in_class(conn, proposer, predicate, limit, unjudged_by)?
     } else {
         // Resolve to the node so the alias set does the matching — a
         // candidate staged before an alias was learned names the surface
         // form, not the canonical one.
         let node = graph::resolve_entity(conn, entity)?
-            .ok_or_else(|| pkg_core::Error::Other(format!("no entity '{entity}'")))?;
+            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no entity '{entity}'")))?;
         let mut surfaces = vec![node.name.clone()];
         surfaces.extend(node.aliases.iter().cloned());
-        pkg_core::fact::pending_about_entity(conn, &surfaces, limit, unjudged_by)?
+        mecha_graph_core::fact::pending_about_entity(conn, &surfaces, limit, unjudged_by)?
     };
     let items: Vec<Value> = items
         .iter()
@@ -1030,7 +1030,7 @@ fn kg_pending(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
             json!({
                 "candidate_id": c.id,
                 "origin_source": c.episode_id.and_then(|_| {
-                    pkg_core::fact::candidate_origin_source(conn, c.id).ok().flatten()
+                    mecha_graph_core::fact::candidate_origin_source(conn, c.id).ok().flatten()
                 }),
                 "statement": c.payload["statement"],
                 // Resolved NOW, not trusted from staging. A candidate's
@@ -1051,7 +1051,7 @@ fn kg_pending(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
                 "evidence": include_evidence
                     .then(|| {
                         c.episode_id.and_then(|eid| {
-                            pkg_core::episode::get_episode(conn, eid).ok().flatten().map(|e| {
+                            mecha_graph_core::episode::get_episode(conn, eid).ok().flatten().map(|e| {
                                 json!({
                                     "source": e.source,
                                     "occurred_at": e.occurred_at,
@@ -1069,9 +1069,9 @@ fn kg_pending(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     )
 }
 
-fn kg_verify(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let checks = match (args["node"].as_str(), args["fact"].as_str()) {
-        (_, Some(uid)) => vec![pkg_core::verify::verify_fact(conn, uid)?],
+        (_, Some(uid)) => vec![mecha_graph_core::verify::verify_fact(conn, uid)?],
         (Some(name), None) => {
             let mut matches = graph::resolve_entity_all(conn, name)?;
             if matches.is_empty() {
@@ -1091,7 +1091,7 @@ fn kg_verify(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
                         })).collect::<Vec<_>>()
                     }))
                 }
-                _ => pkg_core::verify::verify_node(
+                _ => mecha_graph_core::verify::verify_node(
                     conn,
                     &matches[0].id,
                     args["limit"].as_u64().unwrap_or(20) as usize,
@@ -1099,7 +1099,7 @@ fn kg_verify(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
             }
         }
         (None, None) => {
-            return Err(pkg_core::Error::Other(
+            return Err(mecha_graph_core::Error::Other(
                 "kg_verify needs `node` or `fact`".into(),
             ))
         }
@@ -1135,7 +1135,7 @@ fn kg_verify(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
 }
 
-fn kg_task_list(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let include_closed = args["include_closed"].as_bool().unwrap_or(false);
     let today = chrono::Utc::now()
         .date_naive()
@@ -1160,7 +1160,7 @@ fn kg_task_list(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     Ok(json!({ "v": 1, "items": items, "today": today, "truncated": false }))
 }
 
-fn kg_task_create(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let name = args["name"].as_str().unwrap_or_default();
     let due = match args["due"].as_str() {
         Some(raw) => gtd::parse_due(raw)?,
@@ -1176,10 +1176,10 @@ fn kg_task_create(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     Ok(json!({ "v": 1, "status": "created", "id": task_id, "due_at": due }))
 }
 
-fn kg_task_update(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
+fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let task = args["task"]
         .as_str()
-        .ok_or_else(|| pkg_core::Error::Other("kg_task_update needs `task`".into()))?;
+        .ok_or_else(|| mecha_graph_core::Error::Other("kg_task_update needs `task`".into()))?;
 
     if let Some(status) = args["status"].as_str() {
         gtd::set_task_status(conn, task, status)?;
@@ -1188,7 +1188,7 @@ fn kg_task_update(conn: &Connection, args: &Value) -> pkg_core::Result<Value> {
     // Absent field → untouched; "" → cleared — the same tri-state
     // update_task_schedule speaks, with dates going through parse_due so
     // 'tomorrow' and '+3d' work here too.
-    let sched = |v: &Value| -> pkg_core::Result<Option<Option<String>>> {
+    let sched = |v: &Value| -> mecha_graph_core::Result<Option<Option<String>>> {
         match v.as_str() {
             None => Ok(None),
             Some(raw) => Ok(Some(gtd::parse_due(raw)?)),

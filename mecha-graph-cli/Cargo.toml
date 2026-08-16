@@ -1,14 +1,16 @@
 [package]
-name = "pkg-mcp"
+name = "mecha-graph-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pkg-mcp"
+name = "mecha-graph"
 path = "src/main.rs"
 
 [dependencies]
-pkg-core = { path = "../pkg-core" }
+mecha-graph-core = { path = "../mecha-graph-core" }
+clap.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
 serde_json.workspace = true
-chrono.workspace = true

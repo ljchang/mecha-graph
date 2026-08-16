@@ -4,7 +4,7 @@ mod render;
 mod tui;
 
 use clap::{Parser, Subcommand};
-use pkg_core::{db, embed, episode, eval, fact, graph, gtd, rollup, router, sources, stats};
+use mecha_graph_core::{db, embed, episode, eval, fact, graph, gtd, rollup, router, sources, stats};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -22,7 +22,7 @@ struct Cli {
     /// Force human-readable output (default on a terminal)
     // Explicit id: the default id "text" collides with `Note { text }`'s
     // positional once clap propagates this global into subcommands — clap
-    // panics at match time ("could not downcast to bool"), killing `pkg note`.
+    // panics at match time ("could not downcast to bool"), killing `mecha-graph note`.
     #[arg(long = "text", id = "text_output", global = true)]
     text: bool,
 
@@ -52,7 +52,7 @@ fn style() -> render::Style {
 /// the matches and resolves to nothing.
 #[allow(clippy::too_many_arguments)]
 fn resolve_triage_ids(
-    conn: &pkg_core::rusqlite::Connection,
+    conn: &mecha_graph_core::rusqlite::Connection,
     ids: Vec<i64>,
     proposer: &Option<String>,
     predicate: &Option<String>,
@@ -61,7 +61,7 @@ fn resolve_triage_ids(
     max_confidence: Option<f64>,
     limit: usize,
     dry_run: bool,
-) -> pkg_core::Result<Vec<i64>> {
+) -> mecha_graph_core::Result<Vec<i64>> {
     if !ids.is_empty() {
         return Ok(ids);
     }
@@ -71,7 +71,7 @@ fn resolve_triage_ids(
         && min_confidence.is_none()
         && max_confidence.is_none()
     {
-        return Err(pkg_core::Error::Other(
+        return Err(mecha_graph_core::Error::Other(
             "give candidate ids, or at least one bulk filter \
              (--proposer / --predicate / --contains / --min-confidence / --max-confidence)"
                 .into(),
@@ -484,7 +484,7 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
-    /// List tasks (GTD board); interactive status cycling lives in `pkg tui`
+    /// List tasks (GTD board); interactive status cycling lives in `mecha-graph tui`
     Tasks {
         /// Include done/dropped
         #[arg(long)]
@@ -514,7 +514,7 @@ enum TombstoneAction {
     Rm {
         /// Source as stored on the episode, e.g. reflect.note, calendar.event
         source: String,
-        /// The source's item id (shown by `pkg tombstone list`)
+        /// The source's item id (shown by `mecha-graph tombstone list`)
         source_id: String,
     },
 }
@@ -625,7 +625,7 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> pkg_core::Result<()> {
+fn run(cli: Cli) -> mecha_graph_core::Result<()> {
     let cli_json = cli.json;
     let cli_text = cli.text;
     let db_path = cli.db.unwrap_or_else(db::default_db_path);
@@ -694,7 +694,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
             }
             IngestSource::Ics { paths, self_emails, full } => {
                 if paths.is_empty() {
-                    return Err(pkg_core::Error::Other(
+                    return Err(mecha_graph_core::Error::Other(
                         "provide at least one .ics path".into(),
                     ));
                 }
@@ -708,7 +708,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 );
             }
             IngestSource::Reflect { zip } => {
-                let r = pkg_core::sources::reflect::ingest_zip(&conn, &zip)?;
+                let r = mecha_graph_core::sources::reflect::ingest_zip(&conn, &zip)?;
                 println!(
                     "reflect: {} inserted · {} updated · {} unchanged{} · {} backlink + {} alias mentions · {}",
                     r.inserted, r.updated, r.unchanged, r.tombstone_note(), r.mentions, r.alias_mentions,
@@ -741,7 +741,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         Command::Embed { limit, batch } => {
             let embedder = embed::OllamaEmbedder::default();
             if !embedder.available() {
-                return Err(pkg_core::Error::Embed(format!(
+                return Err(mecha_graph_core::Error::Embed(format!(
                     "ollama not reachable at {} — is it running?",
                     embedder.base_url
                 )));
@@ -753,7 +753,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
 
         Command::Query { query, k, budget, private, as_of, scope, sources, since, until } => {
             let scope = router::Scope::parse(&scope).ok_or_else(|| {
-                pkg_core::Error::Other(format!(
+                mecha_graph_core::Error::Other(format!(
                     "bad --scope '{scope}' (both | facts | evidence)"
                 ))
             })?;
@@ -761,10 +761,10 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
             // returning nothing is worse than an error, because empty
             // reads as "this source knows nothing about them".
             if !sources.is_empty() {
-                let known = pkg_core::search::known_sources(&conn)?;
+                let known = mecha_graph_core::search::known_sources(&conn)?;
                 for s in &sources {
                     if !known.contains(s) {
-                        return Err(pkg_core::Error::Other(format!(
+                        return Err(mecha_graph_core::Error::Other(format!(
                             "unknown --source '{s}'; known: {}",
                             known.join(", ")
                         )));
@@ -856,10 +856,10 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 id: 0,
                 uid: String::new(),
                 source: "note".into(),
-                source_id: pkg_core::ids::new_uid(),
+                source_id: mecha_graph_core::ids::new_uid(),
                 source_ref: None,
                 body: text.clone(),
-                occurred_at: pkg_core::ids::now(),
+                occurred_at: mecha_graph_core::ids::now(),
                 occurred_end: None,
                 ingested_at: String::new(),
                 lat: None,
@@ -891,7 +891,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 linked += episode::link_by_alias_scan(&conn, id, &body)?;
             }
             // ...then the §7 cascade (temporal → NPMI → kNN → structural), then rollups.
-            let cascade = pkg_core::linkers::run_cascade(&conn)?;
+            let cascade = mecha_graph_core::linkers::run_cascade(&conn)?;
             let people = rollup::rebuild_person_interactions(&conn)?;
             println!(
                 "alias-scan: {linked} mentions · temporal: {} attributed · npmi: {} facts · knn: {} staged · structural: {} staged · rules: {} staged · rollup: {people} people",
@@ -906,7 +906,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 "  temporal detail: bee {} usable / {} missing end · overlaps {} → \
                  below-{:.0}%-coverage {} · no-attendees {} · attributed {}",
                 t.bee_with_end, t.bee_without_end, t.overlaps,
-                pkg_core::linkers::TEMPORAL_MIN_COVERAGE * 100.0,
+                mecha_graph_core::linkers::TEMPORAL_MIN_COVERAGE * 100.0,
                 t.below_coverage, t.no_attendees, t.attributed_pairs
             );
             println!(
@@ -929,7 +929,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
 
         Command::Review { top, clusters, samples } => {
             if clusters {
-                let rows = pkg_core::precheck::review_clusters(&conn, samples)?;
+                let rows = mecha_graph_core::precheck::review_clusters(&conn, samples)?;
                 if want_json(cli_json, cli_text) {
                     println!("{}", serde_json::to_string_pretty(&rows)?);
                     return Ok(());
@@ -962,10 +962,10 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                         println!("         · {s}");
                     }
                     if c.commitment {
-                        println!("         → commitments materialize tasks; review individually (pkg tui)");
+                        println!("         → commitments materialize tasks; review individually (mecha-graph tui)");
                     } else {
                         println!(
-                            "         → pkg accept|reject --proposer '{}' --predicate '{}'",
+                            "         → mecha-graph accept|reject --proposer '{}' --predicate '{}'",
                             c.proposed_by,
                             c.predicate.trim_matches(|ch| ch == '(' || ch == ')')
                         );
@@ -1012,7 +1012,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                         ))
                     );
                 }
-                println!("\naccept: pkg accept <id...>   reject: pkg reject <id...> --reason \"…\"");
+                println!("\naccept: mecha-graph accept <id...>   reject: mecha-graph reject <id...> --reason \"…\"");
             }
         }
 
@@ -1022,7 +1022,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
             )?;
             for id in ids {
                 // Commitment candidates materialize a Task; plain ones a fact.
-                match pkg_core::extract::accept_commitment(&conn, id) {
+                match mecha_graph_core::extract::accept_commitment(&conn, id) {
                     Ok(task_id) => println!("#{id} accepted → task {task_id}"),
                     Err(_) => match fact::accept_candidate(&conn, id) {
                         Ok(uid) => println!("#{id} accepted → fact {uid}"),
@@ -1126,7 +1126,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else if tags.is_empty() {
-                println!("no tags yet — tag episodes with `pkg annotate` or `t` in the TUI");
+                println!("no tags yet — tag episodes with `mecha-graph annotate` or `t` in the TUI");
             } else {
                 for (t, n) in tags {
                     println!("#{t}  ({n})");
@@ -1190,7 +1190,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 println!("no duplicate-person candidates");
             }
             for (a, b, name) in dups {
-                let detail = |id: &str| -> pkg_core::Result<String> {
+                let detail = |id: &str| -> mecha_graph_core::Result<String> {
                     let ids: Vec<String> = {
                         let mut stmt = conn.prepare(
                             "SELECT kind || ':' || value FROM node_identifier WHERE node_id = ?1",
@@ -1210,7 +1210,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 println!("{name}:");
                 println!("  keep? {}", detail(&a)?);
                 println!("  dup?  {}", detail(&b)?);
-                println!("  → pkg merge <keep-id> <dup-id>");
+                println!("  → mecha-graph merge <keep-id> <dup-id>");
             }
         }
 
@@ -1239,7 +1239,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
             }
             None => match graph::owner_node(&conn)? {
                 Some(nd) => println!("owner: {} ({})", nd.name, nd.id),
-                None => println!("no owner set — `pkg owner <name|email>`"),
+                None => println!("no owner set — `mecha-graph owner <name|email>`"),
             },
         },
 
@@ -1252,7 +1252,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Undo => {
-            match pkg_core::episode::undo_last(&conn)? {
+            match mecha_graph_core::episode::undo_last(&conn)? {
                 Some(msg) => println!("{msg}"),
                 None => println!("nothing to undo"),
             }
@@ -1273,13 +1273,13 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     for (source, source_id, at) in &rows {
                         println!("{at}  {source}  {source_id}");
                     }
-                    println!("{} tombstone(s); `pkg tombstone rm <source> <source_id>` lifts one", rows.len());
+                    println!("{} tombstone(s); `mecha-graph tombstone rm <source> <source_id>` lifts one", rows.len());
                 }
             }
             TombstoneAction::Rm { source, source_id } => {
                 let n = conn.execute(
                     "DELETE FROM episode_tombstone WHERE source = ?1 AND source_id = ?2",
-                    pkg_core::rusqlite::params![source, source_id],
+                    mecha_graph_core::rusqlite::params![source, source_id],
                 )?;
                 if n > 0 {
                     println!("lifted — the next sync may re-import {source} {source_id}");
@@ -1290,7 +1290,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         },
 
         Command::ReflectProcess => {
-            let r = pkg_core::sources::reflect::process_notes(&conn)?;
+            let r = mecha_graph_core::sources::reflect::process_notes(&conn)?;
             println!(
                 "reflect notes: {} scanned · {} promoted · {} attached · {} facts · {} identifiers · {} skipped (plain prose)",
                 r.scanned, r.promoted, r.attached, r.facts, r.identifiers, r.skipped
@@ -1298,7 +1298,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::BeeFacts { pull_limit } => {
-            let r = pkg_core::sources::bee::sync_bee_facts(&conn, pull_limit)?;
+            let r = mecha_graph_core::sources::bee::sync_bee_facts(&conn, pull_limit)?;
             println!(
                 "bee facts: {} staged for review · {} confirmed in Bee · {} deleted in Bee{}",
                 r.staged, r.confirmed, r.deleted,
@@ -1313,7 +1313,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 let e = embed::OllamaEmbedder::default();
                 e.available().then_some(e)
             };
-            let r = pkg_core::precheck::precheck_pending_opts(
+            let r = mecha_graph_core::precheck::precheck_pending_opts(
                 &conn, embedder.as_ref(), auto_accept, dry_run,
             )?;
             if dry_run {
@@ -1355,7 +1355,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::InvalidatePhantoms { dry_run } => {
-            let r = pkg_core::decay::invalidate_phantoms(&conn, dry_run)?;
+            let r = mecha_graph_core::decay::invalidate_phantoms(&conn, dry_run)?;
             if dry_run {
                 println!("(dry run — nothing changed)\n");
             }
@@ -1380,14 +1380,14 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Decay { dry_run } => {
-            let r = pkg_core::decay::sweep_npmi(&conn, dry_run)?;
+            let r = mecha_graph_core::decay::sweep_npmi(&conn, dry_run)?;
             if dry_run {
                 println!("(dry run — nothing changed)");
             }
             println!(
                 "scanned {} · closed {}/{} eligible (cap {}) · statements refreshed {} · \
                  held: band {}, user-verified {} · unparsed {}",
-                r.scanned, r.closed, r.eligible, pkg_core::decay::DECAY_CAP,
+                r.scanned, r.closed, r.eligible, mecha_graph_core::decay::DECAY_CAP,
                 r.refreshed, r.held_band, r.held_user, r.unparsed
             );
             if r.eligible > r.closed && !dry_run {
@@ -1417,7 +1417,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
             if dry_run {
                 println!("{pending} unrooted co-occurrence fact(s) would be re-provenanced");
             } else {
-                let (n, retiered) = pkg_core::linkers::backfill_npmi_derivation(&conn)?;
+                let (n, retiered) = mecha_graph_core::linkers::backfill_npmi_derivation(&conn)?;
                 println!(
                     "re-provenanced {n}/{pending} co-occurrence facts · {retiered} re-tiered \
                      (sensitivity MAX over full contributing set)"
@@ -1427,13 +1427,13 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
 
         Command::Verify { node, fact: fact_uid, limit } => {
             let checks = match (node, fact_uid) {
-                (_, Some(uid)) => vec![pkg_core::verify::verify_fact(&conn, &uid)?],
+                (_, Some(uid)) => vec![mecha_graph_core::verify::verify_fact(&conn, &uid)?],
                 (Some(name), None) => {
                     let matches = graph::resolve_entity_all(&conn, &name)?;
                     let node_id = match matches.len() {
                         0 => match graph::get_node(&conn, &name)? {
                             Some(n) => n.id,
-                            None => return Err(pkg_core::Error::Other(
+                            None => return Err(mecha_graph_core::Error::Other(
                                 format!("no entity matching '{name}'"))),
                         },
                         1 => matches[0].id.clone(),
@@ -1445,9 +1445,9 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                             return Ok(());
                         }
                     };
-                    pkg_core::verify::verify_node(&conn, &node_id, limit)?
+                    mecha_graph_core::verify::verify_node(&conn, &node_id, limit)?
                 }
-                (None, None) => return Err(pkg_core::Error::Other(
+                (None, None) => return Err(mecha_graph_core::Error::Other(
                     "verify needs --node or --fact".into())),
             };
             if want_json(cli_json, cli_text) {
@@ -1462,7 +1462,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::ProbeTargets { limit, include_cold } => {
-            let targets = pkg_core::probe::probe_targets_opts(&conn, limit, include_cold)?;
+            let targets = mecha_graph_core::probe::probe_targets_opts(&conn, limit, include_cold)?;
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&targets)?);
             } else {
@@ -1479,7 +1479,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Corrections { limit } => {
-            let s = pkg_core::corrections::process_pending(&conn, limit)?;
+            let s = mecha_graph_core::corrections::process_pending(&conn, limit)?;
             println!(
                 "corrections {} · superseded {} · staged {} · negated {} · \
                  classes demoted {} · sweep targets {} · unresolved→review {}",
@@ -1503,7 +1503,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     let n = fact::recompute_confidence(&conn, *id)?;
                     conn.execute(
                         "UPDATE fact SET confidence = ?2 WHERE id = ?1",
-                        pkg_core::rusqlite::params![id, old],
+                        mecha_graph_core::rusqlite::params![id, old],
                     )?;
                     n
                 } else {
@@ -1529,7 +1529,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::DedupeFacts { threshold, exact, apply } => {
-            let pairs = pkg_core::precheck::live_fact_dups(&conn, threshold, exact)?;
+            let pairs = mecha_graph_core::precheck::live_fact_dups(&conn, threshold, exact)?;
             if pairs.is_empty() {
                 println!("no near-duplicate live facts at threshold {threshold}");
             }
@@ -1548,12 +1548,12 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Summarize { limit, model, node } => {
-            let chat = pkg_core::extract::OllamaChat::new(&model);
+            let chat = mecha_graph_core::extract::OllamaChat::new(&model);
             match node {
                 Some(id) => {
-                    let done = pkg_core::summarize::summarize_node(&conn, &chat, &id)?;
+                    let done = mecha_graph_core::summarize::summarize_node(&conn, &chat, &id)?;
                     if done {
-                        let ctx = pkg_core::context::get_node_context(&conn, &id)?
+                        let ctx = mecha_graph_core::context::get_node_context(&conn, &id)?
                             .unwrap_or_default();
                         println!("{id}: {}", ctx.summary);
                     } else {
@@ -1561,7 +1561,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     }
                 }
                 None => {
-                    let report = pkg_core::summarize::refresh_summaries(&conn, &chat, limit)?;
+                    let report = mecha_graph_core::summarize::refresh_summaries(&conn, &chat, limit)?;
                     println!("summaries refreshed: {}", report.refreshed);
                     for e in &report.errors {
                         eprintln!("error: {e}");
@@ -1571,12 +1571,12 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Extract { limit, model, source, episode } => {
-            let chat = pkg_core::extract::OllamaChat::new(&model);
+            let chat = mecha_graph_core::extract::OllamaChat::new(&model);
             let report = if let Some(ep) = episode {
-                pkg_core::extract::reextract_episode(&conn, &chat, &ep)?
+                mecha_graph_core::extract::reextract_episode(&conn, &chat, &ep)?
             } else {
                 let sources: Vec<&str> = source.iter().map(|s| s.as_str()).collect();
-                pkg_core::extract::extract_pending(
+                mecha_graph_core::extract::extract_pending(
                     &conn,
                     &chat,
                     limit,
@@ -1589,12 +1589,12 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 report.commitment_candidates, report.errors
             );
             if report.fact_candidates + report.commitment_candidates > 0 {
-                println!("review with: pkg review");
+                println!("review with: mecha-graph review");
             }
         }
 
         Command::MemoryMd { out, budget } => {
-            let md = pkg_core::gtd::generate_memory_md(&conn, budget)?;
+            let md = mecha_graph_core::gtd::generate_memory_md(&conn, budget)?;
             match out {
                 Some(path) => {
                     std::fs::write(&path, &md)?;
@@ -1605,7 +1605,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Gtd => {
-            let r = pkg_core::gtd::weekly_review(&conn)?;
+            let r = mecha_graph_core::gtd::weekly_review(&conn)?;
             println!("# Weekly review\n");
             println!("## Stalled projects (active, no activity 14d)");
             for (_, name, last) in &r.stalled_projects {
@@ -1626,7 +1626,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
         }
 
         Command::Source { action } => {
-            use pkg_core::integrations::{self, SourceConfig};
+            use mecha_graph_core::integrations::{self, SourceConfig};
             let mut config = integrations::load_config()?;
             if integrations::ensure_defaults(&mut config) {
                 integrations::save_config(&config)?;
@@ -1688,14 +1688,14 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     retention, mode, no_test,
                 } => {
                     if let Some(r) = &retention {
-                        if pkg_core::sources::Retention::parse(r).is_none() {
-                            return Err(pkg_core::Error::Other(format!(
+                        if mecha_graph_core::sources::Retention::parse(r).is_none() {
+                            return Err(mecha_graph_core::Error::Other(format!(
                                 "invalid retention '{r}' — keep | capture | capture_delete"
                             )));
                         }
                     }
                     if !integrations::KINDS.contains(&kind.as_str()) {
-                        return Err(pkg_core::Error::Other(format!(
+                        return Err(mecha_graph_core::Error::Other(format!(
                             "unknown kind '{kind}' — one of {:?}",
                             integrations::KINDS
                         )));
@@ -1704,7 +1704,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     let mut settings = std::collections::BTreeMap::new();
                     let mut set = |k: &str, v: Option<String>| {
                         if let Some(v) = v {
-                            settings.insert(k.to_string(), pkg_core::toml::Value::String(v));
+                            settings.insert(k.to_string(), mecha_graph_core::toml::Value::String(v));
                         }
                     };
                     set("url", url);
@@ -1720,7 +1720,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     if !no_test {
                         let test = integrations::test_source(&name, &cfg);
                         if !test.ok {
-                            return Err(pkg_core::Error::Other(format!(
+                            return Err(mecha_graph_core::Error::Other(format!(
                                 "test failed ({}) — fix it or pass --no-test: {}",
                                 name, test.detail
                             )));
@@ -1730,7 +1730,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                     config.sources.insert(name.clone(), cfg);
                     integrations::save_config(&config)?;
                     println!("saved '{name}' to {}", integrations::config_path().display());
-                    println!("next: pkg source sync {name}");
+                    println!("next: mecha-graph source sync {name}");
                 }
 
                 SourceAction::Test { name } => {
@@ -1739,7 +1739,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                             .sources
                             .get(n)
                             .map(|c| vec![(n, c)])
-                            .ok_or_else(|| pkg_core::Error::Other(format!("no source '{n}'")))?,
+                            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no source '{n}'")))?,
                         None => config.sources.iter().collect(),
                     };
                     for (n, cfg) in targets {
@@ -1754,7 +1754,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                             .sources
                             .get(n)
                             .map(|c| vec![(n.clone(), c.clone())])
-                            .ok_or_else(|| pkg_core::Error::Other(format!("no source '{n}'")))?,
+                            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no source '{n}'")))?,
                         None => config
                             .sources
                             .iter()
@@ -1779,7 +1779,7 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 SourceAction::Enable { name } | SourceAction::Disable { name }
                     if !config.sources.contains_key(&name) =>
                 {
-                    return Err(pkg_core::Error::Other(format!("no source '{name}'")));
+                    return Err(mecha_graph_core::Error::Other(format!("no source '{name}'")));
                 }
                 SourceAction::Enable { name } => {
                     config.sources.get_mut(&name).unwrap().enabled = true;
@@ -1793,10 +1793,10 @@ fn run(cli: Cli) -> pkg_core::Result<()> {
                 }
                 SourceAction::Remove { name } => {
                     if config.sources.remove(&name).is_none() {
-                        return Err(pkg_core::Error::Other(format!("no source '{name}'")));
+                        return Err(mecha_graph_core::Error::Other(format!("no source '{name}'")));
                     }
                     integrations::save_config(&config)?;
-                    println!("removed {name} (already-ingested episodes are kept; use pkg redact to purge)");
+                    println!("removed {name} (already-ingested episodes are kept; use mecha-graph redact to purge)");
                 }
             }
         }
@@ -1830,7 +1830,7 @@ mod tests {
     fn test_global_text_flag_does_not_collide_with_note_positional() {
         // Regression: the global --text bool used clap id "text", colliding
         // with `Note { text }`'s positional after global-arg propagation —
-        // `pkg note <msg>` panicked at argument-match time.
+        // `mecha-graph note <msg>` panicked at argument-match time.
         let cli = Cli::try_parse_from(["pkg", "note", "call Victor back"]).unwrap();
         assert!(!cli.text);
         match cli.command {
