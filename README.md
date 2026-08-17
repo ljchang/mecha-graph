@@ -1,21 +1,23 @@
-# personalized_knowledge_graph
+# mecha-graph
 
-A personal knowledge graph that turns your own data into context any agent can
-use. Implements the **Personalized Context — Design** spec (Rev 2, 2026-08-02).
+A personal knowledge graph that turns your own data — mail, calendar, notes,
+messages — into context any agent can use, served over
+[MCP](https://modelcontextprotocol.io) to any client. Built as a sibling of
+[mecha](https://github.com/ljchang/mecha), usable without it.
 
 **The deliverable is not a database, it's a context pack**: every interface
 returns a token-bounded, provenance-carrying, freshness-stamped slice.
 
 ```
-        SOURCES                        CORE                       CONSUMERS
-  ┌───────────────────────┐    ┌──────────────────────┐    ┌────────────────────┐
-  │ Bee (API stream) ✅   │    │      pkg-core        │    │ Hermes      (MCP)  │
-  │ Calendar (ICS) ✅     │───▶│  Rust library        │───▶│ Claude Code (MCP)  │
-  │ Sessions ✅ · Slack ✅│    │  ingest · enrich ·   │    │ pkg CLI  ✅        │
-  │ iMessage ✅ · mbox ✅ │    │  link · retrieve     │    │ DuckDB (analysis)  │
-  └───────────────────────┘    │  SQLite (SQLCipher)  │    └────────────────────┘
-                               │  + sqlite-vec + FTS5 │
-                               └──────────────────────┘
+        SOURCES                          CORE                         CONSUMERS
+  ┌───────────────────────┐    ┌───────────────────────┐    ┌─────────────────────┐
+  │ calendar (ICS)        │    │   mecha-graph-core    │    │ mecha        (MCP)  │
+  │ mbox mail exports     │───▶│   Rust library        │───▶│ Claude Code  (MCP)  │
+  │ Slack · iMessage      │    │   ingest · enrich ·   │    │ any MCP client      │
+  │ notes · wearables     │    │   link · retrieve     │    │ mecha-graph CLI     │
+  └───────────────────────┘    │   SQLite (SQLCipher)  │    │ DuckDB (analytics)  │
+                               │   + sqlite-vec + FTS5 │    └─────────────────────┘
+                               └───────────────────────┘
 ```
 
 **Mental model** (full version: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
@@ -23,119 +25,143 @@ data imports as **episodes** (append-only evidence, idempotent by source id);
 linkers wire episodes to **nodes** (entities, identity via deterministic
 identifiers → aliases → never-guess ambiguity) through **mentions**; and
 **facts** (bi-temporal interpreted claims, each with episode provenance) are
-either asserted directly by high-trust rungs or staged as candidates that
+either asserted directly by high-trust sources or staged as candidates that
 review promotes — *episodes are evidence, nodes are things, facts are
 beliefs, the context pack is the product.*
 
-## Layout
-
-- `pkg-core/` — the library. Knows nothing about any agent (spec §2).
-- `pkg-cli/` — the `pkg` binary (§9.2).
-- `pkg-mcp/` — stdio MCP server exposing the five tools (§9.1):
-  `kg_search`, `kg_entity`, `kg_timeline`, `kg_upsert`, `kg_related`.
-- `eval/gold.jsonl` — the retrieval-quality ruler (§11), mined from your own
-  corpus once you have one. `eval/synthetic/run.sh` is the self-contained
-  version: it builds a throwaway graph from a fictional corpus and runs a
-  24-query gold set against it — no personal data, no live store, works on
-  a fresh clone.
-- `scripts/nightly.sh` — the cron pipeline (03:30): source sync → linkers →
-  GPU-gated embed/extract → MEMORY.md → health alerts.
-- `docs/ARCHITECTURE.md` — the mental model: episodes → mentions/nodes →
-  facts → context packs, the trust ladder, retrieval, time & privacy.
-- `docs/INTEGRATIONS.md` — per-integration auth/config + the at-rest design.
-
-## Quick start
+## Install
 
 ```bash
-cargo build --release
+cargo install mecha-graph          # the CLI
+cargo install mecha-graph-mcp      # the MCP server
+```
 
-# 1. Register integrations (config: ~/.mecha-graph/config.toml; bee + sessions
-#    self-register). See docs/INTEGRATIONS.md for auth details.
-mecha-graph source add bee --mode stream                  # API → DB, no plaintext files
+Or from a checkout: `cargo build --release` (binaries land in
+`target/release/`). Embeddings need [ollama](https://ollama.com) with
+`nomic-embed-text` on localhost; everything else is self-contained.
+
+## Try it with no data at all
+
+```bash
+eval/synthetic/run.sh
+```
+
+builds a throwaway graph from a fictional corpus (a twelve-message mailbox
+and a small calendar) and grades 24 retrieval queries against it — no
+personal data, no live store, works on a fresh clone. It doubles as the
+retrieval-quality ruler: `eval/gold.jsonl` is the same format, mined from
+your own corpus once you have one.
+
+## Quick start with your data
+
+```bash
+# 1. Register integrations (config: ~/.mecha-graph/config.toml).
+#    See docs/INTEGRATIONS.md for per-source auth.
 mecha-graph source add ics --url '<secret-ical-url>' --me you@example.edu
+mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@example.edu --retention capture_delete
 mecha-graph source add slack --token xoxp-…
-mecha-graph source add mbox --path ~/Takeout/mail.mbox --me you@x.edu --retention capture_delete
-mecha-graph source list          # kind, enabled, auth state, last ok, items
+mecha-graph source list           # kind, enabled, auth state, last ok, items
 
-# 2. Ingest everything enabled (cursored, idempotent):
+# 2. Ingest everything enabled (cursored, idempotent — re-runs are no-ops):
 mecha-graph source sync
 
-# 3. Re-run linkers over already-ingested episodes after new aliases land:
-./target/release/mecha-graph link --auto
-
-# 4. Embeddings (ollama + nomic-embed-text, 768d):
-./target/release/mecha-graph embed
+# 3. Link entities, then embed when the GPU is free:
+mecha-graph link --auto
+mecha-graph embed
 
 # Query — returns a context pack (JSON):
-./target/release/mecha-graph query "what did we discuss about the pilot data?"
-./target/release/mecha-graph query "when did I last meet with Nadia?"
-./target/release/mecha-graph entity "Nadia"
-./target/release/mecha-graph stats
-./target/release/mecha-graph eval            # against your graph and gold set
-eval/synthetic/run.sh                # or the self-contained synthetic eval
+mecha-graph query "what did we discuss about the pilot data?"
+mecha-graph entity "Nadia"
+mecha-graph stats
 ```
 
-DB lives at `~/.mecha-graph/graph.db` (override: `--db` or `MECHA_GRAPH_DB`). Cheap ingestion is
-separated from expensive enrichment (§5.4): `ingest` is fast and idempotent —
-re-runs are no-ops via `UNIQUE(source, source_id)` + content hash; run `embed`
-in nightly batches when the GPU is free.
+The store lives at `~/.mecha-graph/graph.db` (override with `--db` or
+`MECHA_GRAPH_DB`). Cheap ingestion is deliberately separated from expensive
+enrichment: `sync` is fast and idempotent; run `embed` and `extract` in
+nightly batches (`scripts/nightly.sh` is the shipped shape of that).
 
-## MCP wiring (§9.1)
+Agent-facing writes go through `kg_upsert` → candidate staging; **nothing an
+agent writes becomes a belief until you review it**: `mecha-graph review`,
+`accept`, `reject`, and `precheck` to auto-triage duplicates.
 
-Claude Code:
+## MCP wiring
+
+The server speaks stdio and exposes eleven tools: `kg_search`, `kg_entity`,
+`kg_timeline`, `kg_related`, `kg_upsert`, `kg_verify`, `kg_pending`,
+`kg_verdict`, and a small task family (`kg_task_list` / `create` / `update`).
+
+**mecha** (`~/.mecha/config.toml`) — the tools carry their own `kg_`
+namespace, so skip the server prefix, and mark the graph untrusted so
+reading it arms the trifecta interlock:
+
+```toml
+[[mcp]]
+name = "graph"
+command = "mecha-graph-mcp"
+prefix_tools = false
+
+[mcp.capabilities]
+untrusted_input = true
+```
+
+**Claude Code**:
 
 ```bash
-claude mcp add pkg -- ~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
+claude mcp add graph -- mecha-graph-mcp
 ```
 
-Hermes (or any MCP client) — stdio transport:
+**Any other MCP client** — stdio transport:
 
 ```json
-{ "mcpServers": { "pkg": { "command": "~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp" } } }
+{ "mcpServers": { "graph": { "command": "mecha-graph-mcp" } } }
 ```
 
-Agent writes go through `kg_upsert` → `fact_candidate` staging with
-`source='agent:<harness>'`; review with `mecha-graph review`, `mecha-graph accept/reject`.
-Disambiguation answers (`kind='alias'`) land immediately as permanent aliases
-(§11.2 — resolve at the point of use).
+## Your data stays yours
 
-## Design notes / deviations from the spec
+- **Encrypted at rest.** The store is SQLCipher; the raw key lives in
+  `~/.mecha-graph/db.key` (0600), picked up automatically by every open
+  (`MECHA_GRAPH_DB_KEY` / `MECHA_GRAPH_DB_KEYFILE` override). Back the key
+  up separately — a password manager, not the same disk.
+- **Stream-first ingestion.** Sources with APIs stream straight into the
+  encrypted DB — plaintext never touches disk. File-based sources (mbox,
+  chat.db copies) can use `--retention capture_delete`: the raw is archived
+  *inside* the encrypted DB, then the file is deleted once the archive row
+  verifies. `mecha-graph raw <uid>` shows the archive; re-enrichment reads
+  from it.
+- **A sensitivity ladder.** `public < personal < private < secret`; default
+  retrieval excludes `private` and above — messages and wearable transcripts
+  land as `private`. Opt in per query with `--private` /
+  `include_private: true`.
+- **True delete.** `mecha-graph redact --episode <uid>` purges the episode,
+  its raw archive, mentions, embeddings, FTS rows, enrichment, and derived
+  facts; `tombstone` keeps re-ingest from resurrecting it.
+- **Local by construction.** Nothing reaches the network except the
+  integrations you enable and ollama on localhost.
 
-- **Stream-first ingestion** (settled 2026-08-02): sources with APIs (Bee,
-  Slack, calendar URLs) stream straight into the DB — plaintext never touches
-  disk. File-based sources (iMessage chat.db copies, mbox exports) use
-  `retention = capture_delete`: full raw archived to `episode_raw` *inside
-  the encrypted DB*, then the file is deleted after the archive row is
-  verified. "Raw stays raw" (§2) is satisfied by the archive — `pkg raw
-  <uid>` shows it, and re-enrichment/re-extraction read from it.
-- **SQLCipher at rest** (§10): the raw key lives in `~/.mecha-graph/db.key` (0600),
-  picked up automatically by every `pkg`/`pkg-mcp` open (`MECHA_GRAPH_DB_KEY`/
-  `MECHA_GRAPH_DB_KEYFILE` override). Back the key up separately (password manager).
-  DuckDB can't read SQLCipher, so analytics use an ephemeral snapshot:
-  `pkg decrypt --out /tmp/analytics.db` (chmod 600) and attach that instead.
-- **FTS5 arm first** (open decision §13): tantivy can be swapped in behind the
-  same RRF interface; FlowMail keeps its tantivy index untouched.
-- **ICS calendar source** instead of OAuth Google/MS Graph: headless-friendly;
-  FlowMail's OAuth sync stays on macOS. RRULE masters are not expanded (v1).
-- **FlowMail untouched**: pkg-core is a fresh extraction following FlowMail's
-  patterns (same rusqlite/sqlite-vec stack, same migration runner). Pointing
-  FlowMail at pkg-core (spec Phase 1 step 3) is a separate macOS-side change.
-- **Bee/DM/SMS episodes are `private`** (§10): excluded from default
-  retrieval; use `--private` / `include_private: true` to opt in per query.
+## Analytics
 
-## Privacy (§10)
-
-`public < personal < private < secret`. Default retrieval excludes `private+`.
-`mecha-graph redact --episode <uid>` is the true-delete path: purges the episode, its
-raw archive, mentions, embeddings, FTS rows, enrichment, and derived facts.
-
-## Analytics (§8.4)
+DuckDB can't read SQLCipher, so analytics use an ephemeral snapshot:
 
 ```bash
-pkg decrypt --out /tmp/analytics.db   # ephemeral plaintext snapshot
+mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
 ```
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '/tmp/analytics.db' AS pkg (TYPE sqlite);
-SELECT source, COUNT(*) FROM pkg.episode GROUP BY source;
+ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
+SELECT source, COUNT(*) FROM graph.episode GROUP BY source;
 ```
+
+## Layout
+
+- `mecha-graph-core/` — the library. Knows nothing about any agent.
+- `mecha-graph-cli/` — the `mecha-graph` binary.
+- `mecha-graph-mcp/` — the stdio MCP server.
+- `docs/ARCHITECTURE.md` — episodes → mentions/nodes → facts → context
+  packs; the trust ladder; retrieval; time and privacy.
+- `docs/INTEGRATIONS.md` — per-integration auth/config and the at-rest
+  design.
+- `eval/` — the retrieval ruler, with the synthetic self-contained variant.
+
+MIT licensed. Maintained alongside
+[mecha](https://github.com/ljchang/mecha), whose docs site covers the
+agent-side half of the story: <https://docs.mecha-factory.ai/>.
