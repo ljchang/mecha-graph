@@ -1,7 +1,7 @@
 //! `pkg tui` — keystroke-speed surfaces for the jobs a one-shot CLI is bad at
-//! (§9.3, §11.1): review-queue triage, merge review, a search REPL with
+//!: review-queue triage, merge review, a search REPL with
 //! provenance drill-down (+ episode tag/note annotation), an entity browser
-//! with fact supersede (§11.5), and a GTD task board.
+//! with fact supersede, and a GTD task board.
 //!
 //! Keys: Tab/Shift-Tab cycle screens; 1-7 jump directly and q quits whenever
 //! nothing is being typed (Esc empties the buffer, so Esc-then-digit and
@@ -1523,7 +1523,7 @@ fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
             KeyCode::Char('m') if detail.episode_id.is_some() => {
                 detail.annotate = Some(("entity", LineEdit::new()))
             }
-            // Cycle the §10 sensitivity tier.
+            // Cycle the sensitivity tier.
             KeyCode::Char('p') => {
                 if let Some(id) = detail.episode_id {
                     if let Some(ep) = episode::get_episode(&app.conn, id)? {
@@ -1909,7 +1909,7 @@ fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     move_sel(&mut app.entity.list, app.entity.facts.len(), -1)
                 }
             }
-            // Supersede the selected fact (§11.5): ends both timelines now;
+            // Supersede the selected fact: ends both timelines now;
             // history stays queryable via timeline/as-of.
             KeyCode::Char('s') => {
                 let fact = app

@@ -1,4 +1,4 @@
-//! `pkg` CLI (§9.2).
+//! `pkg` CLI.
 
 mod render;
 mod tui;
@@ -170,7 +170,7 @@ enum Command {
         k: usize,
         #[arg(long, default_value_t = 4000)]
         budget: usize,
-        /// Include private-tier episodes (§10)
+        /// Include private-tier episodes
         #[arg(long)]
         private: bool,
         /// Bi-temporal: facts as of this date (YYYY-MM-DD)
@@ -205,7 +205,7 @@ enum Command {
         #[arg(long)]
         auto: bool,
     },
-    /// Health stats (§11.4)
+    /// Health stats
     Stats,
     /// Review pending fact candidates
     Review {
@@ -265,17 +265,17 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// True-delete an episode and everything derived from it (§10)
+    /// True-delete an episode and everything derived from it
     Redact {
         /// Episode uid
         episode: String,
     },
-    /// Run the gold-set eval (§11)
+    /// Run the gold-set eval
     Eval {
         #[arg(long, default_value = "eval/gold.jsonl")]
         gold: PathBuf,
     },
-    /// Tier-7 LLM extraction over pending episodes → fact candidates (§7)
+    /// Tier-7 LLM extraction over pending episodes → fact candidates
     Extract {
         #[arg(long, default_value_t = 25)]
         limit: usize,
@@ -338,7 +338,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Decay sweep (§11.5): re-derive every co-occurrence belief, close
+    /// Decay sweep: re-derive every co-occurrence belief, close
     /// the ones whose statistic has collapsed (valid time only — decay is
     /// not error), refresh drifted numbers, alarm on input-set collapse.
     Decay {
@@ -409,7 +409,7 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Refresh generated scope summaries (node_context.summary, §4.5)
+    /// Refresh generated scope summaries (node_context.summary)
     Summarize {
         #[arg(long, default_value_t = 30)]
         limit: usize,
@@ -419,7 +419,7 @@ enum Command {
         #[arg(long)]
         node: Option<String>,
     },
-    /// Generate the boot-injection memory file (§8.3, ~500 tokens)
+    /// Generate the boot-injection memory file (~500 tokens)
     MemoryMd {
         /// Write here instead of stdout (e.g. ~/.hermes/MEMORY.md target)
         #[arg(long)]
@@ -427,14 +427,14 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         budget: usize,
     },
-    /// Weekly review: stalled projects, waiting-on, inbox, orphan goals (§8.4)
+    /// Weekly review: stalled projects, waiting-on, inbox, orphan goals
     Gtd,
     /// Manage integrations (~/.mecha-graph/config.toml)
     Source {
         #[command(subcommand)]
         action: SourceAction,
     },
-    /// Encrypt the database in place with SQLCipher (§10); key → db.key
+    /// Encrypt the database in place with SQLCipher; key → db.key
     Encrypt {
         /// Also shred-delete the plaintext backup after verification
         #[arg(long)]
@@ -490,7 +490,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// List duplicate-person merge candidates (same full name, §9.3)
+    /// List duplicate-person merge candidates (same full name)
     Dups,
     /// Show or set the graph's owner — the person whose life this is
     Owner {
@@ -591,7 +591,7 @@ enum IngestSource {
         #[arg(long)]
         full: bool,
     },
-    /// Calendar from .ics file(s) — the identity bridge (§5.1)
+    /// Calendar from .ics file(s) — the identity bridge
     Ics {
         paths: Vec<PathBuf>,
         /// Your own email(s), excluded from person creation
@@ -890,7 +890,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             for (id, body) in rows {
                 linked += episode::link_by_alias_scan(&conn, id, &body)?;
             }
-            // ...then the §7 cascade (temporal → NPMI → kNN → structural), then rollups.
+            // ...then the linker cascade (temporal → NPMI → kNN → structural), then rollups.
             let cascade = mecha_graph_core::linkers::run_cascade(&conn)?;
             let people = rollup::rebuild_person_interactions(&conn)?;
             println!(
