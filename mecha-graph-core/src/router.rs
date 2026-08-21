@@ -10,7 +10,7 @@
 //! Ambiguity is a feature: "June" matching three people returns the
 //! disambiguation, not a silent guess.
 
-use crate::embed::OllamaEmbedder;
+use crate::embed::Embedder;
 use crate::episode;
 use crate::error::Result;
 use crate::graph;
@@ -596,7 +596,7 @@ fn lookup_column(query: &str) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub fn query(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query_str: &str,
     k: usize,
     budget_tokens: usize,
@@ -620,7 +620,7 @@ pub fn query(
 #[allow(clippy::too_many_arguments)]
 pub fn query_scoped(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query_str: &str,
     k: usize,
     budget_tokens: usize,
@@ -647,7 +647,7 @@ pub fn query_scoped(
 #[allow(clippy::too_many_arguments)]
 pub fn query_lens(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query_str: &str,
     k: usize,
     budget_tokens: usize,
@@ -881,7 +881,7 @@ fn touch_nudge(conn: &Connection, kind: &str, uid: &str) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn recall_into(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query_str: &str,
     tags: &[String],
     entities: &[DetectedEntity],

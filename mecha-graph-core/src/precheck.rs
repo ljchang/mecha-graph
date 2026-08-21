@@ -18,7 +18,7 @@
 //! Commitments (kind=commitment) are never auto-handled: they materialize
 //! tasks, and a wrong task on the GTD board costs attention daily.
 
-use crate::embed::OllamaEmbedder;
+use crate::embed::Embedder;
 use crate::error::Result;
 use crate::fact::{self, FactCandidate};
 use crate::graph;
@@ -26,8 +26,44 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
+// These two numbers encode ONE MODEL'S COSINE SCALE, and nothing about them
+// said so until 2026-08-20. That is the trap: they read as judgements about
+// similarity, and they are judgements about similarity *as measured by a
+// particular embedder*. Measured on identical text — the same claim in
+// different words, versus unrelated text:
+//
+//   nomic-embed-text-v1.5   same 0.8650   unrelated 0.5579   (gap 0.31)
+//   qwen3-embedding-0.6b    same 0.6926   unrelated 0.2786   (gap 0.41)
+//
+// A 0.93 written for the first scale means something else on the second, and
+// would silently stop matching anything.
+//
+// Recalibrated for harrier-oss-v1-0.6b by matching the OPERATING POINT rather
+// than the number: `dedupe-facts` swept over the same corpus twice, once
+// against the pre-migration backup (nomic vectors) and once against the
+// re-embedded store, choosing the threshold that selects the same population
+// of same-subject pairs.
+//
+//   threshold   nomic(bak)   harrier(live)
+//       0.99        23226         13160
+//       0.97        24010         29200   <- matches nomic @ 0.93
+//       0.95        24619         32362
+//       0.93        29273         37344
+//       0.83        85910         82566   <- matches nomic @ 0.83
+//
+// **This preserves the rate, not the accuracy.** If 0.93 was mis-set for
+// nomic, 0.97 is mis-set identically for harrier: the calibration inherits
+// what was true before rather than validating it. Doing better needs labelled
+// duplicate pairs, and this corpus has no non-circular source for them — the
+// structured triple does not determine the statement (same
+// (subject, predicate, object) routinely holds two different claims), so the
+// only oracle is a person. Until that exists, `precheck --auto-accept` is
+// deciding on a rate nobody has checked.
+
 /// Same-subject cosine at or above this is a duplicate statement.
-pub const SEMANTIC_DUP_THRESHOLD: f64 = 0.93;
+/// Calibrated for `harrier-oss-v1-0.6b`; `embed_meta` records which model the
+/// live vectors came from. Changing the embedder invalidates this number.
+pub const SEMANTIC_DUP_THRESHOLD: f64 = 0.97;
 /// Band [flag, dup): kept, but annotated with the similar existing fact.
 pub const SEMANTIC_FLAG_THRESHOLD: f64 = 0.83;
 
@@ -216,7 +252,7 @@ fn bump_observation(conn: &Connection, fact_id: i64) -> Result<()> {
 
 pub fn precheck_pending(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     auto_accept: bool,
 ) -> Result<PrecheckReport> {
     precheck_pending_opts(conn, embedder, auto_accept, false)
@@ -302,7 +338,7 @@ fn mint_recurring_subjects(conn: &Connection, dry_run: bool) -> Result<usize> {
 /// observation bumps, no payload annotations, no accepts.
 pub fn precheck_pending_opts(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     auto_accept: bool,
     dry_run: bool,
 ) -> Result<PrecheckReport> {
@@ -427,7 +463,7 @@ pub fn precheck_pending_opts(
         })
         .collect();
     let cand_vecs: Vec<Option<Vec<f32>>> = match embedder {
-        Some(e) if !fact_vecs.is_empty() || auto_accept => match e.embed(&statements, false) {
+        Some(e) if !fact_vecs.is_empty() || auto_accept => match e.embed(&statements, crate::embed::EmbedTask::Document) {
             Ok(vs) => vs.into_iter().map(Some).collect(),
             Err(_) => vec![None; candidates.len()],
         },

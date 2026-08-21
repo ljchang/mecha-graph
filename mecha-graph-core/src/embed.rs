@@ -1,89 +1,346 @@
-//! Embedding client: Ollama HTTP API with `nomic-embed-text` (768 dims), per
-//! the verified environment (§3). Cheap ingestion is separated from expensive
-//! embedding — call [`embed_pending`] in batches, e.g. nightly (§5.4).
+//! Embedding client: an OpenAI-compatible `/v1/embeddings` server (llama-server).
+//!
+//! Replaced the ollama client on 2026-08-20, alongside the chat path — see
+//! [`crate::llm`] for why the box stopped running two inference engines.
+//!
+//! Three things here are load-bearing and were not obvious:
+//!
+//! **The dimension is configuration, not a constant.** It used to be a
+//! `const EMBED_DIMS: usize = 768` beside a `FLOAT[768]` baked into the `vec0`
+//! DDL — two copies of one fact, and the constant was read by nothing, so only
+//! the DDL was real. [`ensure_vec_dims`] makes the table the single source of
+//! truth: it reads the declared width back out of `sqlite_master` and rebuilds
+//! the vector tables when it disagrees with the configured model.
+//!
+//! **Changing the embedder invalidates every stored vector, silently.** There
+//! is no version marker inside a vector and no way to tell a nomic 768 from a
+//! Qwen3-truncated 768 by looking at one. So the (model, instruction, dims)
+//! triple is recorded in `embed_meta` at write time and can be checked at read
+//! time — a mismatch is an error, not a slow drift in what a cosine means.
+//!
+//! **Cosine scales are not comparable across models, and thresholds encode
+//! one.** Measured on identical text — the same claim in different words,
+//! versus unrelated text:
+//!
+//!   nomic-embed-text-v1.5   same 0.8650   unrelated 0.5579   gap 0.3071
+//!   Qwen3-Embedding-0.6B    same 0.6926   unrelated 0.2786   gap 0.4140
+//!
+//! `precheck::SEMANTIC_DUP_THRESHOLD` is 0.93 — a number that only means
+//! "duplicate" on nomic's compressed scale, where even unrelated text sits at
+//! 0.56. Carried onto a model whose genuine paraphrases score 0.69, it would
+//! silently stop matching anything. Recalibration is part of a model change,
+//! not an optimisation to do afterwards.
 
 use crate::error::{Error, Result};
 use rusqlite::{params, Connection};
+use std::time::Duration;
 
-pub const EMBED_DIMS: usize = 768;
+/// Where the embedding server listens. Deliberately NOT :8080 — that is the
+/// chat model, and llama-server serves one model per process.
+pub const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:8081";
 
-pub struct OllamaEmbedder {
-    pub base_url: String,
-    pub model: String,
+/// Fallback when nothing is configured. 768 is what the store already holds
+/// (nomic-embed-text-v1.5), so an unconfigured install keeps working.
+pub const DEFAULT_EMBED_DIMS: usize = 768;
+
+/// What an embedding is *for*. The old signature was `is_query: bool`, which is
+/// this enum with two variants and no room for the third.
+///
+/// `Dedup` exists because `precheck` compares statement against statement —
+/// symmetric semantic similarity — while embedding both sides as retrieval
+/// *documents*. A `search_document:` representation is trained to make a
+/// passage findable by a query, not to place two phrasings of one claim close
+/// together, which is plausibly why the duplicate threshold has to sit as high
+/// as it does. Instruction-aware models can express the difference; nomic's two
+/// fixed prefixes could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTask {
+    /// Corpus text. Instruction-free for the Qwen and Harrier families, which
+    /// put the instruction on the query side only.
+    Document,
+    /// A search query.
+    Retrieval,
+    /// "Is this the same claim?" — precheck's question.
+    Dedup,
 }
 
-impl Default for OllamaEmbedder {
-    fn default() -> Self {
-        OllamaEmbedder {
-            base_url: std::env::var("MECHA_GRAPH_OLLAMA_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
-            model: std::env::var("MECHA_GRAPH_EMBED_MODEL")
-                .unwrap_or_else(|_| "nomic-embed-text".to_string()),
+impl EmbedTask {
+    /// Qwen3-Embedding format: `Instruct: {task}\nQuery: {text}`. A different
+    /// model family words these differently, and a wrong instruction is a
+    /// silent quality loss rather than an error — which is why the instruction
+    /// is part of the index identity recorded in `embed_meta`.
+    fn default_instruction(self) -> Option<&'static str> {
+        match self {
+            EmbedTask::Document => None,
+            EmbedTask::Retrieval => Some(
+                "Given a search query, retrieve relevant facts and episodes \
+                 from a personal knowledge graph",
+            ),
+            EmbedTask::Dedup => {
+                Some("Retrieve statements that assert the same fact as the given statement")
+            }
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            EmbedTask::Document => "document",
+            EmbedTask::Retrieval => "retrieval",
+            EmbedTask::Dedup => "dedup",
         }
     }
 }
 
-impl OllamaEmbedder {
-    /// Embed a batch of texts. nomic-embed-text expects task prefixes:
-    /// `search_document:` for corpus text, `search_query:` for queries.
-    pub fn embed(&self, texts: &[String], is_query: bool) -> Result<Vec<Vec<f32>>> {
+pub struct Embedder {
+    pub base_url: String,
+    pub model: String,
+    pub dims: usize,
+    /// Characters kept per input. Generous by default: the models in play carry
+    /// 32k-token windows, where nomic's 8k was the reason for the old
+    /// 8,000-char clip. Still bounded, because one pathological episode should
+    /// not become one pathological request.
+    pub max_chars: usize,
+    timeout: Duration,
+}
+
+impl Default for Embedder {
+    fn default() -> Self {
+        let cfg = crate::integrations::load_config()
+            .map(|c| c.llm)
+            .unwrap_or_default();
+        Embedder {
+            base_url: std::env::var("MECHA_GRAPH_EMBED_URL")
+                .ok()
+                .or(cfg.embed_url)
+                .unwrap_or_else(|| DEFAULT_EMBED_URL.to_string()),
+            model: std::env::var("MECHA_GRAPH_EMBED_MODEL")
+                .ok()
+                .or(cfg.embed_model)
+                .unwrap_or_else(|| "embed".to_string()),
+            dims: std::env::var("MECHA_GRAPH_EMBED_DIMS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(cfg.embed_dims)
+                .unwrap_or(DEFAULT_EMBED_DIMS),
+            max_chars: std::env::var("MECHA_GRAPH_EMBED_MAX_CHARS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or(cfg.embed_max_chars)
+                .unwrap_or(24_000),
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl Embedder {
+    /// Embed a batch. Returns one vector per input, in order.
+    ///
+    /// A batch is one HTTP request and llama-server bills the whole request
+    /// against `-c`, so a batch of ordinarily-sized inputs can overflow a
+    /// context that every individual input fits in comfortably. That is a
+    /// property of the batching, not of the data, and it killed a full
+    /// re-embed at 348 s in on a single 9,292-token request. Splitting and
+    /// retrying converges on the one input that genuinely does not fit, which
+    /// then fails with a message about that input — instead of aborting a
+    /// corpus-wide job and leaving a half-written index that still answers
+    /// queries.
+    pub fn embed(&self, texts: &[String], task: EmbedTask) -> Result<Vec<Vec<f32>>> {
+        match self.embed_once(texts, task) {
+            Ok(v) => Ok(v),
+            Err(e) if texts.len() > 1 && is_context_overflow(&e) => {
+                let mid = texts.len() / 2;
+                let mut out = self.embed(&texts[..mid], task)?;
+                out.extend(self.embed(&texts[mid..], task)?);
+                Ok(out)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn embed_once(&self, texts: &[String], task: EmbedTask) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let prefix = if is_query {
-            "search_query: "
-        } else {
-            "search_document: "
-        };
+        let instruction = task.default_instruction();
         let inputs: Vec<String> = texts
             .iter()
             .map(|t| {
-                // Truncate very long bodies; nomic's window is ~8k tokens.
-                let t: String = t.chars().take(8000).collect();
-                format!("{prefix}{t}")
+                let t: String = t.chars().take(self.max_chars).collect();
+                match instruction {
+                    Some(i) => format!("Instruct: {i}\nQuery: {t}"),
+                    None => t,
+                }
             })
             .collect();
 
-        let resp = ureq::post(&format!("{}/api/embed", self.base_url))
+        let resp = ureq::post(&format!("{}/v1/embeddings", self.base_url))
+            .timeout(self.timeout)
             .send_json(serde_json::json!({ "model": self.model, "input": inputs }))
-            .map_err(|e| Error::Embed(format!("ollama request failed: {e}")))?;
+            .map_err(|e| match e {
+                ureq::Error::Status(code, r) => {
+                    let detail = r.into_string().unwrap_or_default();
+                    Error::Embed(format!(
+                        "embedding server {code}: {}",
+                        detail.chars().take(300).collect::<String>()
+                    ))
+                }
+                other => Error::Embed(format!(
+                    "embedding server at {} unreachable: {other}. Start one with \
+                     `llama-server -m <gguf> --port 8081 --embeddings --pooling last`.",
+                    self.base_url
+                )),
+            })?;
 
         let body: serde_json::Value = resp
             .into_json()
-            .map_err(|e| Error::Embed(format!("bad ollama response: {e}")))?;
-
-        let embeddings = body["embeddings"]
+            .map_err(|e| Error::Embed(format!("bad embedding response: {e}")))?;
+        let data = body["data"]
             .as_array()
-            .ok_or_else(|| Error::Embed("no embeddings in response".into()))?;
+            .ok_or_else(|| Error::Embed("no data[] in embedding response".into()))?;
+        if data.len() != inputs.len() {
+            // Position is the only thing tying a vector to its row.
+            return Err(Error::Embed(format!(
+                "asked for {} embeddings, got {}",
+                inputs.len(),
+                data.len()
+            )));
+        }
 
-        embeddings
-            .iter()
-            .map(|e| {
-                e.as_array()
-                    .ok_or_else(|| Error::Embed("embedding not an array".into()))
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_f64().map(|f| f as f32))
-                            .collect()
-                    })
-            })
-            .collect()
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let v: Vec<f32> = item["embedding"]
+                .as_array()
+                .ok_or_else(|| Error::Embed("embedding not an array".into()))?
+                .iter()
+                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                .collect();
+            if v.len() != self.dims {
+                // Would otherwise fail later inside sqlite-vec with a message
+                // about the table, pointing at the wrong thing entirely.
+                return Err(Error::Embed(format!(
+                    "model returned {}-dim vectors but embed_dims is {} — the \
+                     configured model and the vector tables disagree",
+                    v.len(),
+                    self.dims
+                )));
+            }
+            out.push(v);
+        }
+        Ok(out)
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        Ok(self
-            .embed(&[text.to_string()], true)?
+        self.embed(&[text.to_string()], EmbedTask::Retrieval)?
             .into_iter()
             .next()
-            .ok_or_else(|| Error::Embed("empty embedding batch".into()))?)
+            .ok_or_else(|| Error::Embed("empty embedding batch".into()))
     }
 
     pub fn available(&self) -> bool {
-        ureq::get(&format!("{}/api/tags", self.base_url))
-            .timeout(std::time::Duration::from_millis(1500))
+        ureq::get(&format!("{}/health", self.base_url))
+            .timeout(Duration::from_millis(1500))
             .call()
             .is_ok()
     }
+}
+
+/// Recognised by message text, because llama-server gives the condition a
+/// `type` in the body but the transport only surfaces the status. Same
+/// approach, and the same reason, as mecha's `is_context_overflow`.
+fn is_context_overflow(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("exceed_context_size") || s.contains("exceeds the available context size")
+}
+
+/// The declared width of the vector tables, read back out of the schema. The
+/// table is the source of truth: a constant beside it can be, and was, wrong.
+pub fn declared_vec_dims(conn: &Connection) -> Result<Option<usize>> {
+    declared_vec_dims_in(conn, "main")
+}
+
+/// The same, for an ATTACHed database.
+///
+/// Needed because `db::export_plaintext` builds its destination with
+/// `run_migrations`, which creates the vector tables at the default width, and
+/// then copies rows out of a source that may have been rebuilt to a different
+/// one by a model change. The failure is a sqlite-vec "Dimension mismatch …
+/// expected 768, received 1024" that names the column and not the cause.
+pub fn declared_vec_dims_in(conn: &Connection, schema: &str) -> Result<Option<usize>> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row(
+            &format!("SELECT sql FROM {schema}.sqlite_master WHERE name = 'vec_episode'"),
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else { return Ok(None) };
+    let Some(start) = sql.find("FLOAT[") else {
+        return Ok(None);
+    };
+    let rest = &sql[start + 6..];
+    let end = rest.find(']').unwrap_or(0);
+    Ok(rest[..end].parse::<usize>().ok())
+}
+
+/// Make the vector tables match `dims`, rebuilding them if they do not.
+///
+/// Destructive by necessity and by design: vectors of a different width, or
+/// from a different model, are not convertible, and keeping them would leave a
+/// table holding two incompatible geometries with nothing to tell them apart.
+/// The caller re-embeds afterwards. Returns true when a rebuild happened.
+pub fn ensure_vec_dims(conn: &Connection, dims: usize) -> Result<bool> {
+    match declared_vec_dims(conn)? {
+        Some(d) if d == dims => Ok(false),
+        _ => {
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS vec_episode;
+                 DROP TABLE IF EXISTS vec_fact;
+                 CREATE VIRTUAL TABLE vec_episode USING vec0(episode_id INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);
+                 CREATE VIRTUAL TABLE vec_fact    USING vec0(fact_id    INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);"
+            ))?;
+            Ok(true)
+        }
+    }
+}
+
+/// Record what produced the vectors currently in the store.
+///
+/// Without this, swapping a model leaves a table of numbers that look fine,
+/// answer queries, and mean something different than the thresholds reading
+/// them assume. Nothing about a vector reveals that from the outside.
+pub fn set_embed_meta(conn: &Connection, model: &str, dims: usize, instruction: &str) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embed_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            model TEXT NOT NULL, dims INTEGER NOT NULL,
+            instruction TEXT NOT NULL, written_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    )?;
+    conn.execute(
+        "INSERT INTO embed_meta (id, model, dims, instruction, written_at)
+         VALUES (1, ?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET model=?1, dims=?2, instruction=?3, written_at=datetime('now')",
+        params![model, dims as i64, instruction],
+    )?;
+    Ok(())
+}
+
+pub fn get_embed_meta(conn: &Connection) -> Result<Option<(String, usize, String)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT model, dims, instruction FROM embed_meta WHERE id = 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap_or(None))
 }
 
 fn vec_to_json(v: &[f32]) -> String {
@@ -94,7 +351,7 @@ fn vec_to_json(v: &[f32]) -> String {
 /// Embed episodes that don't yet have a vector. Returns count embedded.
 pub fn embed_pending_episodes(
     conn: &Connection,
-    embedder: &OllamaEmbedder,
+    embedder: &Embedder,
     limit: usize,
     batch_size: usize,
 ) -> Result<usize> {
@@ -110,7 +367,7 @@ pub fn embed_pending_episodes(
     let mut total = 0;
     for chunk in rows.chunks(batch_size.max(1)) {
         let texts: Vec<String> = chunk.iter().map(|(_, b)| b.clone()).collect();
-        let vecs = embedder.embed(&texts, false)?;
+        let vecs = embedder.embed(&texts, EmbedTask::Document)?;
         for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
             conn.execute(
                 "INSERT OR REPLACE INTO vec_episode (episode_id, embedding) VALUES (?1, ?2)",
@@ -125,7 +382,7 @@ pub fn embed_pending_episodes(
 /// Embed facts (their NL `statement` — the embed target, §4.3) lacking vectors.
 pub fn embed_pending_facts(
     conn: &Connection,
-    embedder: &OllamaEmbedder,
+    embedder: &Embedder,
     limit: usize,
     batch_size: usize,
 ) -> Result<usize> {
@@ -141,7 +398,7 @@ pub fn embed_pending_facts(
     let mut total = 0;
     for chunk in rows.chunks(batch_size.max(1)) {
         let texts: Vec<String> = chunk.iter().map(|(_, s)| s.clone()).collect();
-        let vecs = embedder.embed(&texts, false)?;
+        let vecs = embedder.embed(&texts, EmbedTask::Document)?;
         for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
             conn.execute(
                 "INSERT OR REPLACE INTO vec_fact (fact_id, embedding) VALUES (?1, ?2)",
@@ -151,4 +408,69 @@ pub fn embed_pending_facts(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_document_carries_no_instruction() {
+        // Both candidate families instruct the query side only. Prefixing a
+        // document would bake the instruction text into the stored vector.
+        assert!(EmbedTask::Document.default_instruction().is_none());
+        assert!(EmbedTask::Retrieval.default_instruction().is_some());
+    }
+
+    #[test]
+    fn dedup_and_retrieval_ask_different_questions() {
+        assert_ne!(
+            EmbedTask::Dedup.default_instruction(),
+            EmbedTask::Retrieval.default_instruction()
+        );
+    }
+
+    #[test]
+    fn the_embed_url_is_not_the_chat_url() {
+        // llama-server serves one model per process; pointing these at one port
+        // silently sends embedding requests to the chat model.
+        assert_ne!(DEFAULT_EMBED_URL, crate::llm::DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn declared_dims_round_trip_through_the_schema() {
+        let conn = crate::db::open_memory().expect("memory db");
+        // The schema, not a constant, is what the embedder must agree with.
+        assert!(ensure_vec_dims(&conn, 1024).expect("rebuild"));
+        assert_eq!(declared_vec_dims(&conn).unwrap(), Some(1024));
+        assert!(!ensure_vec_dims(&conn, 1024).expect("idempotent"));
+        assert!(ensure_vec_dims(&conn, 768).expect("rebuild back"));
+        assert_eq!(declared_vec_dims(&conn).unwrap(), Some(768));
+    }
+
+    #[test]
+    fn a_context_overflow_is_recognised_by_message() {
+        // The split-and-retry hinges on this. A false negative aborts a
+        // corpus-wide re-embed; a false positive costs one extra request.
+        assert!(is_context_overflow(&Error::Embed(
+            "embedding server 400: {\"error\":{\"type\":\"exceed_context_size_error\"}}".into()
+        )));
+        assert!(is_context_overflow(&Error::Embed(
+            "request (9292 tokens) exceeds the available context size (8192 tokens)".into()
+        )));
+        assert!(!is_context_overflow(&Error::Embed("connection refused".into())));
+    }
+
+    #[test]
+    fn embed_meta_records_the_index_identity() {
+        let conn = crate::db::open_memory().expect("memory db");
+        set_embed_meta(&conn, "qwen3-embedding-0.6b", 1024, "retrieval-v1").unwrap();
+        assert_eq!(
+            get_embed_meta(&conn).unwrap(),
+            Some(("qwen3-embedding-0.6b".into(), 1024, "retrieval-v1".into()))
+        );
+        // Overwrite, not append: there is one live index, not a history.
+        set_embed_meta(&conn, "other", 768, "x").unwrap();
+        assert_eq!(get_embed_meta(&conn).unwrap().unwrap().1, 768);
+    }
 }

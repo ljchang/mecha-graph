@@ -31,6 +31,7 @@ pub mod integrations;
 pub mod ladder;
 pub mod ledger;
 pub mod linkers;
+pub mod llm;
 pub mod migrations;
 pub mod precheck;
 pub mod probe;

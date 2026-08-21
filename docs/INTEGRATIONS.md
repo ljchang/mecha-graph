@@ -34,7 +34,7 @@ need zero config.
 | Slack | source | user token `xoxp-…` (or bot `xoxb-…`) | ✅ built — `mecha-graph source add slack --token …` |
 | SMS / iMessage | source | synced copy of chat.db (Mac: Full Disk Access) | ✅ built — `mecha-graph source add imessage --db …` |
 | Email (mbox) | source | none — mbox export (Gmail Takeout etc.) | ✅ built — `mecha-graph source add mbox --path …` |
-| Ollama (embed + extract) | infra | none (localhost) | ✅ |
+| llama-server (embed + extract) | infra | none (localhost) | ✅ shared with mecha; :8080 chat, :8081 embed |
 | Hermes (agent) | consumer | none (local stdio MCP) | ✅ wired |
 | Claude Code (agent) | consumer | none (local stdio MCP) | ✅ wired |
 | DuckDB analytics | consumer | none (reads the SQLite file) | ✅ |
@@ -93,13 +93,58 @@ need zero config.
 
 ## Infrastructure
 
-### Ollama (embeddings + Tier-7 extraction)
-- **Auth**: none — localhost service.
-- **Config**: `MECHA_GRAPH_OLLAMA_URL` (default `http://127.0.0.1:11434`),
-  `MECHA_GRAPH_EMBED_MODEL` (default `nomic-embed-text`), extraction model via
-  `pkg extract --model` / `EXTRACT_MODEL` in `nightly.env`.
-- Models must be pulled once: `ollama pull nomic-embed-text` (done),
-  `gemma4:e4b` + `qwen3.6:35b` (already present).
+### llama-server (embeddings + Tier-7 extraction)
+
+Replaced ollama on 2026-08-20. Not for tidiness: ollama runs its own
+`llama-server` underneath, so the choice was never about the engine — only
+about who sets the flags. Running both meant **two copies of the same 35B
+model** resident at once (57.5 GB of a 121 GB unified pool), at a different
+quantisation, under a chatml template override, with `--context-shift` on and
+`--reasoning-budget` absent, so reasoning ran unbounded. What exactly caused
+the 300 s extraction timeouts is **not established** — the measured
+contributor is contention (two copies on one GPU put generation at 28 tok/s
+against a 79.8 baseline); unbounded reasoning is plausible and was never
+isolated.
+
+- **Auth**: none — localhost.
+- **Two endpoints, because llama-server holds one model per process:**
+  - chat/extraction — `MECHA_GRAPH_CHAT_URL` or `[llm] base_url`,
+    default `http://127.0.0.1:8080`
+  - embeddings — `MECHA_GRAPH_EMBED_URL` or `[llm] embed_url`,
+    default `http://127.0.0.1:8081`
+- **Shared by default, never duplicated.** `Backend::resolve` probes
+  `{base_url}/health`; if anything answers, it is used as-is. Installed beside
+  mecha that is mecha's own server, holding the model once. There is
+  deliberately no code that looks for mecha or reads its config —
+  mecha-graph-core knows nothing about any agent (lib.rs rule 1), and a user
+  running their own llama-server gets the shared path for the same reason.
+- **Starting a server is opt-in, gated on `[llm] model_path`.** A machine that
+  has not named a GGUF cannot start one, which is the whole safety property:
+  probe-and-spawn on its own would answer a transient outage of mecha's server
+  by loading a second 20 GB copy — silently, at 03:30, for the rest of the
+  night. Nothing ever spawns at a URL that already answers, and a managed
+  server is killed when the process exits.
+- **The served model is discovered, not asserted.** llama-server ignores a
+  request's `model` field, so `GET /props` → `model_alias` is what gets
+  recorded in `extract_state.model`. A mismatch against an explicitly pinned
+  `[llm] model` warns rather than refuses: a nightly that dies the first time
+  you try a different model in the TUI would make the graph's health depend on
+  remembering to edit a second config.
+- **Embedding config**: `[llm] embed_model`, `embed_dims`, `embed_max_chars`.
+  `embed::ensure_vec_dims` reconciles the `vec0` tables to `embed_dims` by
+  rebuilding them — destructive by necessity, since vectors of a different
+  width or model are not convertible — and `embed_meta` records
+  (model, dims, instruction) so a swap is detectable afterwards.
+  **Changing the embedder invalidates `precheck`'s thresholds**, which encode
+  one model's cosine scale: measured on identical text, a same-claim pair
+  scores 0.8650 on nomic and 0.6926 on Qwen3-Embedding-0.6B, against a
+  `SEMANTIC_DUP_THRESHOLD` of 0.93. Recalibrate before re-enabling
+  `precheck --auto-accept`.
+- Serve an embedder with
+  `llama-server -m <gguf> --port 8081 --embeddings --pooling last --embd-normalize 2`.
+
+mecha's `docs/LLAMA-SERVER.md` is the full operational reference: slot
+geometry, KV arithmetic, the measured `-np` table, and the request contract.
 
 ### Database & encryption
 - DB: `~/.mecha-graph/graph.db` (override `MECHA_GRAPH_DB` or `--db`). Dir is chmod 700.

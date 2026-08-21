@@ -2,7 +2,7 @@
 //! Gold queries live in `eval/gold.jsonl`; `run` reports recall@10 and MRR
 //! per job so a change that helps one job and hurts another is visible.
 
-use crate::embed::OllamaEmbedder;
+use crate::embed::Embedder;
 use crate::error::Result;
 use crate::router;
 use rusqlite::Connection;
@@ -77,7 +77,7 @@ pub fn load_gold(path: &std::path::Path) -> Result<Vec<GoldQuery>> {
 
 pub fn run(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     gold: &[GoldQuery],
 ) -> Result<EvalReport> {
     let mut results = Vec::new();

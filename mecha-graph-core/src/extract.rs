@@ -11,6 +11,7 @@
 use crate::error::{Error, Result};
 use crate::fact::{self, ProposedFact};
 use crate::graph;
+use crate::llm::ChatClient;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 
@@ -21,45 +22,74 @@ use serde::Deserialize;
 // what make that safe.
 pub const PROMPT_VERSION: i64 = 2;
 
-pub struct OllamaChat {
-    pub base_url: String,
-    pub model: String,
-}
+/// The entity types the prompt admits. Duplicated into the schema below so
+/// the sampler enforces what the prose asks for — keep the two in step.
+const ENTITY_TYPES: [&str; 11] = [
+    "person", "place", "org", "project", "goal", "area", "task", "event", "topic", "artifact",
+    "document",
+];
 
-impl OllamaChat {
-    pub fn new(model: &str) -> Self {
-        OllamaChat {
-            base_url: std::env::var("MECHA_GRAPH_OLLAMA_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
-            model: model.to_string(),
+/// The output shape, as a grammar rather than as a request.
+///
+/// `predicate` is the point: the closed vocabulary lives in the `predicate`
+/// table, the prompt has always said "MUST be one of", and nothing downstream
+/// checked — `propose_fact` stages whatever string arrives, so an out-of-vocab
+/// predicate became a candidate no consumer could interpret. As an enum in the
+/// schema it is unrepresentable instead.
+///
+/// Optional fields are spelled `["string", "null"]` and listed in `required`
+/// rather than omitted: a nullable-but-present field compiles to a flat
+/// grammar, where optional properties compile to a combinatorial one. serde
+/// reads `null` into `Option::None` either way.
+fn extraction_schema(predicates: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entities", "facts", "commitments"],
+        "properties": {
+            "entities": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "type", "identifier"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "type": { "type": "string", "enum": ENTITY_TYPES },
+                    "identifier": { "type": ["string", "null"] }
+                }
+            }},
+            "facts": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subject", "predicate", "object", "object_value",
+                             "statement", "confidence"],
+                "properties": {
+                    "subject": { "type": "string" },
+                    "predicate": { "type": "string", "enum": predicates },
+                    "object": { "type": ["string", "null"] },
+                    "object_value": { "type": ["string", "null"] },
+                    "statement": { "type": "string" },
+                    "confidence": { "type": ["number", "null"] }
+                }
+            }},
+            "commitments": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["who", "what", "when", "direction", "confidence"],
+                "properties": {
+                    "who": { "type": "string" },
+                    "what": { "type": "string" },
+                    "when": { "type": ["string", "null"] },
+                    // Two values only. A model unsure of direction still has
+                    // the out the prompt asks for — emit no commitment at all
+                    // — because the *array* may be empty. Inverting is worse
+                    // than not extracting (§6), and that stays true here.
+                    "direction": { "type": "string",
+                                   "enum": ["owed_by_me", "owed_to_me"] },
+                    "confidence": { "type": ["number", "null"] }
+                }
+            }}
         }
-    }
-
-    /// One JSON-mode chat completion.
-    pub fn complete_json(&self, system: &str, user: &str) -> Result<serde_json::Value> {
-        let resp = ureq::post(&format!("{}/api/chat", self.base_url))
-            .timeout(std::time::Duration::from_secs(300))
-            .send_json(serde_json::json!({
-                "model": self.model,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user }
-                ],
-                "format": "json",
-                "stream": false,
-                "options": { "temperature": 0.1 }
-            }))
-            .map_err(|e| Error::Other(format!("ollama chat failed: {e}")))?;
-        let body: serde_json::Value = resp
-            .into_json()
-            .map_err(|e| Error::Other(format!("bad ollama response: {e}")))?;
-        let content = body
-            .pointer("/message/content")
-            .and_then(|c| c.as_str())
-            .ok_or_else(|| Error::Other("no content in ollama response".into()))?;
-        serde_json::from_str(content)
-            .map_err(|e| Error::Parse(format!("model returned invalid JSON: {e}")))
-    }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,11 +135,18 @@ struct ExtractedCommitment {
     confidence: Option<f64>,
 }
 
-fn system_prompt(conn: &Connection) -> Result<String> {
+/// The closed vocabulary, read once per run. Feeds both the prose and the
+/// grammar, so the two cannot drift apart.
+fn predicates(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT name FROM predicate ORDER BY name")?;
-    let predicates: Vec<String> = stmt
+    let names: Vec<String> = stmt
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
+    Ok(names)
+}
+
+fn system_prompt(conn: &Connection) -> Result<String> {
+    let predicates = predicates(conn)?;
     // The owner's name comes from the graph, never from this source file: a
     // hardcoded name is wrong for every other deployment and personal data
     // in a repo headed for the public.
@@ -173,7 +210,7 @@ pub struct ExtractReport {
 /// `sources`: restrict to these episode sources (None = all).
 pub fn extract_pending(
     conn: &Connection,
-    chat: &OllamaChat,
+    chat: &ChatClient,
     limit: usize,
     sources: Option<&[&str]>,
 ) -> Result<ExtractReport> {
@@ -201,6 +238,7 @@ pub fn extract_pending(
         .collect::<std::result::Result<_, _>>()?;
 
     let system = system_prompt(conn)?;
+    let schema = extraction_schema(&predicates(conn)?);
     let mut report = ExtractReport::default();
 
     for (episode_id, _uid, body, occurred_at) in rows {
@@ -208,6 +246,7 @@ pub fn extract_pending(
             conn,
             chat,
             &system,
+            &schema,
             episode_id,
             &body,
             &occurred_at,
@@ -226,7 +265,7 @@ pub fn extract_pending(
 /// claim the owner already said no to.
 pub fn reextract_episode(
     conn: &Connection,
-    chat: &OllamaChat,
+    chat: &ChatClient,
     episode: &str,
 ) -> Result<ExtractReport> {
     use rusqlite::OptionalExtension;
@@ -245,11 +284,13 @@ pub fn reextract_episode(
         params![episode_id],
     )?;
     let system = system_prompt(conn)?;
+    let schema = extraction_schema(&predicates(conn)?);
     let mut report = ExtractReport::default();
     extract_episode(
         conn,
         chat,
         &system,
+        &schema,
         episode_id,
         &body,
         &occurred_at,
@@ -260,8 +301,9 @@ pub fn reextract_episode(
 
 fn extract_episode(
     conn: &Connection,
-    chat: &OllamaChat,
+    chat: &ChatClient,
     system: &str,
+    schema: &serde_json::Value,
     episode_id: i64,
     body: &str,
     occurred_at: &str,
@@ -293,7 +335,7 @@ fn extract_episode(
             format!("Episode date: {occurred_at}\n{hints}\n{body_trunc}\n\n{CLOSING_IMPERATIVE}");
 
         let parsed: Extraction = match chat
-            .complete_json(&system, &user)
+            .complete_schema(system, &user, "extraction", schema.clone())
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         {
             Ok(p) => p,

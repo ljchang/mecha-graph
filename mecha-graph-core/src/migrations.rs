@@ -87,6 +87,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "agent_verdict",
         sql: V015_AGENT_VERDICT,
     },
+    Migration {
+        version: 16,
+        name: "embed_meta",
+        sql: V016_EMBED_META,
+    },
 ];
 
 const V015_AGENT_VERDICT: &str = r#"
@@ -852,4 +857,28 @@ INSERT OR IGNORE INTO predicate_alias (alias, name) VALUES
     ('waiting_for', 'waiting_on'),
     ('blocked_on', 'blocked_by'),
     ('wrote', 'authored');
+"#;
+
+/// Which model produced the vectors currently in the store.
+///
+/// Added 2026-08-20 with the move off nomic-embed-text. Nothing about a vector
+/// reveals what made it: a 768-dim nomic vector and a 768-dim truncated Qwen
+/// vector are indistinguishable, and a store holding both answers queries
+/// confidently and wrongly. `precheck`'s duplicate thresholds encode one
+/// model's cosine scale, so a silent swap moves what 0.93 means.
+///
+/// It is a migration rather than a CREATE TABLE IF NOT EXISTS inside the
+/// writer, which is where it started: a table created lazily by one function is
+/// invisible to everything that reasons about the schema. `db::copy_all_tables`
+/// walks a fixed list, so the lazily-created version was silently dropped from
+/// every `decrypt` snapshot — found by checking a snapshot rather than by any
+/// failure.
+const V016_EMBED_META: &str = r#"
+CREATE TABLE IF NOT EXISTS embed_meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    model       TEXT NOT NULL,
+    dims        INTEGER NOT NULL,
+    instruction TEXT NOT NULL,
+    written_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;

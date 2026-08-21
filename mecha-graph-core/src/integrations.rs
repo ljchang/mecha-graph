@@ -40,10 +40,82 @@ fn default_true() -> bool {
     true
 }
 
+/// Where the Tier-7 extractor and the summariser get their completions.
+///
+/// Everything here is optional, and the defaults are the *shared* case: an
+/// OpenAI-compatible server already answering at `crate::llm::DEFAULT_BASE_URL`.
+/// Installed beside mecha that is mecha's own llama-server, holding the model
+/// once.
+///
+/// `model_path` is the only field that grants mecha-graph permission to start
+/// a server itself, and its absence is a safety property rather than an
+/// omission — see the note on [`crate::llm`]. A machine that has not named a
+/// GGUF cannot end up running a second copy of a 20 GB model because a health
+/// check happened to fail at 03:30.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// Override the endpoint. Rarely needed: a non-default port, or a server
+    /// on another machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Override the model name sent in the request. Must match the server's
+    /// `--alias` where it serves more than one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A GGUF to serve when nothing answers at `base_url`. Setting this opts
+    /// into mecha-graph managing a llama-server of its own — the standalone
+    /// install. Leave unset wherever another server is expected to exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
+    /// Defaults to `llama-server` on PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_bin: Option<String>,
+    /// Extra flags for a managed server, appended after the defaults so they
+    /// can override them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_args: Option<Vec<String>>,
+
+    // ── Embeddings ──────────────────────────────────────────────────────────
+    // A separate server from the chat one, because llama-server holds one model
+    // per process. Never the same port.
+    /// Defaults to `crate::embed::DEFAULT_EMBED_URL` (:8081).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
+    /// Output width of the embedding model. Must match what the server returns
+    /// and what the `vec0` tables declare; `embed::ensure_vec_dims` reconciles
+    /// the tables to this, and re-embedding follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_dims: Option<usize>,
+    /// Per-input character cap. The old 8,000 existed because nomic's window
+    /// was ~8k tokens; the current candidates carry 32k.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_max_chars: Option<usize>,
+}
+
+impl LlmConfig {
+    fn is_empty(&self) -> bool {
+        self.base_url.is_none()
+            && self.model.is_none()
+            && self.model_path.is_none()
+            && self.server_bin.is_none()
+            && self.server_args.is_none()
+            && self.embed_url.is_none()
+            && self.embed_model.is_none()
+            && self.embed_dims.is_none()
+            && self.embed_max_chars.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub sources: BTreeMap<String, SourceConfig>,
+    /// Skipped when empty so `source add` does not start writing an inert
+    /// `[llm]` table into every existing config on the next save.
+    #[serde(default, skip_serializing_if = "LlmConfig::is_empty")]
+    pub llm: LlmConfig,
 }
 
 pub fn config_path() -> PathBuf {

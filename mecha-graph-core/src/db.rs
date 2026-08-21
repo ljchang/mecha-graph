@@ -116,6 +116,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// were missed for a while: encrypt/decrypt copies silently dropped
 /// annotations, undo history and tombstones until the fork work caught it.)
 const COPY_TABLES: &[&str] = &[
+    "embed_meta",
     "nodes",
     "node_alias",
     "node_identifier",
@@ -275,6 +276,17 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
         db_path.display(),
         key.replace('"', "")
     ))?;
+    // The destination schema came from run_migrations, which creates the vector
+    // tables at the default width. The SOURCE may hold a different one — a
+    // model change rebuilds them through embed::ensure_vec_dims — and copying
+    // wide vectors into a narrow table fails with a sqlite-vec "Dimension
+    // mismatch" that names the column and not the cause. Match the destination
+    // to what the source actually holds, read off its schema rather than off
+    // config: a snapshot must reproduce the database it is a snapshot of, even
+    // when config has since moved on.
+    if let Some(dims) = crate::embed::declared_vec_dims_in(&conn, "src")? {
+        crate::embed::ensure_vec_dims(&conn, dims)?;
+    }
     // Transaction pins a consistent read snapshot vs concurrent writers.
     conn.execute_batch("BEGIN;")?;
     copy_all_tables(&conn)?;

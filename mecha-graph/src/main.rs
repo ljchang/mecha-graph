@@ -155,7 +155,7 @@ enum Command {
         #[command(subcommand)]
         source: IngestSource,
     },
-    /// Embed pending episodes and facts via Ollama
+    /// Embed pending episodes and facts via the local embedding server (:8081)
     Embed {
         #[arg(long, default_value_t = 100000)]
         limit: usize,
@@ -279,7 +279,7 @@ enum Command {
     Extract {
         #[arg(long, default_value_t = 25)]
         limit: usize,
-        #[arg(long, default_value = "gemma4:e4b")]
+        #[arg(long, default_value = mecha_graph_core::llm::DEFAULT_MODEL)]
         model: String,
         /// Restrict to sources, e.g. bee.conversation
         #[arg(long)]
@@ -399,7 +399,11 @@ enum Command {
     },
     /// List near-duplicate live facts (same subject, similar statements)
     DedupeFacts {
-        #[arg(long, default_value_t = 0.93)]
+        // Reads the constant rather than repeating it. It was a literal 0.93
+        // until 2026-08-20, which meant the recalibration for a new embedding
+        // model moved precheck's threshold and left this one behind — two
+        // copies of one fact, and only one of them corrected.
+        #[arg(long, default_value_t = mecha_graph_core::precheck::SEMANTIC_DUP_THRESHOLD)]
         threshold: f64,
         /// Only exact matches after case/punctuation normalization — the
         /// tier that is safe to --apply
@@ -413,7 +417,7 @@ enum Command {
     Summarize {
         #[arg(long, default_value_t = 30)]
         limit: usize,
-        #[arg(long, default_value = "gemma4:e4b")]
+        #[arg(long, default_value = mecha_graph_core::llm::DEFAULT_MODEL)]
         model: String,
         /// Refresh one specific node (by id) regardless of staleness
         #[arg(long)]
@@ -739,15 +743,34 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         },
 
         Command::Embed { limit, batch } => {
-            let embedder = embed::OllamaEmbedder::default();
+            let embedder = embed::Embedder::default();
             if !embedder.available() {
                 return Err(mecha_graph_core::Error::Embed(format!(
-                    "ollama not reachable at {} — is it running?",
+                    "no embedding server at {} — start one with `llama-server -m <gguf> \
+                     --port 8081 --embeddings --pooling last --embd-normalize 2`",
                     embedder.base_url
                 )));
             }
+            // A width change means every stored vector is unusable, so the
+            // tables are rebuilt and the whole corpus re-embedded. Say so
+            // loudly: this is the one command that can discard an index, and
+            // an "embedded 0 episodes" afterwards would look routine.
+            if embed::ensure_vec_dims(&conn, embedder.dims)? {
+                eprintln!(
+                    "mecha-graph: vector tables rebuilt at {} dims — every vector must be \
+                     re-embedded, and precheck's thresholds are calibrated to the OLD model. \
+                     Do not run `precheck --auto-accept` until they are re-derived.",
+                    embedder.dims
+                );
+            }
             let n_ep = embed::embed_pending_episodes(&conn, &embedder, limit, batch)?;
             let n_f = embed::embed_pending_facts(&conn, &embedder, limit, batch)?;
+            embed::set_embed_meta(
+                &conn,
+                &embedder.model,
+                embedder.dims,
+                embed::EmbedTask::Document.tag(),
+            )?;
             println!("embedded {n_ep} episodes, {n_f} facts");
         }
 
@@ -791,7 +814,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
                 return Ok(());
             }
-            let embedder = embed::OllamaEmbedder::default();
+            let embedder = embed::Embedder::default();
             let emb = embedder.available().then_some(&embedder);
             let pack = router::query_lens(&conn, emb, &query, k, budget, private, Some("cli.query"), lens)?;
             if want_json(cli_json, cli_text) {
@@ -1310,7 +1333,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let embedder = if no_semantic {
                 None
             } else {
-                let e = embed::OllamaEmbedder::default();
+                let e = embed::Embedder::default();
                 e.available().then_some(e)
             };
             let r = mecha_graph_core::precheck::precheck_pending_opts(
@@ -1331,7 +1354,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 r.predicate_canonicalized, r.eventive_rejected, r.rejected_dup
             );
             if embedder.is_none() && !no_semantic {
-                println!("(ollama unreachable — semantic tier skipped)");
+                println!("(embedding server unreachable — semantic tier skipped)");
             }
         }
 
@@ -1548,7 +1571,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         }
 
         Command::Summarize { limit, model, node } => {
-            let chat = mecha_graph_core::extract::OllamaChat::new(&model);
+            let chat = mecha_graph_core::llm::ChatClient::connect(&model)?;
             match node {
                 Some(id) => {
                     let done = mecha_graph_core::summarize::summarize_node(&conn, &chat, &id)?;
@@ -1571,7 +1594,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         }
 
         Command::Extract { limit, model, source, episode } => {
-            let chat = mecha_graph_core::extract::OllamaChat::new(&model);
+            let chat = mecha_graph_core::llm::ChatClient::connect(&model)?;
             let report = if let Some(ep) = episode {
                 mecha_graph_core::extract::reextract_episode(&conn, &chat, &ep)?
             } else {
@@ -1803,7 +1826,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Eval { gold } => {
             let queries = eval::load_gold(&gold)?;
-            let embedder = embed::OllamaEmbedder::default();
+            let embedder = embed::Embedder::default();
             let emb = embedder.available().then_some(&embedder);
             let report = eval::run(&conn, emb, &queries)?;
             for j in &report.per_job {

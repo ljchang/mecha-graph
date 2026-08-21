@@ -13,7 +13,7 @@
 
 use crate::context;
 use crate::error::Result;
-use crate::extract::OllamaChat;
+use crate::llm::ChatClient;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -137,7 +137,7 @@ over generic filler. Do not mention the evidence block or the knowledge graph it
 
 /// Generate and store the summary for one node. Returns false if the node has
 /// no evidence worth summarizing.
-pub fn summarize_node(conn: &Connection, chat: &OllamaChat, node_id: &str) -> Result<bool> {
+pub fn summarize_node(conn: &Connection, chat: &ChatClient, node_id: &str) -> Result<bool> {
     let Some(evidence) = summary_evidence(conn, node_id)? else {
         return Ok(false);
     };
@@ -155,7 +155,7 @@ pub fn summarize_node(conn: &Connection, chat: &OllamaChat, node_id: &str) -> Re
 /// nightly pipeline.
 pub fn refresh_summaries(
     conn: &Connection,
-    chat: &OllamaChat,
+    chat: &ChatClient,
     limit: usize,
 ) -> Result<SummarizeReport> {
     let mut report = SummarizeReport::default();

@@ -21,7 +21,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let embedder = embed::OllamaEmbedder::default();
+    let embedder = embed::Embedder::default();
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -264,7 +264,7 @@ fn text_result(v: &Value) -> Value {
 
 fn handle_tool_call(
     conn: &Connection,
-    embedder: &embed::OllamaEmbedder,
+    embedder: &embed::Embedder,
     params: &Value,
 ) -> Result<Value, String> {
     let name = params
@@ -299,7 +299,7 @@ fn handle_tool_call(
 
 fn kg_search(
     conn: &Connection,
-    embedder: &embed::OllamaEmbedder,
+    embedder: &embed::Embedder,
     args: &Value,
 ) -> mecha_graph_core::Result<Value> {
     let mut query = args["query"].as_str().unwrap_or_default().to_string();
