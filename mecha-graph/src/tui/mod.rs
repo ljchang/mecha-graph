@@ -370,7 +370,7 @@ struct GtdState {
 
 struct App {
     conn: Connection,
-    embedder: Option<mecha_graph_core::embed::OllamaEmbedder>,
+    embedder: Option<mecha_graph_core::embed::Embedder>,
     screen: Screen,
     review: ReviewState,
     merge: MergeState,
@@ -395,7 +395,7 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
 }
 
 pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
-    let embedder = mecha_graph_core::embed::OllamaEmbedder::default();
+    let embedder = mecha_graph_core::embed::Embedder::default();
     let embedder = embedder.available().then_some(embedder);
 
     let mut app = App {

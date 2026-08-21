@@ -7,7 +7,7 @@
 //! RRF fusion is engine-agnostic, so a tantivy arm can be swapped in behind
 //! the same interface later.
 
-use crate::embed::OllamaEmbedder;
+use crate::embed::Embedder;
 use crate::error::Result;
 use rusqlite::{params, Connection};
 
@@ -167,7 +167,7 @@ pub fn known_sources(conn: &Connection) -> Result<Vec<String>> {
 #[allow(clippy::too_many_arguments)]
 pub fn hybrid_episodes(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query: &str,
     entity_filter: Option<&str>,
     tag_filter: Option<&[i64]>,
@@ -230,7 +230,7 @@ pub fn hybrid_episodes(
 /// transcript is filtered out of default retrieval along with the transcript.
 pub fn hybrid_facts(
     conn: &Connection,
-    embedder: Option<&OllamaEmbedder>,
+    embedder: Option<&Embedder>,
     query: &str,
     include_private: bool,
     k: usize,

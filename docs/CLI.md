@@ -23,7 +23,7 @@ JSON, no flag needed.
 | `source remove <name>` | Unregister; already-ingested episodes are kept (`redact` purges). |
 | `ingest` | One-off ingestion of a single source, for scripting around `sync`. |
 | `link --auto` | Re-run the cheap linkers and rollups over existing episodes — after new aliases land, entities pick up their mentions. |
-| `embed` | Embed pending episodes and facts via ollama. Batch it when the GPU is free; nothing else waits on it. |
+| `embed` | Embed pending episodes and facts via the llama-server embedding endpoint (:8081). Rebuilds the `vec0` tables if `[llm] embed_dims` changed, which discards every stored vector — see docs/INTEGRATIONS.md. Batch it when the GPU is free; nothing else waits on it. |
 | `extract` | LLM extraction over pending episodes → fact *candidates* for review. The expensive tier, deliberately separate from ingestion. |
 
 ## Ask

@@ -37,8 +37,11 @@ cargo install mecha-graph-mcp      # the MCP server
 ```
 
 Or from a checkout: `cargo build --release` (binaries land in
-`target/release/`). Embeddings need [ollama](https://ollama.com) with
-`nomic-embed-text` on localhost; everything else is self-contained.
+`target/release/`). Embeddings and Tier-7 extraction need an OpenAI-compatible
+[llama-server](https://github.com/ggml-org/llama.cpp) on localhost — a chat
+model on :8080 and an embedding model on :8081 (one model per process). If one
+is already answering, it is shared rather than duplicated; see
+docs/INTEGRATIONS.md. Everything else is self-contained.
 
 ## Try it with no data at all
 
@@ -136,7 +139,7 @@ claude mcp add graph -- mecha-graph-mcp
   its raw archive, mentions, embeddings, FTS rows, enrichment, and derived
   facts; `tombstone` keeps re-ingest from resurrecting it.
 - **Local by construction.** Nothing reaches the network except the
-  integrations you enable and ollama on localhost.
+  integrations you enable and a llama-server on localhost.
 
 ## Analytics
 

@@ -35,7 +35,13 @@ else
     BEE_BUS_MISSING=1
 fi
 
-MECHA_GRAPH_DIR="$HOME/pkg"
+# $HOME/pkg was this store's location before the pkg -> mecha-graph rename.
+# It survived here after the live copy moved, and on 2026-08-17 a run from this
+# repo created a fresh, EMPTY graph.db there — schema initialised, zero rows —
+# which then sat beside the real 186 MB store looking like a second database
+# somebody might need to migrate. Nothing was lost; the risk was the opposite,
+# that the empty one gets mistaken for real.
+MECHA_GRAPH_DIR="${MECHA_GRAPH_DIR:-$HOME/.mecha-graph}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PKG="$REPO_DIR/target/release/mecha-graph"
 LOG_DIR="$MECHA_GRAPH_DIR/logs"
