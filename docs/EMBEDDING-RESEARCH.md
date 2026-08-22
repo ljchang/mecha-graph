@@ -207,6 +207,10 @@ attempt 2 established this corpus cannot supply.
   about a vector reveals what made it, and a 768-dim nomic vector is
   indistinguishable from a truncated 768-dim Qwen one.
 - `precheck.rs` — the calibration table, at the constants it explains.
+- `docs/EMBEDDING-EXAMPLES.md` — the un-generalised versions of the examples
+  above, verbatim as measured. **Private repo only and gitignored**, like
+  `docs/OPERATIONS.md`. This document is the single source for both repos, so
+  anything quoting an episode lives there instead of diverging into two copies.
 - `eval/gold-semantic.jsonl` — the 80 queries, and `scripts/build-semantic-gold.py`
   / `score-semantic.py` / `diagnose-failures.py` that produce and read them.
   **Private repo only**, like `eval/gold.jsonl`: generated from one person's

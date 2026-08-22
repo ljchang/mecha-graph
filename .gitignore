@@ -15,4 +15,5 @@ __pycache__/
 .env
 config.toml
 docs/OPERATIONS.md
+docs/EMBEDDING-EXAMPLES.md
 /.claude/
