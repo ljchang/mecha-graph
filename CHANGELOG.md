@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The binary stopped introducing itself as `pkg`.** `#[command(name = "pkg")]`
+  survived the 0.1.0 rename, so `--version` printed `pkg 0.1.1` and `--help`
+  read `Usage: pkg` — on a crate whose front door is `cargo install
+  mecha-graph`. Three of the five sites were worse than cosmetic because they
+  told the reader to *run* something: a usage hint after a DB move, the review
+  nudge in `render.rs` (`→ pkg review`), and `mecha-graph-mcp`'s open-failure
+  prefix. All five renamed; `PKG_*` env vars and the `~/pkg` data dir are
+  untouched, being a migration rather than a rename.
+
 ## [0.1.1] - 2026-08-21
 
 ### Changed

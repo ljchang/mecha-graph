@@ -17,7 +17,7 @@ fn main() {
     let conn = match db::open(&db_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pkg-mcp: cannot open {}: {e}", db_path.display());
+            eprintln!("mecha-graph-mcp: cannot open {}: {e}", db_path.display());
             std::process::exit(1);
         }
     };

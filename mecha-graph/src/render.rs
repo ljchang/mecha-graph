@@ -212,7 +212,7 @@ pub fn render_stats(h: &HealthStats, style: &Style) -> String {
     let mut alerts = Vec::new();
     if h.merge_queue_depth > 10 {
         alerts.push(format!(
-            "review queue {} > 10 → pkg review",
+            "review queue {} > 10 → mecha-graph review",
             h.merge_queue_depth
         ));
     }

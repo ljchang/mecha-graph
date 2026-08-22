@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "pkg", about = "Personal knowledge graph", version)]
+#[command(name = "mecha-graph", about = "Personal knowledge graph", version)]
 struct Cli {
     /// Database path (default: ~/.mecha-graph/graph.db, or $MECHA_GRAPH_DB)
     #[arg(long, global = true)]
@@ -652,7 +652,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     bak.display()
                 );
             }
-            println!("note: restart anything holding the old DB open (Hermes pkg-mcp, etc.)");
+            println!("note: restart anything holding the old DB open (mecha-graph-mcp, etc.)");
             return Ok(());
         }
         Command::Decrypt { out } => {
@@ -667,7 +667,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let key = db::fork_db(&db_path, out)?;
             println!("fork:  {}", out.display());
             println!("key:   {}", key.display());
-            println!("use:   MECHA_GRAPH_DB={} pkg …   (or --db)", out.display());
+            println!("use:   MECHA_GRAPH_DB={} mecha-graph …   (or --db)", out.display());
             println!("note:  a fork is a full second copy of your life — deleting it");
             println!("       (db + key) when the experiment ends is a deliberate step.");
             return Ok(());
@@ -1854,13 +1854,13 @@ mod tests {
         // Regression: the global --text bool used clap id "text", colliding
         // with `Note { text }`'s positional after global-arg propagation —
         // `mecha-graph note <msg>` panicked at argument-match time.
-        let cli = Cli::try_parse_from(["pkg", "note", "call Victor back"]).unwrap();
+        let cli = Cli::try_parse_from(["mecha-graph", "note", "call Victor back"]).unwrap();
         assert!(!cli.text);
         match cli.command {
             Command::Note { text } => assert_eq!(text, "call Victor back"),
             _ => panic!("expected note subcommand"),
         }
-        let cli = Cli::try_parse_from(["pkg", "--text", "stats"]).unwrap();
+        let cli = Cli::try_parse_from(["mecha-graph", "--text", "stats"]).unwrap();
         assert!(cli.text);
         // The full CLI definition stays internally consistent.
         use clap::CommandFactory;
