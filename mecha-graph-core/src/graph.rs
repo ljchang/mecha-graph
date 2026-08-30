@@ -17,6 +17,15 @@ pub const NODE_TYPES: &[&str] = &[
     "goal",
     "area",
     "task",
+    // Something that acts rather than someone who does. `mecha` is the only
+    // one, and it exists so a task can wait on the agent without the agent
+    // being filed as a person: `waiting_on` is delegation, and Linear rebuilt
+    // their data model around the fact that an agent cannot be held
+    // accountable the way a person can. Making it a `person` node would put
+    // it in every people-shaped view — who owes me things, who I collaborate
+    // with — and quietly answer "who is responsible" with the wrong kind of
+    // thing.
+    "agent",
     "event",
     "event_series",
     "topic",
@@ -514,8 +523,22 @@ pub fn resolve_entity_all(conn: &Connection, name_or_alias: &str) -> Result<Vec<
             .all(|n| ANCHOR_LAST_TYPES.contains(&n.node_type.as_str()));
     if out.is_empty() || only_anchor_last {
         let fuzzy = format!("%{}%", canonical);
-        let mut stmt =
-            conn.prepare_cached("SELECT * FROM nodes WHERE canonical_name LIKE ?1 LIMIT 5")?;
+        // Anchor types first, and the ordering is the whole correctness of
+        // this tier. The rule below already says events must not shadow
+        // people — but it can only drop what the LIMIT let through, and an
+        // unordered `LIMIT 5` over 13,400 calendar events fills all five
+        // slots before a person is reached. Measured: searching a surname
+        // returned five events and no people at all, so `/entity` could not
+        // find two nodes to merge and the drop-rule below had nothing to
+        // drop *to*. Ordering makes the existing rule reachable rather than
+        // replacing it.
+        let mut stmt = conn.prepare_cached(
+            "SELECT * FROM nodes WHERE canonical_name LIKE ?1
+             ORDER BY CASE WHEN node_type IN ('event','event_series','document','artifact')
+                           THEN 1 ELSE 0 END,
+                      access_count DESC, updated_at DESC
+             LIMIT 5",
+        )?;
         let nodes: Vec<Node> = stmt
             .query_map(params![fuzzy], row_to_node_bare)?
             .collect::<std::result::Result<_, _>>()?;
@@ -636,14 +659,12 @@ pub fn promote_human_names(
         let new_name = title_case_name(&best);
         let new_canon = canonicalize(&new_name);
 
-        let collides: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM nodes WHERE canonical_name = ?1 AND id != ?2",
-            params![new_canon, node_id],
-            |r| r.get(0),
-        )?;
-        if collides {
+        // The same definition the interactive verbs use, so a bulk pass can
+        // never quietly do what `rename_node` refuses.
+        if let Some(other) = canonical_collision(conn, &new_canon, Some(&node_id))? {
             skipped.push(format!(
-                "{old} → {new_name}: that name is already another node — a merge question, not a rename"
+                "{old} → {new_name}: that name is already {} ({}) — a merge question, not a rename",
+                other.name, other.id
             ));
             continue;
         }
@@ -664,6 +685,496 @@ pub fn promote_human_names(
         });
     }
     Ok((fixes, skipped))
+}
+
+/// Is `canonical` already some *other* node's canonical name?
+///
+/// The one definition behind every refusal in this family, so `rename_node`,
+/// `create_person` and `promote_human_names` cannot drift into disagreeing
+/// about what a collision is — which would show up as a bulk pass quietly
+/// doing what the interactive verb refuses.
+///
+/// Deliberately **canonical names only, never aliases**. Two nodes sharing a
+/// canonical name is ambiguity that did not exist a moment ago; a name that
+/// merely collides with some node's *alias* is ambiguity that already
+/// existed, and refusing there would block the ordinary case of giving a
+/// node the name it is already aliased by — which is exactly the repair
+/// this was written for.
+fn canonical_collision(
+    conn: &Connection,
+    canonical: &str,
+    exclude_id: Option<&str>,
+) -> Result<Option<Node>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT * FROM nodes WHERE canonical_name = ?1 AND id != ?2 LIMIT 1")?;
+    let found: Vec<Node> = stmt
+        .query_map(
+            params![canonical, exclude_id.unwrap_or("")],
+            row_to_node_bare,
+        )?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(found.into_iter().next())
+}
+
+/// Rename a node, keeping every existing way of reaching it.
+///
+/// **The old name becomes an alias**, which is the whole reason this is safe
+/// to offer interactively: resolution path 1 (canonical_name) changes hands,
+/// paths 2 (alias) and 3 (identifier) do not, so every episode, query and
+/// habit that reached the node by its old name still reaches it. Nothing is
+/// rewritten anywhere else — facts store node *ids*, so the statements
+/// already recorded keep their wording, which is correct: a fact is a record
+/// of what a source said, not a view that should silently restate itself.
+///
+/// Refuses rather than guesses when the new name is already another node's
+/// canonical name: that is a merge question (`merge_nodes`), and renaming
+/// into a collision would manufacture ambiguity where none existed. The
+/// rule and its wording are shared with `promote_human_names`, the bulk
+/// pass that has always had it.
+pub fn rename_node(conn: &Connection, node_id: &str, new_name: &str) -> Result<NameFix> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(crate::error::Error::Other(
+            "a node needs a name; refusing to rename to nothing".into(),
+        ));
+    }
+    let Some(node) = get_node(conn, node_id)? else {
+        return Err(crate::error::Error::Other(format!(
+            "no node with id {node_id}"
+        )));
+    };
+    let new_canon = canonicalize(new_name);
+    if new_canon == node.canonical_name && new_name == node.name {
+        return Err(crate::error::Error::Other(format!(
+            "{} is already named {new_name:?}",
+            node.id
+        )));
+    }
+    if let Some(other) = canonical_collision(conn, &new_canon, Some(node_id))? {
+        return Err(crate::error::Error::Other(format!(
+            "{} → {new_name:?}: that name is already {} ({}) — a merge question, not a rename. \
+             If they are the same, use `merge {} {}`.",
+            node.name, other.name, other.id, other.id, node.id
+        )));
+    }
+
+    // Before the update, so a failure here leaves the node reachable by the
+    // name it still has.
+    add_alias(conn, node_id, &node.name, "rename")?;
+    conn.execute(
+        "UPDATE nodes SET name = ?2, canonical_name = ?3, updated_at = datetime('now')
+         WHERE id = ?1",
+        params![node_id, new_name, new_canon],
+    )?;
+    Ok(NameFix {
+        node_id: node_id.to_string(),
+        from: node.name,
+        to: new_name.to_string(),
+    })
+}
+
+/// Create a person node that nothing in the graph proposed.
+///
+/// The gap this fills: a person can be the subject of forty facts and have
+/// no node, because nodes are minted by ingest (`get_or_create_person`, off
+/// an email or an attendee list) and a person who only ever appears in
+/// spoken conversation has neither. There was no way to say "this person
+/// exists" — and no way to reach one either, since `merge_nodes` keeps the
+/// survivor's name, so the workaround for a bad name needed a node that only
+/// this function can make.
+///
+/// **Stricter about collisions than `rename_node`, on purpose.** A rename
+/// moves a name that already has evidence behind it; a create invents a node
+/// with none, so it must not land on top of a name that already resolves
+/// exactly — including by alias, which a rename tolerates. Inventing a
+/// second "Wren" is not a repair.
+///
+/// **And it checks exact resolution, never `resolve_entity_all`.** That
+/// function's fourth tier is a `LIKE '%name%'` fallback, so "Wren" resolves
+/// today to the *event* "SPSP Wrench Reunion" — a substring hit. Refusing on
+/// a fuzzy match would make the missing-person case, the one case this
+/// exists for, the one case it cannot serve.
+pub fn create_person(conn: &Connection, name: &str, source: &str) -> Result<Node> {
+    create_node(conn, "person", name, source)
+}
+
+/// Create a node of any type in the closed set that nothing in the graph
+/// proposed. `create_person` is the common case spelled short.
+///
+/// **The first-name alias is a person-only nicety and stays that way.**
+/// Spoken sources say "Marisol" and mean a person; nobody says
+/// "Psychological" and means the department. Minting one for an org would
+/// hand every multi-word institution a one-word magnet for unrelated text —
+/// which is the exact mechanism that took three repairs to undo today.
+pub fn create_node(conn: &Connection, node_type: &str, name: &str, source: &str) -> Result<Node> {
+    let name = name.trim();
+    if !NODE_TYPES.contains(&node_type) {
+        return Err(crate::error::Error::Other(format!(
+            "node_type '{node_type}' not in closed set {NODE_TYPES:?}"
+        )));
+    }
+    if name.is_empty() {
+        return Err(crate::error::Error::Other(format!(
+            "a node needs a name; refusing to create an unnamed {node_type}"
+        )));
+    }
+    let canonical = canonicalize(name);
+    if let Some(other) = canonical_collision(conn, &canonical, None)? {
+        return Err(crate::error::Error::Other(format!(
+            "{name:?} is already {} ({}) — nothing to create. \
+             Rename it if the name is wrong, or alias it if this is another way of saying it.",
+            other.name, other.id
+        )));
+    }
+    let by_alias: Vec<Node> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT n.* FROM nodes n JOIN node_alias a ON a.node_id = n.id WHERE a.alias = ?1",
+        )?;
+        let rows: Vec<Node> = stmt
+            .query_map(params![canonical], row_to_node_bare)?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    if let Some(other) = by_alias.into_iter().next() {
+        return Err(crate::error::Error::Other(format!(
+            "{name:?} already resolves to {} ({}) as an alias — creating a second node \
+             would split that name across two. Rename that node if it is the one you mean.",
+            other.name, other.id
+        )));
+    }
+
+    let id = format!("{node_type}-{}", uuid::Uuid::new_v4());
+    let mut node = Node::new(&id, node_type, name);
+    node.source = source.to_string();
+    upsert_node(conn, &node)?;
+    // The first-name alias, on `get_or_create_person`'s reasoning: spoken
+    // sources and queries use bare first names, and a collision there is
+    // what the disambiguation envelope is for. People only — see above.
+    if node_type == "person" {
+        if let Some(first) = name.split_whitespace().next() {
+            if first.len() >= 3 && first != name {
+                add_alias(conn, &id, first, "firstname")?;
+            }
+        }
+    }
+    get_node(conn, &id).map(|n| n.unwrap())
+}
+
+/// Change a node's type, keeping its id and everything hanging off it.
+///
+/// The type is not cosmetic: `resolve_entity_all` ranks anchor types above
+/// retrieval targets, so an org filed as a `topic` loses to an event of the
+/// same name, and a calendar resource filed as a `person` shows up in
+/// people-shaped answers. Both were real in this graph — the Ostrander Brain
+/// Imaging Center was a topic, and several `@group.calendar.google.com`
+/// addresses were people.
+///
+/// A rename with a `create` on the side would work and is worse: the node
+/// would keep its old id nowhere, so every fact, mention and rollup pointing
+/// at it would have to be moved, and a partial move is how a repair becomes
+/// a second problem. Changing one column moves nothing.
+pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<(String, String)> {
+    if !NODE_TYPES.contains(&node_type) {
+        return Err(crate::error::Error::Other(format!(
+            "node_type '{node_type}' not in closed set {NODE_TYPES:?}"
+        )));
+    }
+    let Some(node) = get_node(conn, node_id)? else {
+        return Err(crate::error::Error::Other(format!(
+            "no node with id {node_id}"
+        )));
+    };
+    if node.node_type == node_type {
+        return Err(crate::error::Error::Other(format!(
+            "{} is already a {node_type}",
+            node.name
+        )));
+    }
+    conn.execute(
+        "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
+        params![node_id, node_type],
+    )?;
+    // The id keeps its old prefix, and that is deliberate. It is an opaque
+    // key that every fact, mention and rollup already references; rewriting
+    // it to match the new type would mean rewriting all of them to gain a
+    // string nobody resolves on.
+    Ok((node.node_type, node_type.to_string()))
+}
+
+/// Is `name` free for `exclude_id` to take? The public face of
+/// `canonical_collision`, for callers that need to know *before* proposing a
+/// rename — a proposal that cannot be applied is worse than no proposal.
+pub fn canonical_collision_free_name(
+    conn: &Connection,
+    name: &str,
+    exclude_id: &str,
+) -> Result<bool> {
+    Ok(canonical_collision(conn, &canonicalize(name), Some(exclude_id))?.is_none())
+}
+
+/// Title-case a human name, particles and initials handled. Public so a
+/// proposer can show the name it would apply rather than a lowercased alias.
+pub fn title_case_public(s: &str) -> String {
+    title_case_name(s)
+}
+
+/// Remove one alias from a node. Returns whether a row was actually there.
+///
+/// The counterpart `rename_node` needs and deliberately does not do itself.
+/// Renaming keeps the old name as an alias because the usual case is *the
+/// name was wrong* — everything that reached the node by it should keep
+/// doing so. The case this serves is the other one: **the name belonged to
+/// somebody else**, and keeping it would preserve exactly the conflation
+/// being undone. Two different repairs, so two verbs rather than a flag.
+pub fn remove_alias(conn: &Connection, node_id: &str, alias: &str) -> Result<bool> {
+    let alias = canonicalize(alias);
+    let n = conn.execute(
+        "DELETE FROM node_alias WHERE node_id = ?1 AND alias = ?2",
+        params![node_id, alias],
+    )?;
+    Ok(n > 0)
+}
+
+/// Move a deterministic identifier — an email, a handle — to another node.
+///
+/// An identifier is the strongest claim in the graph: `get_or_create_person`
+/// resolves on it before anything else, so it decides where *future* ingest
+/// lands. Splitting two people apart without moving it means the next email
+/// re-merges them, which is why this is a verb and not a manual step.
+///
+/// The destination must exist. A missing target would otherwise orphan the
+/// identifier into a row pointing at nothing, and the foreign key would take
+/// the whole transaction with it at a confusing moment.
+pub fn move_identifier(conn: &Connection, kind: &str, value: &str, to_node: &str) -> Result<()> {
+    let value = value.trim().to_lowercase();
+    if get_node(conn, to_node)?.is_none() {
+        return Err(crate::error::Error::Other(format!(
+            "no node with id {to_node}"
+        )));
+    }
+    let n = conn.execute(
+        "UPDATE node_identifier SET node_id = ?3 WHERE kind = ?1 AND value = ?2",
+        params![kind, value, to_node],
+    )?;
+    if n == 0 {
+        return Err(crate::error::Error::Other(format!(
+            "no {kind} identifier {value:?} on any node"
+        )));
+    }
+    Ok(())
+}
+
+/// Move one episode's mention from one node to another.
+///
+/// Keyed on the episode's **uid** rather than its rowid, because a uid is
+/// what every other surface prints and what a person can copy out of a
+/// listing; rowids are an implementation detail nobody should be asked to
+/// handle.
+///
+/// `INSERT OR REPLACE` rather than `UPDATE`: the primary key is
+/// `(episode_id, node_id)`, so an update collides when the destination
+/// already mentions that episode — which is the ordinary case when a split
+/// is putting an episode where a node already sits. The old row is dropped
+/// either way, which is the whole intent.
+pub fn move_mention(conn: &Connection, episode_uid: &str, from: &str, to: &str) -> Result<()> {
+    let episode_id: i64 = conn
+        .query_row(
+            "SELECT id FROM episode WHERE uid = ?1",
+            params![episode_uid],
+            |r| r.get(0),
+        )
+        .map_err(|_| crate::error::Error::Other(format!("no episode with uid {episode_uid}")))?;
+    if get_node(conn, to)?.is_none() {
+        return Err(crate::error::Error::Other(format!("no node with id {to}")));
+    }
+    let row: Option<(String, f64)> = conn
+        .query_row(
+            "SELECT extractor, confidence FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+            params![episode_id, from],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let Some((extractor, confidence)) = row else {
+        return Err(crate::error::Error::Other(format!(
+            "{from} does not mention episode {episode_uid}"
+        )));
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO mention (episode_id, node_id, extractor, confidence)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![episode_id, to, extractor, confidence],
+    )?;
+    conn.execute(
+        "DELETE FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+        params![episode_id, from],
+    )?;
+    Ok(())
+}
+
+/// What a bulk reattribution actually did.
+///
+/// `blocked` is the count that could not move because the destination
+/// already holds an identical live fact — reported rather than resolved,
+/// because the two ways to resolve it are folding observation counts (which
+/// `merge_nodes` may do, since it is about to delete the node anyway) and
+/// deleting evidence, and neither should happen silently inside a partial
+/// move.
+#[derive(Debug, Default, PartialEq)]
+pub struct Reattributed {
+    pub subjects: usize,
+    pub objects: usize,
+    pub self_loops: usize,
+    pub blocked: usize,
+}
+
+/// Re-point every fact endpoint from one node to another, leaving both nodes
+/// in place.
+///
+/// This is the half of `merge_nodes` that a *contamination* needs and a
+/// merge does not. The case: a fuzzy substring match made an event node the
+/// subject of twenty-one facts about a person — "Wren is a twin daughter"
+/// filed under "SPSP Wrench Reunion" — so the facts are true and only their
+/// endpoint is wrong. A merge would be the wrong tool twice over: it would
+/// destroy the event, which is a real event, and it would carry across the
+/// one mention that genuinely belongs to it.
+///
+/// Self-loops are dropped **before** the re-point rather than after. A fact
+/// linking the two nodes becomes `X → X` once they are the same, which is
+/// meaningless — but deleting `subject_id = to AND object_id = to`
+/// afterwards would also take any self-loop the destination already had.
+/// Cutting the ones that this move would create is precise; cleaning up
+/// afterwards is not.
+pub fn move_facts(conn: &Connection, from: &str, to: &str) -> Result<Reattributed> {
+    if from == to {
+        return Err(crate::error::Error::Other(
+            "cannot move a node's facts onto itself".into(),
+        ));
+    }
+    if get_node(conn, to)?.is_none() {
+        return Err(crate::error::Error::Other(format!("no node with id {to}")));
+    }
+    if get_node(conn, from)?.is_none() {
+        return Err(crate::error::Error::Other(format!(
+            "no node with id {from}"
+        )));
+    }
+
+    let tx = conn.is_autocommit();
+    if tx {
+        conn.execute_batch("BEGIN;")?;
+    }
+    let result = (|| -> Result<Reattributed> {
+        // Bound to locals in execution order rather than built as a struct
+        // literal: the sequence is load-bearing — the self-loop cut must
+        // happen *before* the re-point — and a literal invites a future
+        // reorder that silently changes what runs first.
+        let self_loops = conn.execute(
+            "DELETE FROM fact
+             WHERE (subject_id = ?1 AND object_id = ?2)
+                OR (subject_id = ?2 AND object_id = ?1)",
+            params![from, to],
+        )?;
+        // OR IGNORE for the live-unique index, exactly as the merge path does.
+        let subjects = conn.execute(
+            "UPDATE OR IGNORE fact SET subject_id = ?2 WHERE subject_id = ?1",
+            params![from, to],
+        )?;
+        let objects = conn.execute(
+            "UPDATE OR IGNORE fact SET object_id = ?2 WHERE object_id = ?1",
+            params![from, to],
+        )?;
+        let blocked = conn.query_row(
+            "SELECT COUNT(*) FROM fact WHERE subject_id = ?1 OR object_id = ?1",
+            params![from],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+        Ok(Reattributed {
+            subjects,
+            objects,
+            self_loops,
+            blocked,
+        })
+    })();
+    if tx {
+        match &result {
+            Ok(_) => conn.execute_batch("COMMIT;")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+        }
+    }
+    result
+}
+
+/// Re-point mentions in bulk, optionally narrowed to one extractor and/or
+/// one episode source. Returns (moved, dropped-as-redundant).
+///
+/// The narrowing is the point. A contaminated node is usually not *entirely*
+/// contaminated: the SPSP reunion event had 474 mentions, of which 473 were
+/// `llm` hits from bee episodes about a toddler and exactly one was the
+/// `attendee` row that is genuinely the event's. `--extractor llm` is what
+/// separates them, and it separates them by *how the graph came to believe
+/// it* rather than by anything a reader has to judge case by case.
+///
+/// A mention that cannot move because the destination already mentions that
+/// episode is **dropped** rather than left behind, and this is the one place
+/// here that deletes. It is safe because the row is redundant by
+/// construction — the same (episode, node) pair already exists on the
+/// destination, which is the whole state the move was trying to reach.
+/// Leaving it would keep the contaminated node showing mentions the repair
+/// was meant to take away.
+pub fn move_mentions(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    extractor: Option<&str>,
+    source: Option<&str>,
+) -> Result<(usize, usize)> {
+    if from == to {
+        return Err(crate::error::Error::Other(
+            "cannot move a node's mentions onto itself".into(),
+        ));
+    }
+    if get_node(conn, to)?.is_none() {
+        return Err(crate::error::Error::Other(format!("no node with id {to}")));
+    }
+    // Both placeholders are always bound and always present in the SQL:
+    // rusqlite counts parameters strictly, so a clause built in only when
+    // its option is Some leaves the binding list the wrong length. An empty
+    // string is the "no filter" value, which no real extractor or source
+    // can collide with.
+    let filter = " AND (?3 = '' OR extractor = ?3) \
+                  AND (?4 = '' OR episode_id IN (SELECT id FROM episode WHERE source = ?4))";
+    let ex = extractor.unwrap_or_default();
+    let src = source.unwrap_or_default();
+
+    let tx = conn.is_autocommit();
+    if tx {
+        conn.execute_batch("BEGIN;")?;
+    }
+    let result = (|| -> Result<(usize, usize)> {
+        let moved = conn.execute(
+            &format!("UPDATE OR IGNORE mention SET node_id = ?2 WHERE node_id = ?1{filter}"),
+            params![from, to, ex, src],
+        )?;
+        let dropped = conn.execute(
+            &format!(
+                "DELETE FROM mention WHERE node_id = ?1{filter}
+                 AND episode_id IN (SELECT episode_id FROM mention WHERE node_id = ?2)"
+            ),
+            params![from, to, ex, src],
+        )?;
+        Ok((moved, dropped))
+    })();
+    if tx {
+        match &result {
+            Ok(_) => conn.execute_batch("COMMIT;")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+        }
+    }
+    result
 }
 
 /// Get-or-create a person node keyed by a deterministic identifier (Tier 1).
@@ -1245,8 +1756,8 @@ mod tests {
     fn test_get_or_create_person_dedupes_by_email() {
         let conn = open_memory().unwrap();
         let a = get_or_create_person(&conn, Some("n@example.edu"), "Nadia", "calendar").unwrap();
-        let b = get_or_create_person(&conn, Some("N@Example.EDU"), "Nadia Petrova", "email")
-            .unwrap();
+        let b =
+            get_or_create_person(&conn, Some("N@Example.EDU"), "Nadia Petrova", "email").unwrap();
         assert_eq!(a.id, b.id, "same email must resolve to the same node");
         // Both display names became aliases.
         assert!(b.aliases.contains(&"nadia".to_string()));
@@ -1261,13 +1772,8 @@ mod tests {
         let conn = open_memory().unwrap();
         let keep =
             get_or_create_person(&conn, Some("d@example.edu"), "Dana Fields", "cal").unwrap();
-        let dup = get_or_create_person(
-            &conn,
-            Some("f0000xy@example.edu"),
-            "Dana Fields",
-            "cal",
-        )
-        .unwrap();
+        let dup =
+            get_or_create_person(&conn, Some("f0000xy@example.edu"), "Dana Fields", "cal").unwrap();
         assert_ne!(keep.id, dup.id);
         upsert_node(&conn, &Node::new("lab", "org", "The Lab")).unwrap();
 
@@ -1350,10 +1856,7 @@ mod tests {
         );
 
         // What renders is a name now.
-        assert_eq!(
-            get_node(&conn, &n.id).unwrap().unwrap().name,
-            "Vera Holt"
-        );
+        assert_eq!(get_node(&conn, &n.id).unwrap().unwrap().name, "Vera Holt");
         // And every way of finding her still works: by new name, by the
         // old address (identifier path AND alias path), by first name.
         for lookup in ["Vera Holt", "veraholt@example.com", "vera"] {
@@ -1363,6 +1866,549 @@ mod tests {
                 "lookup by {lookup} must still resolve"
             );
         }
+    }
+
+    /// The other absorption shape: `resolve_entity_all`'s fuzzy tier made an
+    /// *event* the subject of every fact about a person, because her name is
+    /// a substring of its title. The facts are true and only their endpoint
+    /// is wrong, and the event is a real event — so a merge is the wrong
+    /// tool twice over.
+    #[test]
+    fn facts_move_off_a_contaminated_node_without_destroying_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("event-spsp", "event", "SPSP Wrench Reunion"),
+        )
+        .unwrap();
+        let wren = create_person(&conn, "Wren Calder", "t").unwrap();
+        let avery = create_person(&conn, "Avery J Calder", "t").unwrap();
+        // Facts that landed on the event: one with it as subject, one as
+        // object, and one linking it to the person it is really about.
+        // Seeded predicates only: `fact.predicate` is a foreign key into the
+        // predicate vocabulary, and the everyday `is`/`has` the extractor
+        // mints on demand are not in a fresh database.
+        for (subj, obj, pred, stmt) in [
+            ("event-spsp", None, "about", "Wren is a twin daughter."),
+            (
+                "event-spsp",
+                Some(avery.id.as_str()),
+                "related_to",
+                "Wren is Avery's daughter.",
+            ),
+            (
+                avery.id.as_str(),
+                Some("event-spsp"),
+                "member_of",
+                "Avery's daughters include Wren.",
+            ),
+            (
+                "event-spsp",
+                Some(wren.id.as_str()),
+                "attended",
+                "co-occurrence",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO fact (uid, subject_id, predicate, object_id, statement, polarity,
+                                   confidence, observation_count, valid_from)
+                 VALUES (hex(randomblob(8)), ?1, ?2, ?3, ?4, 'positive', 1.0, 1, datetime('now'))",
+                params![subj, pred, obj, stmt],
+            )
+            .unwrap();
+        }
+
+        let moved = move_facts(&conn, "event-spsp", &wren.id).unwrap();
+        assert_eq!(moved.subjects, 2, "{moved:?}");
+        assert_eq!(moved.objects, 1, "{moved:?}");
+        // The event↔Wren link would have become Wren → Wren; cut, not kept.
+        assert_eq!(moved.self_loops, 1, "{moved:?}");
+        assert_eq!(moved.blocked, 0, "{moved:?}");
+
+        // The event survives — it is a real event.
+        assert!(get_node(&conn, "event-spsp").unwrap().is_some());
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact WHERE subject_id='event-spsp' OR object_id='event-spsp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "nothing still hangs off the event");
+        // A pre-existing self-loop on the destination is none of this
+        // function's business, and cleaning up after the re-point would have
+        // eaten it.
+        let on_edie: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact WHERE subject_id=?1 OR object_id=?1",
+                params![wren.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(on_edie, 3);
+    }
+
+    /// The narrowing is the whole point: a contaminated node is usually not
+    /// entirely contaminated, and `extractor` separates the two by how the
+    /// graph came to believe each one rather than by a reader's judgement.
+    #[test]
+    fn mentions_move_by_extractor_leaving_the_nodes_own_evidence() {
+        let conn = open_memory().unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("event-spsp", "event", "SPSP Wrench Reunion"),
+        )
+        .unwrap();
+        let wren = create_person(&conn, "Wren Calder", "t").unwrap();
+        let mk = |sid: &str, src: &str| {
+            let ep = crate::episode::Episode {
+                id: 0,
+                uid: String::new(),
+                source: src.into(),
+                source_id: sid.into(),
+                source_ref: None,
+                body: format!("body {sid}"),
+                occurred_at: "2026-08-01 12:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: "personal".into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            };
+            crate::episode::upsert_episode(&conn, &ep).unwrap().0
+        };
+        let a = mk("a", "bee.conversation");
+        let b = mk("b", "bee.daily");
+        let c = mk("c", "calendar.event");
+        for (ep, ex) in [(a, "llm"), (b, "llm"), (c, "attendee")] {
+            conn.execute(
+                "INSERT INTO mention (episode_id, node_id, extractor, confidence)
+                 VALUES (?1, 'event-spsp', ?2, 1.0)",
+                params![ep, ex],
+            )
+            .unwrap();
+        }
+
+        let (moved, dropped) =
+            move_mentions(&conn, "event-spsp", &wren.id, Some("llm"), None).unwrap();
+        assert_eq!((moved, dropped), (2, 0));
+        let kept: (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MIN(extractor),'') FROM mention WHERE node_id='event-spsp'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(kept, (1, "attendee".into()), "the event keeps its own row");
+    }
+
+    /// A mention the destination already has is redundant by construction,
+    /// so it is dropped rather than stranded — otherwise the contaminated
+    /// node keeps showing mentions the repair was meant to take away.
+    #[test]
+    fn a_redundant_mention_is_dropped_rather_than_left_behind() {
+        let conn = open_memory().unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("event-spsp", "event", "SPSP Wrench Reunion"),
+        )
+        .unwrap();
+        let wren = create_person(&conn, "Wren Calder", "t").unwrap();
+        let ep = crate::episode::Episode {
+            id: 0,
+            uid: String::new(),
+            source: "bee.daily".into(),
+            source_id: "shared".into(),
+            source_ref: None,
+            body: "both mention it".into(),
+            occurred_at: "2026-08-01 12:00:00".into(),
+            occurred_end: None,
+            ingested_at: String::new(),
+            lat: None,
+            lon: None,
+            location: None,
+            sensitivity: "personal".into(),
+            scope_id: None,
+            meta: None,
+            raw: None,
+        };
+        let (ep_id, _) = crate::episode::upsert_episode(&conn, &ep).unwrap();
+        for node in ["event-spsp", wren.id.as_str()] {
+            conn.execute(
+                "INSERT INTO mention (episode_id, node_id, extractor, confidence)
+                 VALUES (?1, ?2, 'llm', 1.0)",
+                params![ep_id, node],
+            )
+            .unwrap();
+        }
+        let (moved, dropped) =
+            move_mentions(&conn, "event-spsp", &wren.id, Some("llm"), None).unwrap();
+        assert_eq!((moved, dropped), (0, 1));
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE node_id='event-spsp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn bulk_moves_refuse_a_node_onto_itself_or_a_missing_target() {
+        let conn = open_memory().unwrap();
+        let n = create_person(&conn, "Wren Calder", "t").unwrap();
+        assert!(move_facts(&conn, &n.id, &n.id).is_err());
+        assert!(move_facts(&conn, &n.id, "person-nope").is_err());
+        assert!(move_facts(&conn, "person-nope", &n.id).is_err());
+        assert!(move_mentions(&conn, &n.id, &n.id, None, None).is_err());
+        assert!(move_mentions(&conn, &n.id, "person-nope", None, None).is_err());
+    }
+
+    /// The repair this family exists for, end to end: a first-name alias
+    /// pulled one person's whole history onto another person's node, and
+    /// undoing it means moving the *smaller* side out — the identifier that
+    /// decides where future ingest lands, the names that belong to them, and
+    /// the handful of episodes that were really theirs.
+    #[test]
+    fn a_conflated_node_can_be_split_apart() {
+        let conn = open_memory().unwrap();
+        // The node as it really was: minted from a student's email, then
+        // aliased by first name, then a decade of somebody else's life.
+        let stuck = get_or_create_person(
+            &conn,
+            Some("marisol.b.farrow.27@ostrander.edu"),
+            "Marisol B. Farrow",
+            "llm",
+        )
+        .unwrap();
+        add_alias(&conn, &stuck.id, "marisol", "firstname").unwrap();
+        assert_eq!(
+            resolve_entity_all(&conn, "Marisol").unwrap()[0].id,
+            stuck.id,
+            "precondition: the bare first name lands on the student"
+        );
+
+        // Invert: the node is overwhelmingly the daughter's, so she keeps it.
+        rename_node(&conn, &stuck.id, "Marisol Quinn Calder").unwrap();
+        // …but the old name must NOT stay an alias here — it is someone
+        // else's name, and keeping it is the conflation.
+        assert!(remove_alias(&conn, &stuck.id, "Marisol B. Farrow").unwrap());
+        assert!(remove_alias(&conn, &stuck.id, "marisol.b.farrow.27").unwrap());
+
+        let student = create_person(&conn, "Marisol B. Farrow", "manual").unwrap();
+        move_identifier(
+            &conn,
+            "email",
+            "marisol.b.farrow.27@ostrander.edu",
+            &student.id,
+        )
+        .unwrap();
+
+        // Each name now reaches exactly one person.
+        let calder = resolve_entity_all(&conn, "Marisol Quinn Calder").unwrap();
+        assert_eq!(calder.len(), 1);
+        assert_eq!(calder[0].id, stuck.id);
+        let farrow = resolve_entity_all(&conn, "Marisol B. Farrow").unwrap();
+        assert_eq!(farrow.len(), 1);
+        assert_eq!(farrow[0].id, student.id);
+        // And the identifier decides where the next email lands — the whole
+        // point of moving it, and what stops the split re-merging tomorrow.
+        let again = get_or_create_person(
+            &conn,
+            Some("marisol.b.farrow.27@ostrander.edu"),
+            "Marisol B. Farrow",
+            "llm",
+        )
+        .unwrap();
+        assert_eq!(
+            again.id, student.id,
+            "future ingest must land on the student"
+        );
+    }
+
+    /// A mention moves with its extractor and confidence intact — the
+    /// provenance is the evidence, and a move that flattened it to "manual"
+    /// would launder how the graph came to believe something.
+    #[test]
+    fn moving_a_mention_carries_its_provenance() {
+        let conn = open_memory().unwrap();
+        let from = create_person(&conn, "Marisol Quinn Calder", "t").unwrap();
+        let to = create_person(&conn, "Marisol B. Farrow", "t").unwrap();
+        let ep = crate::episode::Episode {
+            id: 0,
+            uid: String::new(),
+            source: "reflect.note".into(),
+            source_id: "advising-2023".into(),
+            source_ref: None,
+            body: "First Year Advising 2023".into(),
+            occurred_at: "2026-08-03 12:00:00".into(),
+            occurred_end: None,
+            ingested_at: String::new(),
+            lat: None,
+            lon: None,
+            location: None,
+            sensitivity: "personal".into(),
+            scope_id: None,
+            meta: None,
+            raw: None,
+        };
+        let (ep_id, _) = crate::episode::upsert_episode(&conn, &ep).unwrap();
+        let uid: String = conn
+            .query_row(
+                "SELECT uid FROM episode WHERE id = ?1",
+                params![ep_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO mention (episode_id, node_id, extractor, confidence)
+             VALUES (?1, ?2, 'alias', 0.75)",
+            params![ep_id, from.id],
+        )
+        .unwrap();
+
+        move_mention(&conn, &uid, &from.id, &to.id).unwrap();
+
+        let moved: (String, f64) = conn
+            .query_row(
+                "SELECT extractor, confidence FROM mention WHERE episode_id=?1 AND node_id=?2",
+                params![ep_id, to.id],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(moved.0, "alias");
+        assert!((moved.1 - 0.75).abs() < f64::EPSILON);
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id=?1 AND node_id=?2",
+                params![ep_id, from.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the mention moved rather than being copied");
+    }
+
+    /// Every one of these refuses rather than half-doing the job — a split
+    /// left halfway is worse than one not started.
+    #[test]
+    fn the_split_verbs_refuse_what_they_cannot_do() {
+        let conn = open_memory().unwrap();
+        let n = create_person(&conn, "Vera Holt", "t").unwrap();
+        // An alias that was not there is `false`, not an error: the caller
+        // asked for it to be gone and it is gone.
+        assert!(!remove_alias(&conn, &n.id, "never-was").unwrap());
+        assert!(move_identifier(&conn, "email", "nobody@x.com", &n.id).is_err());
+        assert!(move_identifier(&conn, "email", "a@x.com", "person-nope").is_err());
+        assert!(move_mention(&conn, "no-such-uid", &n.id, &n.id).is_err());
+    }
+
+    /// The property that makes a rename safe to offer as one keypress: the
+    /// old name keeps resolving, because it becomes an alias. Everything
+    /// that reached the node before still reaches it.
+    #[test]
+    fn a_rename_leaves_the_old_name_resolving() {
+        let conn = open_memory().unwrap();
+        let n = create_person(&conn, "Marisol B. Farrow", "t").unwrap();
+
+        let fix = rename_node(&conn, &n.id, "Marisol Calder").unwrap();
+        assert_eq!(fix.from, "Marisol B. Farrow");
+        assert_eq!(fix.to, "Marisol Calder");
+
+        let after = get_node(&conn, &n.id).unwrap().unwrap();
+        assert_eq!(after.name, "Marisol Calder");
+        assert_eq!(after.canonical_name, "marisol calder");
+
+        // Both names still land on the same node — path 1 changed hands,
+        // path 2 picked up what it dropped.
+        for name in ["Marisol Calder", "Marisol B. Farrow"] {
+            let hits = resolve_entity_all(&conn, name).unwrap();
+            assert_eq!(hits.len(), 1, "{name} resolved to {} nodes", hits.len());
+            assert_eq!(hits[0].id, n.id, "{name} resolved to the wrong node");
+        }
+    }
+
+    /// Renaming onto a name another node already owns is a merge question,
+    /// and the refusal names the command that answers it.
+    #[test]
+    fn a_rename_into_a_collision_is_refused_and_names_the_merge() {
+        let conn = open_memory().unwrap();
+        let keep = create_person(&conn, "Vera Holt", "t").unwrap();
+        let dup = create_person(&conn, "V. Holt", "t").unwrap();
+
+        let err = rename_node(&conn, &dup.id, "Vera Holt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merge question"), "{err}");
+        assert!(
+            err.contains(&keep.id),
+            "the refusal must name the other node: {err}"
+        );
+        assert!(err.contains("merge"), "{err}");
+        // Refused means unchanged.
+        assert_eq!(get_node(&conn, &dup.id).unwrap().unwrap().name, "V. Holt");
+    }
+
+    /// A node may be renamed to a name it is *already aliased by* — which is
+    /// the common repair, and which a collision rule keyed on aliases rather
+    /// than canonical names would have refused.
+    #[test]
+    fn a_rename_to_the_nodes_own_alias_is_allowed() {
+        let conn = open_memory().unwrap();
+        let n = create_person(&conn, "Marisol B. Farrow", "t").unwrap();
+        add_alias(&conn, &n.id, "Marisol Calder", "manual").unwrap();
+
+        rename_node(&conn, &n.id, "Marisol Calder").unwrap();
+        assert_eq!(
+            get_node(&conn, &n.id).unwrap().unwrap().name,
+            "Marisol Calder"
+        );
+    }
+
+    /// The trap this whole verb had to be written around. `resolve_entity_all`
+    /// falls back to `LIKE '%name%'`, so "Wren" resolves to the *event* "SPSP
+    /// Wrench Reunion" — a substring hit. Refusing to create on a fuzzy match
+    /// would make the missing-person case the one case create cannot serve,
+    /// which is the only case it exists for.
+    #[test]
+    fn creating_a_person_ignores_a_fuzzy_substring_match() {
+        let conn = open_memory().unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("event-reunion", "event", "SPSP Wrench Reunion"),
+        )
+        .unwrap();
+        // The precondition: the name really does resolve, to the wrong thing.
+        let before = resolve_entity_all(&conn, "Wren").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].node_type, "event");
+
+        let wren = create_person(&conn, "Wren", "t").unwrap();
+        assert_eq!(wren.node_type, "person");
+
+        // And now the person outranks the event, which is `resolve_entity_all`'s
+        // own anchor-type rule doing the work.
+        let after = resolve_entity_all(&conn, "Wren").unwrap();
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0].id, wren.id);
+    }
+
+    /// The type is not cosmetic — `resolve_entity_all` ranks anchor types
+    /// above retrieval targets — and changing it must move nothing, because
+    /// a partial move is how a repair becomes a second problem.
+    #[test]
+    fn retyping_keeps_the_id_and_everything_hanging_off_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("topic-obic", "topic", "Ostrander Brain Imaging Center"),
+        )
+        .unwrap();
+        add_alias(&conn, "topic-obic", "OBIC", "manual").unwrap();
+
+        let (was, now) = retype_node(&conn, "topic-obic", "org").unwrap();
+        assert_eq!((was.as_str(), now.as_str()), ("topic", "org"));
+
+        let after = get_node(&conn, "topic-obic").unwrap().unwrap();
+        assert_eq!(after.node_type, "org");
+        assert_eq!(
+            after.id, "topic-obic",
+            "the id is an opaque key and does not move"
+        );
+        assert_eq!(load_aliases(&conn, "topic-obic").unwrap(), vec!["obic"]);
+        assert_eq!(
+            resolve_entity_all(&conn, "OBIC").unwrap()[0].id,
+            "topic-obic"
+        );
+    }
+
+    #[test]
+    fn retyping_refuses_an_unknown_type_a_no_op_and_a_missing_node() {
+        let conn = open_memory().unwrap();
+        let n = create_node(&conn, "topic", "A Thing", "t").unwrap();
+        assert!(retype_node(&conn, &n.id, "institution").is_err());
+        assert!(
+            retype_node(&conn, &n.id, "topic").is_err(),
+            "already that type"
+        );
+        assert!(retype_node(&conn, "nope-1", "org").is_err());
+    }
+
+    /// An org is not a person, and the difference that matters is the
+    /// first-name alias: minting one for "Psychological & Brain Sciences
+    /// Department" would give it "Psychological" as a one-word magnet, which
+    /// is the mechanism behind every conflation repaired today.
+    #[test]
+    fn only_people_get_a_first_name_alias() {
+        let conn = open_memory().unwrap();
+        let person = create_node(&conn, "person", "Emma Calloway", "t").unwrap();
+        assert_eq!(load_aliases(&conn, &person.id).unwrap(), vec!["emma"]);
+
+        let org = create_node(
+            &conn,
+            "org",
+            "Psychological & Brain Sciences Department",
+            "t",
+        )
+        .unwrap();
+        assert!(
+            load_aliases(&conn, &org.id).unwrap().is_empty(),
+            "an org must not be given a one-word magnet"
+        );
+        assert_eq!(org.node_type, "org");
+        assert!(
+            org.id.starts_with("org-"),
+            "id carries the type: {}",
+            org.id
+        );
+    }
+
+    /// The closed set is enforced here too, not only on `upsert_node` — a
+    /// caller reaching this with a typo should be told, not have a node of
+    /// an unknown type refused three layers down.
+    #[test]
+    fn creating_a_node_of_an_unknown_type_is_refused() {
+        let conn = open_memory().unwrap();
+        let err = create_node(&conn, "institution", "Ostrander", "t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("closed set"), "{err}");
+        assert!(create_node(&conn, "org", "  ", "t").is_err());
+    }
+
+    /// Create is stricter than rename: an exact name, or an exact alias, is
+    /// something that already resolves, and a second node under it splits
+    /// the name across two rather than repairing anything.
+    #[test]
+    fn creating_a_person_refuses_a_name_that_already_resolves_exactly() {
+        let conn = open_memory().unwrap();
+        let existing = create_person(&conn, "Vera Holt", "t").unwrap();
+        add_alias(&conn, &existing.id, "Vee", "manual").unwrap();
+
+        let by_name = create_person(&conn, "vera holt", "t")
+            .unwrap_err()
+            .to_string();
+        assert!(by_name.contains(&existing.id), "{by_name}");
+        assert!(by_name.contains("Rename"), "{by_name}");
+
+        let by_alias = create_person(&conn, "Vee", "t").unwrap_err().to_string();
+        assert!(by_alias.contains("alias"), "{by_alias}");
+        assert!(by_alias.contains(&existing.id), "{by_alias}");
+    }
+
+    /// A name is not optional, and neither verb may blank one.
+    #[test]
+    fn neither_verb_accepts_an_empty_name() {
+        let conn = open_memory().unwrap();
+        let n = create_person(&conn, "Vera Holt", "t").unwrap();
+        assert!(create_person(&conn, "   ", "t").is_err());
+        assert!(rename_node(&conn, &n.id, "  ").is_err());
+        assert!(rename_node(&conn, "person-nope", "Anything").is_err());
+        assert_eq!(get_node(&conn, &n.id).unwrap().unwrap().name, "Vera Holt");
     }
 
     #[test]
@@ -1421,7 +2467,7 @@ mod tests {
         upsert_node(&conn, &Node::new("p5", "person", "June")).unwrap();
         upsert_node(&conn, &Node::new("p6", "person", "June")).unwrap();
         // Genuinely different people do not pair.
-        upsert_node(&conn, &Node::new("p7", "person", "Luke Skywalker")).unwrap();
+        upsert_node(&conn, &Node::new("p7", "person", "Avery Skywalker")).unwrap();
 
         let dups = duplicate_person_candidates(&conn).unwrap();
         let pairs: Vec<(&str, &str)> = dups
@@ -1528,7 +2574,8 @@ mod tests {
         // two nodes being merged becomes a self-loop after endpoint rewrite
         // ("Iris related_to Iris") — it must not survive the merge.
         let conn = open_memory().unwrap();
-        let keep = get_or_create_person(&conn, Some("i@example.com"), "Iris Calder", "cal").unwrap();
+        let keep =
+            get_or_create_person(&conn, Some("i@example.com"), "Iris Calder", "cal").unwrap();
         let dup = get_or_create_person(&conn, Some("i@example.edu"), "Iris", "cal").unwrap();
         crate::fact::assert_fact(
             &conn,
@@ -1556,6 +2603,46 @@ mod tests {
         assert_eq!(
             self_loops, 0,
             "merge must drop facts that became self-loops"
+        );
+    }
+
+    /// The drop-rule alone is not enough: it can only remove what the fuzzy
+    /// tier's LIMIT let through. With enough events matching a substring,
+    /// all five slots filled before any person was reached — so a surname
+    /// search returned five events and no people, and `/entity` could not
+    /// find two nodes to offer for a merge.
+    #[test]
+    fn a_surname_finds_people_even_when_events_swamp_the_substring() {
+        let conn = open_memory().unwrap();
+        // Far more events matching "choi" than the fuzzy tier will return.
+        for i in 0..20 {
+            upsert_node(
+                &conn,
+                &Node::new(
+                    &format!("event-{i}"),
+                    "event",
+                    &format!("booked: YB whitlock {i}"),
+                ),
+            )
+            .unwrap();
+        }
+        let a = create_person(&conn, "Dara Whitlock", "t").unwrap();
+        let b = create_person(&conn, "Juno Whitlock", "t").unwrap();
+
+        let hits = resolve_entity_all(&conn, "Whitlock").unwrap();
+        let ids: Vec<&str> = hits.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            ids.contains(&a.id.as_str()),
+            "Dara Whitlock missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&b.id.as_str()),
+            "Juno Whitlock missing: {ids:?}"
+        );
+        assert!(
+            hits.iter().all(|n| n.node_type == "person"),
+            "events shadowed the people: {:?}",
+            hits.iter().map(|n| &n.name).collect::<Vec<_>>()
         );
     }
 
@@ -1587,8 +2674,7 @@ mod tests {
     fn test_resolve_entity_ambiguity() {
         let conn = open_memory().unwrap();
         let g1 = get_or_create_person(&conn, Some("june.chen@x.com"), "June Chen", "t").unwrap();
-        let g2 =
-            get_or_create_person(&conn, Some("june.r@y.com"), "June Rodriguez", "t").unwrap();
+        let g2 = get_or_create_person(&conn, Some("june.r@y.com"), "June Rodriguez", "t").unwrap();
         add_alias(&conn, &g1.id, "June", "manual").unwrap();
         add_alias(&conn, &g2.id, "June", "manual").unwrap();
 

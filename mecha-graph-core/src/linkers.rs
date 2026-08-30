@@ -530,17 +530,6 @@ pub fn link_knn(conn: &Connection) -> Result<usize> {
         if connected {
             continue;
         }
-        let staged: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM fact_candidate
-             WHERE proposed_by = 'linker:knn' AND status != 'rejected'
-               AND payload LIKE '%' || ?1 || '%' AND payload LIKE '%' || ?2 || '%'",
-            params![a, b],
-            |r| r.get(0),
-        )?;
-        if staged {
-            continue;
-        }
-
         let name = |id: &str| -> Result<String> {
             Ok(
                 conn.query_row("SELECT name FROM nodes WHERE id = ?1", params![id], |r| {
@@ -549,10 +538,30 @@ pub fn link_knn(conn: &Connection) -> Result<usize> {
             )
         };
         let (na, nb) = (name(a)?, name(b)?);
+
+        if linker_pair_asked(conn, a, b, &na, &nb)? {
+            continue;
+        }
+
+        // Names, not node ids, and this line is the whole of a bug that made
+        // every `linker:knn` candidate impossible to accept.
+        //
+        // `ProposedFact.subject` is a NAME — it is what `accept_candidate`
+        // hands to `resolve_entity` (canonical name, alias, identifier, then
+        // fuzzy; there is no tier that reads `nodes.id`), what `bind_subject`
+        // asks `suggest_entities` about, and what `--create-subjects` uses as
+        // the display name of the node it mints. It is also the `kg_upsert`
+        // wire format, where every agent writes names. This linker was the
+        // one producer writing ids into it, having just looked the names up
+        // for the statement two lines above — so every candidate it staged
+        // failed on `cannot resolve subject 'topic-<uuid>'`, `bind` could
+        // never suggest anything (a uuid is not a misspelling of a name), and
+        // `--create-subjects` minted topic nodes whose *display name* was
+        // another node's id. Five of those are in the graph.
         let proposed = fact::ProposedFact {
-            subject: a.clone(),
+            subject: na.clone(),
             predicate: "related_to".into(),
-            object: Some(b.clone()),
+            object: Some(nb.clone()),
             object_value: None,
             statement: format!(
                 "{na} and {nb} appear in semantically similar contexts (centered cosine {sim:.2}) — likely related"
@@ -561,11 +570,207 @@ pub fn link_knn(conn: &Connection) -> Result<usize> {
             // 0.80..1.0 similarity → 0.4..0.7: speculative territory, always.
             confidence: Some((0.4 + (sim - KNN_SIM_THRESHOLD) * 1.5).clamp(0.4, 0.7)),
             tags: None,
+            subject_node: Some(a.clone()),
+            object_node: Some(b.clone()),
         };
         fact::propose_fact(conn, &proposed, "linker:knn", None)?;
         created += 1;
     }
     Ok(created)
+}
+
+/// Has any speculative linker — any status — already asked about this node
+/// pair? A pair asked once is asked, whatever the answer was: rejection
+/// writes no negative fact, mentions rebuild nightly and centroids drift,
+/// so without an any-status guard the same judged pair re-entered the
+/// top-40 with a shifted `cosine 0.NN` in the statement defeating
+/// precheck's exact rejection memory (115 of 133 human verdicts on kNN
+/// were rejections, many the same answer given twice). Scoped across
+/// `linker:%`, not one proposer: kNN and structural stage the same
+/// `related_to` claim about the same pair, and a per-proposer guard let a
+/// pair rejected under one re-enter under the other.
+///
+/// Three matching arms, one per payload generation:
+/// - `subject_node`/`object_node` ids — what both linkers write now; exact,
+///   collision-free (names are not unique: two people really can be June,
+///   and a name-only guard silently suppresses the distinct second pair).
+/// - names, only for rows with NO node ids — the cohort staged between the
+///   names fix (24fa9be) and the id fields; collision there errs toward
+///   silence, and the cohort no longer grows.
+/// - `LIKE '%<id>%'` — the id-era rows from before 24fa9be, where the ids
+///   sit inside subject/object themselves; precise because ids are uuids.
+fn linker_pair_asked(conn: &Connection, a: &str, b: &str, na: &str, nb: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) > 0 FROM fact_candidate
+         WHERE proposed_by LIKE 'linker:%'
+           AND ((json_extract(payload, '$.subject_node') IN (?1, ?2)
+                 AND json_extract(payload, '$.object_node') IN (?1, ?2))
+             OR (json_extract(payload, '$.subject_node') IS NULL
+                 AND json_extract(payload, '$.subject') IN (?3, ?4)
+                 AND json_extract(payload, '$.object')  IN (?3, ?4))
+             OR (payload LIKE '%' || ?1 || '%' AND payload LIKE '%' || ?2 || '%'))",
+        params![a, b, na, nb],
+        |r| r.get(0),
+    )?)
+}
+
+// ─── One-shot repair: node ids where names belong ────────────────────────────
+
+/// Does this string have the shape of a node id — `<kind>-<uuid>`?
+///
+/// Used only to decide whether a candidate whose subject resolves to nothing
+/// gets **reported** as wreckage from the id-in-a-name-field bug. Nothing is
+/// rewritten on this: a rewrite happens only when the string is provably a
+/// live node's id.
+///
+/// Deliberately strict, and the first cut was not. An unresolvable subject
+/// is the ordinary condition of a pending candidate — `cannot resolve
+/// subject` is the commonest accept failure in the queue — so "lowercase
+/// words joined by hyphens" reported 243 candidates as damage when 121 were
+/// affected in total. `gaze-kit` and `social-connection` are names somebody
+/// meant; only a real uuid tail makes it an id.
+pub fn looks_like_node_id(s: &str) -> bool {
+    s.split_once('-')
+        .is_some_and(|(kind, rest)| !kind.is_empty() && uuid::Uuid::parse_str(rest).is_ok())
+}
+
+/// What [`repair_node_id_payloads`] found and did.
+#[derive(Debug, Default, Serialize)]
+pub struct IdPayloadRepair {
+    pub candidates_scanned: usize,
+    /// Pending candidates whose `subject`/`object` held a node id and now
+    /// hold that node's display name.
+    pub payloads_repaired: usize,
+    /// Candidates naming an id no node has — nothing to rewrite them to, so
+    /// they are left pending and reported. A human decides; a guess here
+    /// would invent the subject of somebody's belief.
+    pub unresolvable: Vec<i64>,
+    /// `(placeholder id, the node it was standing in for, facts moved)`.
+    ///
+    /// The third number is the one to read before running this. A placeholder
+    /// with facts on it is a belief somebody *accepted* while its subject
+    /// stood for nothing; the merge re-points it at the real entity, which is
+    /// what the belief's own statement always said. That is a repair, but it
+    /// is also a belief changing what it is about, so it is counted out loud
+    /// rather than folded into the total.
+    pub placeholders_merged: Vec<(String, String, i64)>,
+    /// Placeholders whose name is not any live node's id — reported, never
+    /// touched. It may be a real entity somebody named oddly.
+    pub placeholders_orphaned: Vec<String>,
+}
+
+/// Repair the damage from a producer writing node ids into `subject` and
+/// `object`, which are names (see the `linker:knn` comment above).
+///
+/// Two repairs, in this order, because the first changes what the second
+/// sees:
+///
+/// 1. **Placeholder nodes**, minted by `accept --create-subjects` on one of
+///    these candidates: their *display name* is another node's id, so they
+///    are duplicates of a node we can name exactly. Merged into it, which
+///    also leaves the id as an alias of the real node — inert for name
+///    lookup, and the one spelling that makes an unrepaired candidate
+///    resolve somewhere true instead of at a placeholder.
+///
+///    That last part is why this is not cosmetic. Once a placeholder exists,
+///    the *next* candidate carrying that id **resolves** — to the
+///    placeholder — so it accepts cleanly and asserts a belief about a node
+///    that stands for nothing. A queue item that fails loudly is a bug; one
+///    that succeeds into a fiction is the kind this repair exists for.
+///
+/// 2. **Pending candidate payloads**: `subject`/`object` rewritten from the
+///    id to the node's name. Every pending candidate is scanned, not just
+///    `linker:knn`'s — `kg_upsert` shares this payload shape, so the same
+///    mistake can arrive from an agent, and the check (is this string a
+///    node id?) is exact either way.
+///
+/// Accepted facts are **not** touched: they hold `subject_id`, which was
+/// always an id and always correct. This is only about the name-shaped
+/// fields of things still waiting for a verdict.
+pub fn repair_node_id_payloads(conn: &Connection, dry_run: bool) -> Result<IdPayloadRepair> {
+    let mut rep = IdPayloadRepair::default();
+
+    // 1. Placeholders: a node whose display name is some *other* node's id.
+    // `id != name` excludes the ordinary case of a node deliberately named
+    // after itself, which is what test fixtures and some seeded topics do.
+    let placeholders: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM nodes
+             WHERE name IN (SELECT id FROM nodes) AND id != name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    for (dup_id, names_id) in placeholders {
+        match crate::graph::get_node(conn, &names_id)? {
+            Some(real) => {
+                let facts: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM fact
+                     WHERE subject_id = ?1 OR object_id = ?1",
+                    params![dup_id],
+                    |r| r.get(0),
+                )?;
+                if !dry_run {
+                    crate::graph::merge_nodes(conn, &real.id, &dup_id)?;
+                }
+                rep.placeholders_merged.push((dup_id, real.id, facts));
+            }
+            None => rep.placeholders_orphaned.push(dup_id),
+        }
+    }
+
+    // 2. Pending payloads: ids in the name-shaped fields.
+    let rows: Vec<(i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, payload FROM fact_candidate WHERE status = 'proposed'")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    for (cid, raw) in rows {
+        rep.candidates_scanned += 1;
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let mut changed = false;
+        let mut stranded = false;
+        for field in ["subject", "object"] {
+            let Some(value) = payload.get(field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // Only strings that ARE a node id. A name that merely looks
+            // id-shaped is left exactly as it is: this repair rewrites what
+            // it can prove, never what it recognises.
+            let looks_like_id = looks_like_node_id(value);
+            match crate::graph::get_node(conn, value)? {
+                Some(node) => {
+                    if let serde_json::Value::Object(map) = &mut payload {
+                        map.insert(field.into(), serde_json::Value::String(node.name));
+                        changed = true;
+                    }
+                }
+                // An id-shaped string that resolves to nothing: the node was
+                // merged or redacted after the proposal. Nothing to rewrite
+                // it to, so say so rather than leave it looking repaired.
+                None if looks_like_id && crate::graph::resolve_entity(conn, value)?.is_none() => {
+                    stranded = true;
+                }
+                None => {}
+            }
+        }
+        if changed {
+            if !dry_run {
+                fact::update_candidate_payload(conn, cid, &payload)?;
+            }
+            rep.payloads_repaired += 1;
+        } else if stranded {
+            rep.unresolvable.push(cid);
+        }
+    }
+    Ok(rep)
 }
 
 // ─── Tier 5: structural link prediction (Adamic-Adar) ────────────────────────
@@ -650,17 +855,6 @@ pub fn link_structural(conn: &Connection) -> Result<usize> {
         if connected {
             continue;
         }
-        let staged: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM fact_candidate
-             WHERE proposed_by LIKE 'linker:%' AND status = 'proposed'
-               AND payload LIKE '%' || ?1 || '%' AND payload LIKE '%' || ?2 || '%'",
-            params![a, b],
-            |r| r.get(0),
-        )?;
-        if staged {
-            continue;
-        }
-
         let name = |id: &str| -> Result<String> {
             Ok(
                 conn.query_row("SELECT name FROM nodes WHERE id = ?1", params![id], |r| {
@@ -669,6 +863,16 @@ pub fn link_structural(conn: &Connection) -> Result<usize> {
             )
         };
         let (na, nb) = (name(&a)?, name(&b)?);
+
+        // The shared any-status pair guard — see `linker_pair_asked`. The
+        // old form here was doubly broken: `status = 'proposed'` re-filed
+        // pairs the owner had already judged (either way), and
+        // `payload LIKE '%<node id>%'` stopped matching entirely once
+        // payloads switched from ids to names — every dedup lookup came
+        // back false, so nothing this tier had ever staged blocked anything.
+        if linker_pair_asked(conn, &a, &b, &na, &nb)? {
+            continue;
+        }
         // Three classes with distinct ledger rows: agreement is the
         // high-precision hypothesis; each heuristic alone earns (or
         // loses) trust separately.
@@ -691,15 +895,22 @@ pub fn link_structural(conn: &Connection) -> Result<usize> {
                 format!("Resource-Allocation {ra:.2}"),
             ),
         };
+        // Names, not node ids — the bug commit 24fa9be fixed for linker:knn
+        // lived here too: `ProposedFact.subject` is what `accept_candidate`
+        // hands to `resolve_entity`, which has no tier that reads `nodes.id`,
+        // so an id-bearing candidate fails on accept with "cannot resolve
+        // subject 'topic-<uuid>'" — unacceptable-by-construction.
         let proposed = fact::ProposedFact {
-            subject: a.clone(),
+            subject: na.clone(),
             predicate: "related_to".into(),
-            object: Some(b.clone()),
+            object: Some(nb.clone()),
             object_value: None,
             statement: format!("{na} and {nb} share graph structure ({evidence}) — likely related"),
             valid_from: None,
             confidence: Some(conf),
             tags: None,
+            subject_node: Some(a.clone()),
+            object_node: Some(b.clone()),
         };
         fact::propose_fact(conn, &proposed, proposer, None)?;
         created += 1;
@@ -755,17 +966,33 @@ pub fn backfill_firstname_aliases(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
-/// Run the full cascade in order (§7: cheapest and most precise first).
-pub fn run_cascade(conn: &Connection) -> Result<LinkReport> {
+/// Run the cascade in order (§7: cheapest and most precise first), with the
+/// speculative tiers switchable. `propose = false` runs only the tiers that
+/// write direct, deterministic output (alias backfill, temporal join, NPMI)
+/// and skips the three that stage candidates for human review (kNN,
+/// structural, rules).
+///
+/// The parameter is deliberately not defaulted away behind a convenience
+/// wrapper: a caller must SAY whether it wants the proposing tiers, because
+/// the two halves have opposite records — the deterministic tiers are the
+/// pipeline's substrate (decay and the rollups read their mentions), while
+/// the proposing tiers ran at 4–14% human accept for a month (`linker:knn`
+/// 18 accepted / 115 rejected, the rules 2/52) with no mechanism anywhere
+/// consuming those rates. ~190 proposals a night nobody wanted, and the
+/// only off switch was editing this file. Until a precision gate exists,
+/// proposing is opt-in per run, not the price of keeping mentions fresh.
+pub fn run_cascade(conn: &Connection, propose: bool) -> Result<LinkReport> {
     let mut report = LinkReport::default();
     backfill_firstname_aliases(conn)?;
     let (n, trep) = link_temporal_reported(conn)?; // 3 before 2: its mentions feed NPMI
     report.temporal_mentions = n;
     report.temporal = trep;
     report.npmi_facts = link_npmi(conn)?;
-    report.knn_candidates = link_knn(conn)?;
-    report.structural_candidates = link_structural(conn)?;
-    report.rule_candidates = crate::rules::run_rules(conn)?.iter().map(|(_, n)| n).sum();
+    if propose {
+        report.knn_candidates = link_knn(conn)?;
+        report.structural_candidates = link_structural(conn)?;
+        report.rule_candidates = crate::rules::run_rules(conn)?.iter().map(|(_, n)| n).sum();
+    }
     Ok(report)
 }
 
@@ -905,9 +1132,26 @@ mod tests {
     }
 
     /// A node of `node_type` mentioned in `n` fresh episodes, each embedded
-    /// with the given hot components.
+    /// with the given hot components. Its display name is its id — fine for
+    /// the tests that only care whether a pair was staged, and *not* fine for
+    /// anything asserting what a payload says: a fixture where name == id
+    /// cannot tell a producer writing names from one writing ids, which is
+    /// how `linker:knn` shipped node ids in `subject` and stayed green.
+    /// `seed_named` is the one to reach for there.
     fn seed_node(conn: &Connection, id: &str, node_type: &str, n: usize, hot: &[(usize, f32)]) {
-        upsert_node(conn, &Node::new(id, node_type, id)).unwrap();
+        seed_named(conn, id, id, node_type, n, hot)
+    }
+
+    /// The same, with a display name that is deliberately not the id.
+    fn seed_named(
+        conn: &Connection,
+        id: &str,
+        name: &str,
+        node_type: &str,
+        n: usize,
+        hot: &[(usize, f32)],
+    ) {
+        upsert_node(conn, &Node::new(id, node_type, name)).unwrap();
         for k in 0..n {
             let (ep, _) = upsert_episode(
                 conn,
@@ -925,27 +1169,361 @@ mod tests {
         // Two topics in near-identical embedding neighborhoods, never
         // co-occurring; one orthogonal topic; one person sharing the topics'
         // neighborhood (must not cross the type gate).
-        seed_node(&conn, "hyperalignment", "topic", 4, &[(0, 1.0), (1, 0.1)]);
-        seed_node(
+        //
+        // Ids and names are deliberately different here — see `seed_named`.
+        seed_named(
             &conn,
-            "functional-alignment",
+            "topic-1f0a",
+            "Hyperalignment",
+            "topic",
+            4,
+            &[(0, 1.0), (1, 0.1)],
+        );
+        seed_named(
+            &conn,
+            "topic-9b3c",
+            "Functional Alignment",
             "topic",
             4,
             &[(0, 1.0), (1, 0.2)],
         );
-        seed_node(&conn, "gardening", "topic", 4, &[(5, 1.0)]);
-        seed_node(&conn, "alice", "person", 4, &[(0, 1.0), (1, 0.1)]);
+        seed_named(&conn, "topic-5e21", "Gardening", "topic", 4, &[(5, 1.0)]);
+        seed_named(
+            &conn,
+            "person-7ac4",
+            "Alice",
+            "person",
+            4,
+            &[(0, 1.0), (1, 0.1)],
+        );
 
         let n = link_knn(&conn).unwrap();
         assert_eq!(n, 1, "exactly the similar same-type pair");
         let staged = fact::pending_candidates(&conn, 100).unwrap();
         assert_eq!(staged.len(), 1);
-        let payload = staged[0].payload.to_string();
-        assert!(payload.contains("hyperalignment") && payload.contains("functional-alignment"));
         assert!(staged[0].proposed_by.as_deref() == Some("linker:knn"));
 
-        // Idempotent: a second run must not re-stage the same pair.
+        // `subject`/`object` are NAMES. `ProposedFact.subject` is what
+        // `accept_candidate` hands to `resolve_entity` — which reads
+        // canonical names, aliases and identifiers, and never `nodes.id` —
+        // so a node id here is a candidate nobody can ever accept.
+        let payload = &staged[0].payload;
+        assert_eq!(payload["subject"], "Hyperalignment");
+        assert_eq!(payload["object"], "Functional Alignment");
+
+        // And the artifact, not the field: it accepts. This is the assertion
+        // that fails on the old behaviour — with an id in `subject` it is
+        // `cannot resolve subject 'topic-1f0a'`, which is what every one of
+        // these candidates did in the real queue.
+        fact::accept_candidate(&conn, staged[0].id).expect("a knn candidate must be acceptable");
+
+        // Idempotent: a second run must not re-stage the same pair. The pair
+        // is now a live fact, so this exercises the `connected` guard; the
+        // `staged` guard has its own test below.
         assert_eq!(link_knn(&conn).unwrap(), 0);
+    }
+
+    /// The repair, and the compounding failure that makes it worth having.
+    ///
+    /// A candidate carrying a node id in `subject` fails to accept — until
+    /// somebody answers that failure with `--create-subjects`, which mints a
+    /// node whose *display name* is the id. From then on the id **resolves**,
+    /// to that placeholder, and the next candidate carrying it accepts
+    /// silently into a fiction. The assertion below that matters is the last
+    /// one: after the repair the subject resolves to the real node, not to
+    /// the placeholder that was standing where it should have been.
+    #[test]
+    fn test_repair_rewrites_ids_to_names_and_merges_placeholders() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("topic-1f0a", "topic", "Hyperalignment")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("topic-9b3c", "topic", "Functional Alignment"),
+        )
+        .unwrap();
+        // What `accept --create-subjects` left behind: a node named after
+        // another node's id.
+        upsert_node(&conn, &Node::new("topic-dead", "topic", "topic-1f0a")).unwrap();
+
+        let staged = |subject: &str, object: &str| fact::ProposedFact {
+            subject: subject.into(),
+            predicate: "related_to".into(),
+            object: Some(object.into()),
+            object_value: None,
+            statement: "Hyperalignment and Functional Alignment — likely related".into(),
+            valid_from: None,
+            confidence: Some(0.7),
+            tags: None,
+            ..Default::default()
+        };
+        let broken = fact::propose_fact(
+            &conn,
+            &staged("topic-1f0a", "topic-9b3c"),
+            "linker:knn",
+            None,
+        )
+        .unwrap();
+        // A candidate that was always fine must come through untouched.
+        let fine = fact::propose_fact(
+            &conn,
+            &staged("Hyperalignment", "Functional Alignment"),
+            "llm",
+            None,
+        )
+        .unwrap();
+
+        // Before: the id resolves — to the placeholder. This is the silent
+        // case, and it is why "it accepts" is not evidence of anything.
+        assert_eq!(
+            crate::graph::resolve_entity(&conn, "topic-1f0a")
+                .unwrap()
+                .map(|n| n.id),
+            Some("topic-dead".into()),
+            "the placeholder is what an id resolves to before the repair"
+        );
+
+        let dry = repair_node_id_payloads(&conn, true).unwrap();
+        assert_eq!(dry.payloads_repaired, 1);
+        assert_eq!(dry.placeholders_merged.len(), 1);
+        assert_eq!(
+            fact::pending_candidates(&conn, 10).unwrap().len(),
+            2,
+            "a dry run writes nothing"
+        );
+        assert!(
+            crate::graph::get_node(&conn, "topic-dead")
+                .unwrap()
+                .is_some(),
+            "nor does it merge"
+        );
+
+        let r = repair_node_id_payloads(&conn, false).unwrap();
+        assert_eq!(r.candidates_scanned, 2);
+        assert_eq!(r.payloads_repaired, 1, "only the one holding ids");
+        assert_eq!(
+            r.placeholders_merged,
+            vec![("topic-dead".to_string(), "topic-1f0a".to_string(), 0)]
+        );
+        assert!(r.unresolvable.is_empty());
+
+        let by_id = |id: i64| {
+            fact::pending_candidates(&conn, 10)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .payload
+        };
+        assert_eq!(by_id(broken)["subject"], "Hyperalignment");
+        assert_eq!(by_id(broken)["object"], "Functional Alignment");
+        assert_eq!(by_id(fine)["subject"], "Hyperalignment", "left alone");
+
+        // The placeholder is gone, and the id now resolves to the real node
+        // — so even an unrepaired candidate carrying it lands somewhere true.
+        assert!(crate::graph::get_node(&conn, "topic-dead")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::graph::resolve_entity(&conn, "topic-1f0a")
+                .unwrap()
+                .map(|n| n.id),
+            Some("topic-1f0a".into())
+        );
+        // And the repaired candidate accepts, which is the whole point.
+        fact::accept_candidate(&conn, broken).unwrap();
+    }
+
+    /// A name that merely looks id-shaped is not an id: not rewritten, and
+    /// not even reported. The repair acts on what it can prove against
+    /// `nodes.id`, and reports only on a real `<kind>-<uuid>`.
+    ///
+    /// Both halves matter. Rewriting a hyphenated name would replace one
+    /// entity's subject with another's. *Reporting* it is cheaper and still
+    /// wrong: an unresolvable subject is the ordinary state of a pending
+    /// candidate, so a loose pattern buries the actual damage in a list of
+    /// ordinary ones — which is what the first version of this did, calling
+    /// 243 candidates stranded out of 121 affected.
+    #[test]
+    fn test_repair_leaves_unprovable_strings_alone() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("topic-1f0a", "topic", "Hyperalignment")).unwrap();
+        let stage = |subject: &str| {
+            fact::propose_fact(
+                &conn,
+                &fact::ProposedFact {
+                    subject: subject.into(),
+                    predicate: "related_to".into(),
+                    object: Some("Hyperalignment".into()),
+                    object_value: None,
+                    statement: "x".into(),
+                    valid_from: None,
+                    confidence: Some(0.7),
+                    tags: None,
+                    ..Default::default()
+                },
+                "llm",
+                None,
+            )
+            .unwrap()
+        };
+        // An ordinary unresolvable subject that happens to carry hyphens.
+        let name = stage("some-thing-nobody-has");
+        // A real id whose node is gone — merged or redacted since.
+        let stray = stage("topic-2b4d7a1e-0000-4000-8000-000000000000");
+
+        let r = repair_node_id_payloads(&conn, false).unwrap();
+        assert_eq!(r.payloads_repaired, 0);
+        assert_eq!(
+            r.unresolvable,
+            vec![stray],
+            "only the id-shaped one is reported"
+        );
+        let payload = |id: i64| {
+            fact::pending_candidates(&conn, 10)
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .payload
+        };
+        assert_eq!(payload(name)["subject"], "some-thing-nobody-has");
+        assert_eq!(
+            payload(stray)["subject"],
+            "topic-2b4d7a1e-0000-4000-8000-000000000000",
+            "never rewritten to a guess"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_node_id_needs_a_real_uuid() {
+        assert!(looks_like_node_id(
+            "topic-99995377-2ebc-47e9-8065-b24079880def"
+        ));
+        assert!(looks_like_node_id(
+            "event_series-2b4d7a1e-0000-4000-8000-000000000000"
+        ));
+        // Names, all of them.
+        assert!(!looks_like_node_id("gaze-kit"));
+        assert!(!looks_like_node_id("some-thing-nobody-has"));
+        assert!(!looks_like_node_id("Jean-Luc Picard"));
+        assert!(!looks_like_node_id("topic-1f0a"));
+        assert!(!looks_like_node_id("Hyperalignment"));
+        // A bare uuid with no kind is not one either.
+        assert!(!looks_like_node_id("-2b4d7a1e-0000-4000-8000-000000000000"));
+    }
+
+    /// The staged-guard on its own: a pending candidate for a pair must stop
+    /// that pair being proposed again.
+    ///
+    /// Worth its own test because the guard had to change with the payload.
+    /// It matched `payload LIKE '%<node id>%'` twice, which was precise only
+    /// while ids were in there; names are not high-entropy, so the substring
+    /// form would have started suppressing unrelated pairs — a link silently
+    /// never offered. The guard reads the two fields by name now.
+    #[test]
+    fn the_pair_guard_reads_all_three_payload_generations() {
+        let conn = open_memory().unwrap();
+        let stage = |payload: serde_json::Value, proposer: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, proposed_by, status, confidence)
+                 VALUES (?1, ?2, ?3, 0.5)",
+                rusqlite::params![payload.to_string(), proposer, status],
+            )
+            .unwrap();
+        };
+
+        // Id-era row (pre-24fa9be): the node ids sit in subject/object
+        // themselves. The name-keyed guard alone could never match these,
+        // so every judged id-era pair was re-proposed on the first
+        // --propose run — the exact re-ask flood the guard exists to stop.
+        stage(
+            serde_json::json!({"subject": "topic-aaaa-1111", "predicate": "related_to",
+                               "object": "topic-bbbb-2222", "statement": "old era"}),
+            "linker:knn",
+            "rejected",
+        );
+        assert!(
+            linker_pair_asked(&conn, "topic-aaaa-1111", "topic-bbbb-2222", "Alpha", "Beta")
+                .unwrap(),
+            "an id-era judged pair is asked"
+        );
+
+        // Names-era row (24fa9be..id fields): names only, no node ids.
+        stage(
+            serde_json::json!({"subject": "Gamma", "predicate": "related_to",
+                               "object": "Delta", "statement": "names era"}),
+            "linker:adamic_adar",
+            "rejected",
+        );
+        assert!(
+            linker_pair_asked(&conn, "topic-cccc", "topic-dddd", "Gamma", "Delta").unwrap(),
+            "a names-era judged pair is asked — and across linker proposers, \
+             not just the one that staged it"
+        );
+
+        // Current row: node ids ride beside the names. Two DISTINCT nodes
+        // sharing a display name must not collide — names are not unique,
+        // and a name-only guard silently suppressed the second pair.
+        stage(
+            serde_json::json!({"subject": "June", "predicate": "related_to",
+                               "object": "Kappa", "statement": "current era",
+                               "subject_node": "person-june-1", "object_node": "topic-kappa"}),
+            "linker:knn",
+            "rejected",
+        );
+        assert!(
+            linker_pair_asked(&conn, "person-june-1", "topic-kappa", "June", "Kappa").unwrap(),
+            "the same pair by id is asked"
+        );
+        assert!(
+            !linker_pair_asked(&conn, "person-june-2", "topic-kappa", "June", "Kappa").unwrap(),
+            "a DIFFERENT node with the same display name is a different question"
+        );
+    }
+
+    #[test]
+    fn test_knn_does_not_restage_a_pending_pair() {
+        let conn = open_memory().unwrap();
+        seed_named(
+            &conn,
+            "topic-1f0a",
+            "Hyperalignment",
+            "topic",
+            4,
+            &[(0, 1.0), (1, 0.1)],
+        );
+        seed_named(
+            &conn,
+            "topic-9b3c",
+            "Functional Alignment",
+            "topic",
+            4,
+            &[(0, 1.0), (1, 0.2)],
+        );
+        seed_named(&conn, "topic-5e21", "Gardening", "topic", 4, &[(5, 1.0)]);
+
+        assert_eq!(link_knn(&conn).unwrap(), 1);
+        // Left pending — not accepted, so the `connected` guard cannot be
+        // what stops the second run.
+        assert_eq!(
+            link_knn(&conn).unwrap(),
+            0,
+            "the pending candidate blocks it"
+        );
+        assert_eq!(fact::pending_candidates(&conn, 100).unwrap().len(), 1);
+
+        // Rejection is asked-and-answered, not absence. The guard read
+        // `status != 'rejected'` for a month: rejecting wrote no negative
+        // fact, mentions rebuilt nightly, and the same judged pair re-entered
+        // the top-40 the next night — 115 of the proposer's 133 human
+        // verdicts were rejections, many the same answer given twice.
+        let id = fact::pending_candidates(&conn, 100).unwrap()[0].id;
+        fact::reject_candidate(&conn, id, "not related").unwrap();
+        assert_eq!(
+            link_knn(&conn).unwrap(),
+            0,
+            "a rejected pair must never be re-proposed"
+        );
     }
 
     #[test]

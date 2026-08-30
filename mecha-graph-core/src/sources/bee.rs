@@ -628,6 +628,7 @@ pub fn stage_bee_fact(conn: &Connection, id: i64, text: &str, tags: &[String]) -
         valid_from: None,
         confidence: Some(0.5), // Bee's own extraction: unvetted
         tags: (!tags.is_empty()).then(|| tags.join(",")),
+        ..Default::default()
     };
     let cid = crate::fact::propose_fact(conn, &proposed, "bee:suggested", None)?;
     // Ride the Bee id in the payload so verdicts can be pushed back.
@@ -885,8 +886,7 @@ You spent time planning the spring planting.
     #[test]
     fn test_bee_fact_staging_dedup_and_push_lifecycle() {
         let conn = crate::db::open_memory().unwrap();
-        crate::graph::upsert_node(&conn, &crate::graph::Node::new("ada", "person", "Ada"))
-            .unwrap();
+        crate::graph::upsert_node(&conn, &crate::graph::Node::new("ada", "person", "Ada")).unwrap();
 
         // Staging pre-fills the subject via entity detection and rides the id.
         let cid = stage_bee_fact(

@@ -296,6 +296,7 @@ mod tests {
                 valid_from: None,
                 source: None,
                 tags: vec![],
+                tier: None,
                 text: String::new(),
             }],
             truncated: false,

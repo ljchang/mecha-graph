@@ -136,6 +136,17 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "kg_shadow_queue",
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+            "description": "The surfaced-verdict queue (review-on-use): live UNREVIEWED (shadow) facts that are about to matter — each with the reasons it surfaced (contradicts a reviewed fact / was served in a context pack N times / spot-check of a sampled class). Shadow facts are already retrievable, rank-discounted and labeled 'unreviewed'; this queue is what a human should look at next. Read-only, and deliberately so: show the owner what surfaced, but the verdict itself (confirm/refute) is a human act on a human surface — `pkg shadow --confirm/--refute` or the TUI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Max facts surfaced (default 10)" }
+                }
+            }
+        },
+        {
             "name": "kg_verdict",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
             "description": "Record what a dialogue concluded about a pending candidate. This is NOT a decision — the candidate stays pending and a human still decides. It is an opinion filed beside the candidate so it can be scored against that decision later, which is the only way a mechanism earns its way up the autonomy ladder. Give the candidate_id, the mechanism that produced it (corroboration|persistence|resolution), the verdict, and a one-line basis naming what was found.",
@@ -166,6 +177,17 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "kg_notes",
+            "annotations": { "readOnlyHint": true, "openWorldHint": false },
+            "description": "The owner's own captured notes (source='note' episodes), newest first. A listing, not a search: what was recently written down, for surfaces that show a notebook. Each row carries `source_id`: re-upserting an episode under source='note' with that id UPDATES the note in place, which is how a notebook offers an edit rather than a second copy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "max rows (default 20)" }
+                }
+            }
+        },
+        {
             "name": "kg_upsert",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
             "description": "Write back something learned. kind='fact' is staged as a fact candidate (never directly into the graph) with agent provenance; kind='alias' records a user's answer to a disambiguation; kind='episode' records evidence (e.g. a distilled session summary) — it lands as a source-owned episode whose extracted beliefs still go through the review queue. Re-upserting the same source+source_id updates the episode instead of duplicating it.",
@@ -181,7 +203,8 @@ fn tool_definitions() -> Value {
                     "valid_from": { "type": "string" },
                     "confidence": { "type": "number" },
                     "alias": { "type": "string", "description": "kind=alias: the alias text" },
-                    "node_id": { "type": "string", "description": "kind=alias: the node it belongs to" },
+                    "node_id": { "type": "string", "description": "kind=alias: the node it belongs to (an id, not a name)" },
+                    "remove": { "type": "boolean", "description": "kind=alias: remove the alias instead of adding it — the repair for a name that belonged to somebody else. Only on the user's explicit instruction; removing an alias changes where every future mention of that name lands." },
                     "body": { "type": "string", "description": "kind=episode: the episode text" },
                     "source_id": { "type": "string", "description": "kind=episode: stable id within the source (e.g. a session id) — the idempotence key" },
                     "source_ref": { "type": "string", "description": "kind=episode: pointer back to the raw record (e.g. a transcript path)" },
@@ -213,7 +236,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, and who it is waiting on. Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -231,7 +254,19 @@ fn tool_definitions() -> Value {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
                     "project": { "type": "string", "description": "Parent project/topic — must resolve to an existing node" },
-                    "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" }
+                    "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
+                    "captured_from": {
+                        "type": "object",
+                        "description": "What prompted this task, so a person can read the original later — `mecha tasks source <id>` follows it. A pointer, never a copy: no bodies, no quoted text, and a key that is not listed here is refused. Set it when the task comes from something with an address; omit it entirely for one somebody typed, where the absence is the honest answer.",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["mail", "frontdoor", "session"] },
+                            "id": { "type": "string", "description": "Which one — a thread id, request id, session id" },
+                            "account": { "type": "string", "description": "Required for kind 'mail': thread ids are account-scoped" },
+                            "label": { "type": "string", "description": "A handle a human recognises it by, e.g. the subject line" },
+                            "at": { "type": "string", "description": "When the original is dated, RFC 3339" }
+                        },
+                        "required": ["kind", "id"]
+                    }
                 },
                 "required": ["name"]
             }
@@ -239,7 +274,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_update",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
-            "description": "Move a task through its lifecycle (status: next|inbox|scheduled|waiting|done|dropped) and/or edit its scheduling. 'done'/'dropped' stamp completed_at; reopening clears it. For due/defer/context: omit the field to leave it untouched, pass \"\" to clear it. Takes the task's node_id from kg_task_list.",
+            "description": "Move a task through its lifecycle (status: next|inbox|scheduled|waiting|done|dropped) and/or edit its scheduling. 'done'/'dropped' stamp completed_at; reopening clears it. For due/defer/context/waiting_on: omit the field to leave it untouched, pass \"\" to clear it. waiting_on names who currently has the ball and must already exist in the graph. Takes the task's node_id from kg_task_list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -247,7 +282,10 @@ fn tool_definitions() -> Value {
                     "status": { "type": "string", "enum": ["next", "inbox", "scheduled", "waiting", "done", "dropped"] },
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
-                    "context": { "type": "string", "description": "New context tag; \"\" clears" }
+                    "context": { "type": "string", "description": "New context tag; \"\" clears" },
+                    "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'." },
+                    "session": { "type": "string", "description": "The agent conversation working this task. Set by the harness that starts one — do not invent a value; \"\" clears." },
+                    "captured_from": { "description": "What the task was captured from — same object kg_task_create takes; \"\" clears. Set it from what you actually read, never reconstructed from the task's wording." }
                 },
                 "required": ["task"]
             }
@@ -277,15 +315,19 @@ fn handle_tool_call(
         "kg_search" => kg_search(conn, embedder, &args),
         "kg_entity" => kg_entity(conn, &args),
         "kg_timeline" => kg_timeline(conn, &args),
+        "kg_notes" => kg_notes(conn, &args),
         "kg_upsert" => kg_upsert(conn, &args),
         "kg_related" => kg_related(conn, &args),
         "kg_verify" => kg_verify(conn, &args),
         "kg_pending" => kg_pending(conn, &args),
+        "kg_shadow_queue" => kg_shadow_queue(conn, &args),
         "kg_verdict" => kg_verdict(conn, &args),
         "kg_task_list" => kg_task_list(conn, &args),
         "kg_task_create" => kg_task_create(conn, &args),
         "kg_task_update" => kg_task_update(conn, &args),
-        _ => Err(mecha_graph_core::Error::Other(format!("unknown tool {name}"))),
+        _ => Err(mecha_graph_core::Error::Other(format!(
+            "unknown tool {name}"
+        ))),
     };
 
     match out {
@@ -295,6 +337,61 @@ fn handle_tool_call(
             "isError": true
         })),
     }
+}
+
+/// The surfaced-verdict queue, read-only. The verdict verbs stay off the
+/// MCP surface on purpose: an agent relaying "the owner said yes" is a
+/// paraphrase, and a lane must not promote itself — confirmation crosses
+/// a human surface (CLI/TUI) structurally, not by convention.
+fn kg_shadow_queue(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let limit = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
+    let (q, total) = mecha_graph_core::shadow::surfaced_counted(conn, limit)?;
+    let (live, served) = mecha_graph_core::shadow::shadow_counts(conn)?;
+    Ok(json!({
+        "surfaced_total": total,
+        "surfaced": q.iter().map(|s| json!({
+            "fact_uid": s.fact.uid,
+            "statement": s.fact.statement,
+            "predicate": s.fact.predicate,
+            "extractor": s.fact.extractor,
+            "confidence": s.fact.confidence,
+            "reasons": s.reasons,
+            "touches": s.touches,
+            "last_served": s.last_served,
+        })).collect::<Vec<_>>(),
+        "shadow_live": live,
+        "shadow_served": served,
+        "note": "verdicts are human-gated: pkg shadow --confirm <uid> / --refute <uid> --reason '…'",
+    }))
+}
+
+/// The owner's notes, newest first. Deliberately source='note' only: this
+/// is the notebook view, and mixing in distilled sessions or mail episodes
+/// would make it a feed nobody asked for.
+fn kg_notes(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let limit = args["limit"].as_u64().unwrap_or(20).min(200);
+    // `source_id` rides along beside `uid`, and the pair is not redundant:
+    // `uid` names the row, but the only key that can *write* to it is
+    // (source, source_id) — the idempotence key `upsert_episode` matches on.
+    // A notebook that lists notes without it can offer no edit at all, which
+    // is what mecha's notes page discovered by having nothing to send back.
+    let mut stmt = conn.prepare(
+        "SELECT uid, source_id, body, occurred_at FROM episode
+         WHERE source = 'note'
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map([limit], |r| {
+            Ok(serde_json::json!({
+                "uid": r.get::<_, String>(0)?,
+                "source_id": r.get::<_, String>(1)?,
+                "body": r.get::<_, String>(2)?,
+                "occurred_at": r.get::<_, String>(3)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({ "notes": rows }))
 }
 
 fn kg_search(
@@ -443,7 +540,10 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
                 // means this was asked and answered no. Do not re-assert it.
                 "polarity": f.polarity,
                 "valid_from": f.valid_from, "confidence": f.confidence,
-                "observations": f.observation_count, "extractor": f.extractor
+                "observations": f.observation_count, "extractor": f.extractor,
+                // review-on-use: 'shadow' facts are served but unvetted;
+                // anything not 'reviewed' is unreviewed.
+                "tier": f.tier
             })
         })
         .collect();
@@ -458,6 +558,23 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         .collect();
     let pi = rollup::get_person_interaction(conn, &node.id)?;
     let ctx = context::assemble_context(conn, &node.id, 1500)?;
+    // The deterministic keys — an email, a handle — that decide where future
+    // ingest lands. Aliases are how the node is *spoken of*; identifiers are
+    // how sources *reach* it, which is why a split that leaves one behind
+    // re-merges on the next sync. Surfaced so a person can see the
+    // difference before repairing a conflation.
+    let identifiers: Vec<Value> = {
+        let mut stmt = conn.prepare(
+            "SELECT kind, value FROM node_identifier
+             WHERE node_id = ?1 ORDER BY kind, value",
+        )?;
+        let rows = stmt
+            .query_map([&node.id], |r| {
+                Ok(json!({ "kind": r.get::<_, String>(0)?, "value": r.get::<_, String>(1)? }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
     // Which sources actually cover this entity, and over what span. The
     // rollup already answers this coarsely as per-channel recency; this is
     // the same question asked precisely, and it is what a caller needs to
@@ -474,7 +591,8 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     Ok(json!({
         "v": 1, "found": true,
         "node": { "id": node.id, "name": node.name, "type": node.node_type,
-                  "aliases": node.aliases, "scope_id": node.scope_id },
+                  "aliases": node.aliases, "identifiers": identifiers,
+                  "scope_id": node.scope_id },
         "interaction": pi,
         "context": ctx,
         "facts": facts,
@@ -540,6 +658,23 @@ fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         let alias = args["alias"]
             .as_str()
             .ok_or_else(|| mecha_graph_core::Error::Other("alias upsert needs alias".into()))?;
+        if args["remove"].as_bool() == Some(true) {
+            // The other repair (the CLI's `unalias`): the name belonged to
+            // somebody else. Symmetric with add — both directions are the
+            // owner answering a disambiguation, and removing is the safer of
+            // the two (an alias is re-addable; a wrong one keeps mis-linking
+            // every future mention). node_id is an id, never a name: on a
+            // repair verb a name lookup could land on exactly the conflated
+            // node being repaired.
+            let removed = graph::remove_alias(conn, node_id, alias)?;
+            return Ok(json!({
+                "v": 1,
+                "status": if removed { "alias_removed" } else { "alias_absent" },
+                "node_id": node_id,
+                "alias": alias,
+                "removed": removed,
+            }));
+        }
         graph::add_alias(conn, node_id, alias, source)?;
         return Ok(json!({ "v": 1, "status": "alias_added", "node_id": node_id, "alias": alias }));
     }
@@ -553,7 +688,9 @@ fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         // evidence; provenance (`source`) is what lets you undo the evidence.
         let body = args["body"].as_str().unwrap_or_default();
         if body.is_empty() {
-            return Err(mecha_graph_core::Error::Other("episode upsert needs body".into()));
+            return Err(mecha_graph_core::Error::Other(
+                "episode upsert needs body".into(),
+            ));
         }
         let source_id = args["source_id"].as_str().unwrap_or_default();
         if source_id.is_empty() {
@@ -649,6 +786,7 @@ fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         valid_from: args["valid_from"].as_str().map(|s| s.to_string()),
         confidence: args["confidence"].as_f64(),
         tags: args["tags"].as_str().map(|s| s.to_string()),
+        ..Default::default()
     };
     if proposed.subject.is_empty() || proposed.statement.is_empty() {
         return Err(mecha_graph_core::Error::Other(
@@ -759,6 +897,46 @@ mod tests {
     }
 
     #[test]
+    fn alias_upsert_removes_with_the_remove_flag() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("rowan-1", "person", "Rowan Ellery")).unwrap();
+
+        // Add, then remove — the round trip of a conflation repair.
+        let v = kg_upsert(
+            &conn,
+            &json!({ "kind": "alias", "node_id": "rowan-1", "alias": "rowan" }),
+        )
+        .unwrap();
+        assert_eq!(v["status"], "alias_added");
+
+        let v = kg_upsert(
+            &conn,
+            &json!({ "kind": "alias", "node_id": "rowan-1", "alias": "rowan", "remove": true }),
+        )
+        .unwrap();
+        assert_eq!(v["status"], "alias_removed");
+        assert_eq!(v["removed"], true);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_alias WHERE node_id = 'daniel-1' AND alias = 'daniel'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "the alias row must actually be gone");
+
+        // Removing what is already gone reports the truth, not an error —
+        // the caller asked for it to be absent, and it is.
+        let v = kg_upsert(
+            &conn,
+            &json!({ "kind": "alias", "node_id": "rowan-1", "alias": "rowan", "remove": true }),
+        )
+        .unwrap();
+        assert_eq!(v["status"], "alias_absent");
+        assert_eq!(v["removed"], false);
+    }
+
+    #[test]
     fn episode_upsert_validates_its_inputs() {
         let conn = open_memory().unwrap();
         // No body.
@@ -849,6 +1027,229 @@ mod tests {
         assert_eq!(open["items"].as_array().unwrap().len(), 0);
         let all = kg_task_list(&conn, &json!({ "include_closed": true })).unwrap();
         assert_eq!(all["items"].as_array().unwrap().len(), 1);
+    }
+
+    /// The board can now say *who* has the ball, which is what makes
+    /// "waiting" mean something a person can act on.
+    #[test]
+    fn waiting_on_names_who_has_the_ball_and_refuses_a_stranger() {
+        let conn = open_memory().unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "get the signed copy" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The agent node ships with the schema, so a task can be delegated on
+        // a graph nobody has hand-populated.
+        let v = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "waiting", "waiting_on": "mecha" }),
+        )
+        .unwrap();
+        assert_eq!(v["task"]["status"], "waiting");
+        assert_eq!(
+            v["task"]["waiting_on"], "mecha",
+            "reported back, or a caller cannot tell a set from a no-op"
+        );
+
+        // Typo protection, exactly as `project` has: an unknown name is an
+        // error rather than a new node. Without this, "waiting on Nadai"
+        // quietly becomes a person.
+        let err = kg_task_update(&conn, &json!({ "task": id, "waiting_on": "Nadai" }));
+        assert!(err.is_err(), "an unknown name must not mint a node");
+        assert!(format!("{:#}", err.unwrap_err()).contains("no node matches"));
+
+        // The failed set left the previous answer standing rather than
+        // half-clearing it.
+        let board = kg_task_list(&conn, &json!({})).unwrap();
+        assert_eq!(board["items"][0]["waiting_on"], "mecha");
+
+        // "" clears, on the same tri-state the other fields speak.
+        let v = kg_task_update(&conn, &json!({ "task": id, "waiting_on": "" })).unwrap();
+        assert!(v["task"]["waiting_on"].is_null());
+    }
+
+    /// One live claim about who owes a task, however many times it moves.
+    /// The old belief is invalidated rather than deleted — who *used* to have
+    /// it is the history a bi-temporal store exists for.
+    #[test]
+    fn re_pointing_waiting_on_leaves_exactly_one_live_fact() {
+        let conn = open_memory().unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "t" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let person = mecha_graph_core::graph::Node::new("person-x", "person", "Nadia");
+        mecha_graph_core::graph::upsert_node(&conn, &person).unwrap();
+
+        kg_task_update(&conn, &json!({ "task": id, "waiting_on": "Nadia" })).unwrap();
+        kg_task_update(&conn, &json!({ "task": id, "waiting_on": "mecha" })).unwrap();
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                    AND valid_to IS NULL AND invalidated_at IS NULL",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 1,
+            "two live claims about who owes this is not a state"
+        );
+
+        let all: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(all, 2, "and the first one is history, not gone");
+    }
+
+    /// The link back to the conversation that worked a task — an attribute,
+    /// because an edge to the session's episode would exist only for the runs
+    /// the distiller judged worth remembering, and the runs it skips are
+    /// exactly the ones a person half-remembers and wants to reopen.
+    #[test]
+    fn a_task_remembers_the_conversation_that_worked_it() {
+        let conn = open_memory().unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "t" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            kg_task_list(&conn, &json!({})).unwrap()["items"][0]["session"].is_null(),
+            "a task nobody has worked names no conversation"
+        );
+
+        let v = kg_task_update(
+            &conn,
+            &json!({ "task": id, "session": "20260826T101804-476080dd" }),
+        )
+        .unwrap();
+        assert_eq!(v["task"]["session"], "20260826T101804-476080dd");
+        // And on the board, which is what a row renders from.
+        let board = kg_task_list(&conn, &json!({})).unwrap();
+        assert_eq!(board["items"][0]["session"], "20260826T101804-476080dd");
+
+        // "" clears, like every other field on this tool.
+        let v = kg_task_update(&conn, &json!({ "task": id, "session": "" })).unwrap();
+        assert!(v["task"]["session"].is_null());
+    }
+
+    /// The way back to what asked for the task, across the wire.
+    ///
+    /// Capture and update both take it, because the two capture paths differ:
+    /// `mecha mail task` knows the thread as it creates the task, while a run
+    /// that discovers the source later fills it in.
+    #[test]
+    fn a_task_remembers_what_asked_for_it() {
+        let conn = open_memory().unwrap();
+        let mail = json!({
+            "kind": "mail", "account": "ostrander", "id": "thread-19a2f",
+            "label": "SAS 2027 award nominations", "at": "2026-08-11T14:02:00Z",
+        });
+
+        // Set at capture — the mail path, where the thread is in hand.
+        let id = kg_task_create(
+            &conn,
+            &json!({ "name": "Decide on the nominations", "captured_from": mail }),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let board = kg_task_list(&conn, &json!({})).unwrap();
+        assert_eq!(board["items"][0]["captured_from"]["kind"], "mail");
+        assert_eq!(board["items"][0]["captured_from"]["id"], "thread-19a2f");
+        assert_eq!(board["items"][0]["captured_from"]["account"], "ostrander");
+
+        // A task typed into the board carries nothing, and the row says so
+        // with a null rather than a `{"kind": "manual"}` that opens nothing.
+        let plain = kg_task_create(&conn, &json!({ "name": "buy milk" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let board = kg_task_list(&conn, &json!({})).unwrap();
+        let plain_row = board["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == plain.as_str())
+            .unwrap();
+        assert!(plain_row["captured_from"].is_null());
+
+        // Filled in later, and reported back — a caller cannot otherwise tell
+        // a successful set from a silently-ignored one.
+        let v = kg_task_update(
+            &conn,
+            &json!({ "task": plain, "captured_from": {"kind": "session", "id": "20260826T101804-476080dd"} }),
+        )
+        .unwrap();
+        assert_eq!(v["task"]["captured_from"]["kind"], "session");
+
+        // `""` clears, like every other field on this tool. `null` cannot:
+        // an absent key deserialises to exactly that, so omitting the field
+        // would wipe the pointer on every unrelated status change.
+        let v = kg_task_update(&conn, &json!({ "task": id, "status": "next" })).unwrap();
+        assert_eq!(
+            v["task"]["captured_from"]["id"], "thread-19a2f",
+            "moving a task must not forget where it came from"
+        );
+        let v = kg_task_update(&conn, &json!({ "task": id, "captured_from": "" })).unwrap();
+        assert!(v["task"]["captured_from"].is_null());
+
+        // A copy is refused at the tool boundary too — the graph holds a
+        // pointer at other people's words, never the words.
+        assert!(kg_task_create(
+            &conn,
+            &json!({ "name": "x", "captured_from": {"kind": "mail", "account": "a", "id": "t", "body": "Dear Ada, …"} })
+        )
+        .is_err());
+    }
+
+    /// `@owner` is how a harness hands work back without carrying the
+    /// owner's name around — and a graph with no owner says so rather than
+    /// silently naming nobody.
+    #[test]
+    fn owner_is_addressable_without_knowing_the_owners_name() {
+        let conn = open_memory().unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "t" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let err = kg_task_update(&conn, &json!({ "task": id, "waiting_on": "@owner" }));
+        assert!(err.is_err(), "no owner set is a named failure, not a no-op");
+        assert!(format!("{:#}", err.unwrap_err()).contains("no owner set"));
+
+        let me = mecha_graph_core::graph::Node::new("person-me", "person", "Ada");
+        mecha_graph_core::graph::upsert_node(&conn, &me).unwrap();
+        mecha_graph_core::graph::set_owner(&conn, "person-me").unwrap();
+
+        let v = kg_task_update(&conn, &json!({ "task": id, "waiting_on": "@owner" })).unwrap();
+        assert_eq!(v["task"]["waiting_on"], "Ada");
+    }
+
+    /// The agent is not a person, and the distinction is the point: a task
+    /// waits on `mecha` without `mecha` turning up in every people-shaped
+    /// view, because responsibility does not transfer to it.
+    #[test]
+    fn the_agent_node_ships_and_is_not_a_person() {
+        let conn = open_memory().unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT node_type FROM nodes WHERE id = 'agent-mecha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "agent");
     }
 
     #[test]
@@ -1152,7 +1553,8 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
                 "id": t.node_id, "name": t.name, "status": t.status,
                 "due_at": t.due_at, "defer_until": t.defer_until,
                 "context": t.context_tag, "project": t.project,
-                "waiting_on": t.waiting_on, "completed_at": t.completed_at,
+                "waiting_on": t.waiting_on, "session": t.session, "completed_at": t.completed_at,
+                "captured_from": t.captured_from,
                 "overdue": overdue
             })
         })
@@ -1173,6 +1575,15 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         args["project"].as_str(),
         args["context"].as_str(),
     )?;
+    // A second write rather than a sixth positional argument, on the
+    // `set_task_session` shape: the property has its own validating setter,
+    // and `create_task` has a TUI caller that has nothing to say about
+    // provenance. A refused pointer fails the *call*, so the caller learns
+    // its pointer was junk rather than getting a task with the provenance
+    // quietly missing — which is the absence this whole field exists to fix.
+    if !args["captured_from"].is_null() {
+        gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
+    }
     Ok(json!({ "v": 1, "status": "created", "id": task_id, "due_at": due }))
 }
 
@@ -1209,6 +1620,26 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         )?;
     }
 
+    // After the schedule, because both can arrive in one call and a caller
+    // moving a task to `waiting` almost always names who in the same breath.
+    if let Some(who) = args["waiting_on"].as_str() {
+        gtd::set_task_waiting_on(conn, task, who)?;
+    }
+    if let Some(session) = args["session"].as_str() {
+        gtd::set_task_session(conn, task, session)?;
+    }
+    // An object sets it; `""` clears it, which is the tri-state every other
+    // field here speaks. `null` cannot mean "clear" — an absent key
+    // deserialises to exactly that, so the two would be the same call and
+    // omitting the field would wipe the pointer.
+    match &args["captured_from"] {
+        Value::Null => {}
+        Value::String(s) if s.trim().is_empty() => {
+            gtd::set_task_captured_from(conn, task, None)?;
+        }
+        value => gtd::set_task_captured_from(conn, task, Some(value))?,
+    }
+
     let updated = gtd::list_tasks(conn, true)?
         .into_iter()
         .find(|t| t.node_id == task)
@@ -1216,7 +1647,13 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             json!({
                 "id": t.node_id, "name": t.name, "status": t.status,
                 "due_at": t.due_at, "defer_until": t.defer_until,
-                "context": t.context_tag, "completed_at": t.completed_at
+                "context": t.context_tag, "completed_at": t.completed_at,
+                // Reported back because the caller cannot otherwise tell a
+                // successful set from a silently-ignored one — the field is
+                // written as a fact, not a column, so it does not turn up in
+                // the row by itself.
+                "waiting_on": t.waiting_on, "session": t.session,
+                "captured_from": t.captured_from
             })
         });
     Ok(json!({ "v": 1, "status": "updated", "task": updated }))

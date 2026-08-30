@@ -12,7 +12,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use mecha_graph_core::rusqlite::Connection;
-use mecha_graph_core::{episode, fact, graph, gtd, precheck, rollup, router, stats};
+use mecha_graph_core::{entity_audit, episode, fact, graph, gtd, precheck, rollup, router, stats};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -263,6 +263,10 @@ enum ReviewMode {
     Normal,
     /// Typing a rejection reason.
     Reason(LineEdit),
+    /// Typing a refutation reason for the selected SHADOW fact.
+    ShadowReason(LineEdit),
+    /// Typing a rejection reason for the selected semantic GROUP.
+    GroupReason(LineEdit),
     /// Editing the candidate's fields before acceptance.
     Edit(EditState),
 }
@@ -284,10 +288,42 @@ struct ReviewState {
     /// Item view drilled into one cluster (Enter from cluster view):
     /// (proposer, predicate-or-"(kind)"). Esc pops back out.
     cluster_filter: Option<(String, String)>,
+    /// Proposer view (`p` toggles): the queue rolled up by proposing
+    /// mechanism — gossip, the linkers, the LLM extractor, Bee, the rules.
+    ///
+    /// One level above clusters because that is the level the decisions are
+    /// actually made at: you switch a *mechanism* on or off, and its record
+    /// is invisible spread across 733 (proposer, predicate) rows.
+    proposer_view: bool,
+    proposers: Vec<precheck::ProposerStat>,
+    proposer_list: ListState,
+    /// Narrows both the cluster list and the item list to one proposer.
+    /// Separate from `cluster_filter` rather than folded into it, because
+    /// the two compose: pick a mechanism, then a class within it.
+    proposer_filter: Option<String>,
+    /// Surfaced-verdict view (`s` toggles): live shadow facts that are
+    /// about to matter — review-on-use's primary human surface. The
+    /// verdict verbs here act on FACTS (confirm/refute), not candidates.
+    shadow_view: bool,
+    shadow: Vec<mecha_graph_core::shadow::SurfacedFact>,
+    shadow_list: ListState,
+    /// Semantic groups within ONE class (`g` from a cluster) — the
+    /// measured-sound cascade lane (same-class pairs carried the same
+    /// human verdict ~89% of the time; cross-class only ~63%, which is
+    /// why this view deliberately does not cross). One keystroke is one
+    /// human verdict: the leader is the owner's, members cascade
+    /// machine-labeled.
+    group_view: bool,
+    groups: Vec<mecha_graph_core::similar::SimilarGroup>,
+    group_class: Option<(String, String)>,
+    group_list: ListState,
 }
 
 struct MergeState {
-    items: Vec<(String, String, String)>, // (a, b, canonical name)
+    /// (a, b, label, proposal). `proposal` is `Some` when the row came from
+    /// the audit queue, so acting on it here also decides it there — two
+    /// surfaces over one decision, not two decisions.
+    items: Vec<(String, String, String, Option<i64>)>,
     list: ListState,
     /// Merge direction: false = keep left(a), true = keep right(b).
     swap: bool,
@@ -328,9 +364,41 @@ enum EntityMode {
     View,
 }
 
+/// The three identity edits the entity page offers. Each is one line of
+/// text and one call into `mecha_graph_core::graph`, which is why they share
+/// a mode rather than getting a form apiece.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    /// Change the node's name; the old one stays an alias.
+    Rename,
+    /// Add another way of saying this node's name.
+    Alias,
+    /// Mint a person who has facts and episodes but no node of their own.
+    NewPerson,
+}
+
+impl EditKind {
+    fn prompt(self) -> &'static str {
+        match self {
+            EditKind::Rename => " rename to — Enter confirms · Esc cancels ",
+            EditKind::Alias => " add alias — Enter confirms · Esc cancels ",
+            EditKind::NewPerson => " new person, their name — Enter confirms · Esc cancels ",
+        }
+    }
+}
+
+struct EntityEdit {
+    kind: EditKind,
+    input: LineEdit,
+}
+
 struct EntityState {
     mode: EntityMode,
     input: LineEdit,
+    /// An identity edit in flight. Held beside `mode` rather than as a
+    /// fourth variant of it so the lookup/pick/view logic is untouched —
+    /// an edit is a thing layered *over* the page, not a fourth page.
+    edit: Option<EntityEdit>,
     /// Live typeahead suggestions while typing in Input mode.
     suggestions: Vec<graph::Suggestion>,
     sug: ListState,
@@ -413,6 +481,17 @@ pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
             clusters: vec![],
             cluster_list: ListState::default(),
             cluster_filter: None,
+            proposer_view: false,
+            proposers: vec![],
+            proposer_list: ListState::default(),
+            proposer_filter: None,
+            shadow_view: false,
+            shadow: vec![],
+            shadow_list: ListState::default(),
+            group_view: false,
+            groups: vec![],
+            group_class: None,
+            group_list: ListState::default(),
         },
         merge: MergeState {
             items: vec![],
@@ -437,6 +516,7 @@ pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
         entity: EntityState {
             mode: EntityMode::Input,
             input: LineEdit::new(),
+            edit: None,
             suggestions: vec![],
             sug: ListState::default(),
             candidates: vec![],
@@ -551,7 +631,8 @@ fn event_loop(
                     CaptureKind::Fact => app.capture.fields.iter().any(|(_, v)| !v.is_empty()),
                 },
                 Screen::Entity => {
-                    app.entity.mode == EntityMode::Input && !app.entity.input.is_empty()
+                    app.entity.edit.is_some()
+                        || (app.entity.mode == EntityMode::Input && !app.entity.input.is_empty())
                 }
                 Screen::Gtd => match &app.gtd.mode {
                     GtdMode::Form { fields, .. } => fields.iter().any(|(_, v)| !v.is_empty()),
@@ -591,7 +672,8 @@ fn event_loop(
             // be typeable — so q-quit only fires where text can't be entered.
             let accepts_text = matches!(app.screen, Screen::Capture)
                 || (app.screen == Screen::Search && app.search.detail.is_none())
-                || (app.screen == Screen::Entity && app.entity.mode == EntityMode::Input)
+                || (app.screen == Screen::Entity
+                    && (app.entity.mode == EntityMode::Input || app.entity.edit.is_some()))
                 || (app.screen == Screen::Gtd && matches!(app.gtd.mode, GtdMode::Form { .. }));
             if !typing {
                 // Screen switches consume the key: without the `continue`, the
@@ -680,6 +762,7 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
                     valid_from: None,
                     source: Some(r.get(1)?),
                     tags: vec![],
+                    tier: None,
                     text: body.chars().take(200).collect(),
                 })
             })?
@@ -748,14 +831,25 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
 
 impl App {
     fn reload_review(&mut self) -> mecha_graph_core::Result<()> {
-        self.review.items = match &self.review.cluster_filter {
-            // Drilled into one cluster: select members by exactly the key
-            // rule the cluster was built with (precheck::cluster_key).
-            Some((proposer, predicate)) => fact::pending_candidates(&self.conn, 100_000)?
+        // Two filters that compose: a proposer alone, a proposer plus a
+        // predicate, or neither. Selection is by exactly the key rule the
+        // clusters were built with (`precheck::cluster_key`), so drilling in
+        // can never show a different set than the row that was drilled.
+        let proposer = self
+            .review
+            .cluster_filter
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .or_else(|| self.review.proposer_filter.clone());
+        let predicate = self.review.cluster_filter.as_ref().map(|(_, p)| p.clone());
+        self.review.items = match &proposer {
+            Some(proposer) => fact::pending_candidates(&self.conn, 100_000)?
                 .into_iter()
                 .filter(|c| {
                     c.proposed_by.as_deref().unwrap_or("?") == proposer
-                        && precheck::cluster_key(&c.payload).0 == *predicate
+                        && predicate
+                            .as_ref()
+                            .is_none_or(|p| precheck::cluster_key(&c.payload).0 == *p)
                 })
                 .take(500)
                 .collect(),
@@ -774,11 +868,75 @@ impl App {
         if self.review.cluster_view {
             self.reload_clusters()?;
         }
+        if self.review.proposer_view {
+            self.reload_proposers()?;
+        }
+        if self.review.shadow_view {
+            self.reload_shadow()?;
+        }
+        if self.review.group_view {
+            self.reload_groups()?;
+        }
         Ok(())
     }
 
+    fn reload_shadow(&mut self) -> mecha_graph_core::Result<()> {
+        self.review.shadow = mecha_graph_core::shadow::surfaced(
+            &self.conn,
+            mecha_graph_core::shadow::DEFAULT_SURFACE_LIMIT,
+        )?;
+        let len = self.review.shadow.len();
+        let sel = self.review.shadow_list.selected().unwrap_or(0);
+        self.review.shadow_list.select(if len == 0 {
+            None
+        } else {
+            Some(sel.min(len - 1))
+        });
+        Ok(())
+    }
+
+    fn selected_shadow(&self) -> Option<&mecha_graph_core::shadow::SurfacedFact> {
+        self.review.shadow.get(self.review.shadow_list.selected()?)
+    }
+
+    fn reload_groups(&mut self) -> mecha_graph_core::Result<()> {
+        let Some((proposer, predicate)) = self.review.group_class.clone() else {
+            return Ok(());
+        };
+        let e = mecha_graph_core::embed::Embedder::default();
+        if !e.available() {
+            self.review.group_view = false;
+            self.review.cluster_view = true;
+            self.status = "embedding server not answering — groups need vectors".into();
+            return Ok(());
+        }
+        self.review.groups = mecha_graph_core::similar::groups_for_class(
+            &self.conn,
+            &e,
+            &proposer,
+            &predicate,
+            mecha_graph_core::similar::GROUP_THRESHOLD,
+        )?;
+        let len = self.review.groups.len();
+        let sel = self.review.group_list.selected().unwrap_or(0);
+        self.review.group_list.select(if len == 0 {
+            None
+        } else {
+            Some(sel.min(len - 1))
+        });
+        Ok(())
+    }
+
+    fn selected_group(&self) -> Option<&mecha_graph_core::similar::SimilarGroup> {
+        self.review.groups.get(self.review.group_list.selected()?)
+    }
+
     fn reload_clusters(&mut self) -> mecha_graph_core::Result<()> {
-        self.review.clusters = precheck::review_clusters(&self.conn, 3)?;
+        let all = precheck::review_clusters(&self.conn, 3)?;
+        self.review.clusters = match &self.review.proposer_filter {
+            Some(p) => all.into_iter().filter(|c| c.proposed_by == *p).collect(),
+            None => all,
+        };
         let len = self.review.clusters.len();
         let sel = self.review.cluster_list.selected().unwrap_or(0);
         self.review.cluster_list.select(if len == 0 {
@@ -789,6 +947,25 @@ impl App {
         Ok(())
     }
 
+    fn reload_proposers(&mut self) -> mecha_graph_core::Result<()> {
+        self.review.proposers = precheck::proposer_stats(&self.conn)?;
+        let len = self.review.proposers.len();
+        let sel = self.review.proposer_list.selected().unwrap_or(0);
+        self.review.proposer_list.select(if len == 0 {
+            None
+        } else {
+            Some(sel.min(len - 1))
+        });
+        Ok(())
+    }
+
+    fn selected_proposer(&self) -> Option<&precheck::ProposerStat> {
+        self.review
+            .proposer_list
+            .selected()
+            .and_then(|i| self.review.proposers.get(i))
+    }
+
     fn selected_cluster(&self) -> Option<&precheck::ReviewCluster> {
         self.review
             .clusters
@@ -796,7 +973,11 @@ impl App {
     }
 
     /// Pending candidate ids belonging to one cluster.
-    fn cluster_member_ids(&self, proposer: &str, predicate: &str) -> mecha_graph_core::Result<Vec<i64>> {
+    fn cluster_member_ids(
+        &self,
+        proposer: &str,
+        predicate: &str,
+    ) -> mecha_graph_core::Result<Vec<i64>> {
         Ok(fact::pending_candidates(&self.conn, 100_000)?
             .into_iter()
             .filter(|c| {
@@ -808,10 +989,29 @@ impl App {
     }
 
     fn reload_merge(&mut self) -> mecha_graph_core::Result<()> {
-        self.merge.items = graph::duplicate_person_candidates(&self.conn)?;
-        self.merge
-            .items
-            .extend(graph::email_duplicate_candidates(&self.conn)?);
+        // Three sources, one screen. The first two match identical names
+        // and identical addresses; the third is the audit's near-duplicate
+        // detector, which is the only one that sees "Conan Moore" beside
+        // "Conan F Moore". Before it was wired in, this screen said "no
+        // candidates 🎉" while two merges waited in the queue — a surface
+        // announcing there is nothing to do is worse than one that says
+        // nothing, because it is believed.
+        self.merge.items = graph::duplicate_person_candidates(&self.conn)?
+            .into_iter()
+            .chain(graph::email_duplicate_candidates(&self.conn)?)
+            .map(|(a, b, name)| (a, b, name, None))
+            .collect();
+        for p in entity_audit::pending(&self.conn, Some("near_duplicate_person"), 200)? {
+            if p.other_id.is_empty() {
+                continue;
+            }
+            self.merge.items.push((
+                p.subject_id.clone(),
+                p.other_id.clone(),
+                format!("{} / {}", p.subject_name, p.other_name),
+                Some(p.id),
+            ));
+        }
         let len = self.merge.items.len();
         let sel = self.merge.list.selected().unwrap_or(0);
         self.merge.list.select(if len == 0 {
@@ -1050,17 +1250,9 @@ fn spawn_editor(initial: &str) -> mecha_graph_core::Result<Option<String>> {
 
 /// Strings too generic to become aliases — learning "they" → a person would
 /// poison resolution for every future "They …" candidate.
-fn alias_worthy(s: &str) -> bool {
-    let c = s.trim().to_lowercase();
-    c.len() >= 3
-        && ![
-            "they", "them", "he", "she", "it", "we", "us", "the", "this", "that", "everyone",
-        ]
-        .contains(&c.as_str())
-        && !c.starts_with("the ")
-        && !c.starts_with("a ")
-        && !c.starts_with("an ")
-}
+// alias_worthy moved to core (fact::alias_worthy) when the CLI `bind` verb
+// arrived — two copies of that list is two lists that drift.
+use mecha_graph_core::fact::alias_worthy;
 
 /// Ids a review action applies to: in cluster view, every member of the
 /// selected cluster; otherwise the marked set (in list order) when
@@ -1128,6 +1320,75 @@ fn accept_selected(app: &mut App, create_missing: bool) -> mecha_graph_core::Res
     Ok(())
 }
 
+/// Refute the selected shadow fact: never true, retracted, candidate
+/// rejected under the human label. One selection, one verdict.
+fn refute_selected_shadow(app: &mut App, reason: &str) -> mecha_graph_core::Result<()> {
+    if let Some(sf) = app.selected_shadow() {
+        let uid = sf.fact.uid.clone();
+        fact::refute_shadow_fact(&app.conn, &uid, reason)?;
+        app.status = format!(
+            "refuted {} — retracted as never true",
+            &uid[..8.min(uid.len())]
+        );
+        app.reload_shadow()?;
+    }
+    Ok(())
+}
+
+/// One human verdict on a semantic group: the leader is the owner's,
+/// every member goes through the cascade paths (machine-labeled,
+/// invisible to the ladder). If the leader's verdict cannot land, nothing
+/// cascades — a fan-out from a failed verdict is a fan-out from nothing.
+fn accept_selected_group(app: &mut App) -> mecha_graph_core::Result<()> {
+    let Some(g) = app.selected_group() else {
+        return Ok(());
+    };
+    let (leader, members) = (g.leader_id, g.members.clone());
+    match fact::accept_candidate_opts(&app.conn, leader, false, true) {
+        Ok(_) => {}
+        Err(e) => {
+            app.status = format!("group leader #{leader} failed: {e} — nothing cascaded");
+            return Ok(());
+        }
+    }
+    let (mut done, mut failed) = (0usize, 0usize);
+    for (id, _) in &members {
+        match fact::accept_candidate_cascade(&app.conn, *id, leader) {
+            Ok(_) => done += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    app.status = match failed {
+        0 => format!("group accepted: you + {done} cascaded (one human verdict)"),
+        f => format!("group accepted: you + {done} cascaded, {f} left pending"),
+    };
+    app.reload_groups()?;
+    app.reload_review()
+}
+
+fn reject_selected_group(app: &mut App, reason: &str) -> mecha_graph_core::Result<()> {
+    let Some(g) = app.selected_group() else {
+        return Ok(());
+    };
+    let (leader, members) = (g.leader_id, g.members.clone());
+    match fact::reject_candidate(&app.conn, leader, reason) {
+        Ok(()) => {}
+        Err(e) => {
+            app.status = format!("group leader #{leader} failed: {e} — nothing cascaded");
+            return Ok(());
+        }
+    }
+    let mut done = 0usize;
+    for (id, sim) in &members {
+        if fact::reject_candidate_cascade(&app.conn, *id, leader, Some(*sim)).is_ok() {
+            done += 1;
+        }
+    }
+    app.status = format!("group rejected: you + {done} cascaded (one human verdict)");
+    app.reload_groups()?;
+    app.reload_review()
+}
+
 fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
     match &mut app.review.mode {
         ReviewMode::Reason(buf) => {
@@ -1141,6 +1402,42 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     };
                     app.review.mode = ReviewMode::Normal;
                     reject_targets(app, &reason)?;
+                }
+                k => {
+                    buf.handle(k, mods);
+                }
+            }
+            return Ok(());
+        }
+        ReviewMode::ShadowReason(buf) => {
+            match key {
+                KeyCode::Esc => app.review.mode = ReviewMode::Normal,
+                KeyCode::Enter => {
+                    let reason = if buf.is_empty() {
+                        "refuted at review".to_string()
+                    } else {
+                        buf.text().to_string()
+                    };
+                    app.review.mode = ReviewMode::Normal;
+                    refute_selected_shadow(app, &reason)?;
+                }
+                k => {
+                    buf.handle(k, mods);
+                }
+            }
+            return Ok(());
+        }
+        ReviewMode::GroupReason(buf) => {
+            match key {
+                KeyCode::Esc => app.review.mode = ReviewMode::Normal,
+                KeyCode::Enter => {
+                    let reason = if buf.is_empty() {
+                        "rejected in review".to_string()
+                    } else {
+                        buf.text().to_string()
+                    };
+                    app.review.mode = ReviewMode::Normal;
+                    reject_selected_group(app, &reason)?;
                 }
                 k => {
                     buf.handle(k, mods);
@@ -1196,6 +1493,141 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
         ReviewMode::Normal => {}
     }
 
+    // Semantic-group view: one class's near-repeats, one verdict per
+    // group. Within-class only — the measured lane (~89% agreement);
+    // crossing classes measured ~63% and stays off this surface.
+    if app.review.group_view {
+        match key {
+            KeyCode::Char('j') | KeyCode::Down => {
+                move_sel(&mut app.review.group_list, app.review.groups.len(), 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                move_sel(&mut app.review.group_list, app.review.groups.len(), -1)
+            }
+            KeyCode::Char('G') => {
+                let len = app.review.groups.len();
+                if len > 0 {
+                    app.review.group_list.select(Some(len - 1));
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Esc => {
+                app.review.group_view = false;
+                app.review.cluster_view = true;
+                app.reload_review()?;
+            }
+            KeyCode::Char('a') => accept_selected_group(app)?,
+            KeyCode::Char('r') => {
+                if let Some((p, k)) = app.review.group_class.clone() {
+                    reject_selected_group(app, &format!("cluster verdict: {p} · {k}"))?;
+                }
+            }
+            KeyCode::Char('R') if app.selected_group().is_some() => {
+                app.review.mode = ReviewMode::GroupReason(LineEdit::new());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Surfaced-verdict view: shadow facts that are about to matter.
+    // The verbs act on FACTS — y confirms (tier → reviewed), r/R refutes
+    // (never true) — and each keystroke settles the staging candidate and
+    // moves the ladder exactly once, in core.
+    if app.review.shadow_view {
+        match key {
+            KeyCode::Char('j') | KeyCode::Down => {
+                move_sel(&mut app.review.shadow_list, app.review.shadow.len(), 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                move_sel(&mut app.review.shadow_list, app.review.shadow.len(), -1)
+            }
+            KeyCode::Char('G') => {
+                let len = app.review.shadow.len();
+                if len > 0 {
+                    app.review.shadow_list.select(Some(len - 1));
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Esc => {
+                app.review.shadow_view = false;
+                app.reload_review()?;
+            }
+            KeyCode::Char('y') | KeyCode::Char('a') => {
+                if let Some(sf) = app.selected_shadow() {
+                    let uid = sf.fact.uid.clone();
+                    fact::confirm_shadow_fact(&app.conn, &uid)?;
+                    app.status = format!("confirmed {} — now reviewed", &uid[..8.min(uid.len())]);
+                    app.reload_shadow()?;
+                }
+            }
+            // r: instant refute — the surfacing reason IS the context; R
+            // prompts for prose when the why matters (it feeds rejection
+            // memory).
+            KeyCode::Char('r') => refute_selected_shadow(app, "refuted at review")?,
+            KeyCode::Char('R') if app.selected_shadow().is_some() => {
+                app.review.mode = ReviewMode::ShadowReason(LineEdit::new());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Proposer view: which mechanism is proposing well. Read-only on
+    // purpose — no bulk verdict spans a whole mechanism, because a proposer
+    // is not a claim about anything and "reject everything the extractor
+    // ever said" is a decision no single keystroke should carry.
+    if app.review.proposer_view {
+        match key {
+            KeyCode::Char('j') | KeyCode::Down => {
+                move_sel(&mut app.review.proposer_list, app.review.proposers.len(), 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => move_sel(
+                &mut app.review.proposer_list,
+                app.review.proposers.len(),
+                -1,
+            ),
+            KeyCode::Char('G') => {
+                let len = app.review.proposers.len();
+                if len > 0 {
+                    app.review.proposer_list.select(Some(len - 1));
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Esc => {
+                app.review.proposer_view = false;
+                app.review.proposer_filter = None;
+                app.reload_review()?;
+            }
+            // Enter narrows to this mechanism and drops into its clusters.
+            KeyCode::Enter => {
+                if let Some(p) = app.selected_proposer() {
+                    let name = p.proposer.clone();
+                    let pend = p.pending;
+                    app.review.proposer_view = false;
+                    app.review.cluster_view = true;
+                    app.review.cluster_filter = None;
+                    app.review.proposer_filter = Some(name.clone());
+                    app.review.cluster_list.select(Some(0));
+                    app.reload_review()?;
+                    app.status = format!("{name} — {pend} pending · Esc back to proposers");
+                }
+            }
+            // c: skip the cluster level and see this mechanism's items.
+            KeyCode::Char('c') => {
+                if let Some(p) = app.selected_proposer() {
+                    let name = p.proposer.clone();
+                    app.review.proposer_view = false;
+                    app.review.cluster_view = false;
+                    app.review.cluster_filter = None;
+                    app.review.proposer_filter = Some(name.clone());
+                    app.review.list.select(Some(0));
+                    app.reload_review()?;
+                    app.status = format!("{name} — every pending item · Esc clears the filter");
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Cluster view: one decision per (proposer, predicate) class.
     if app.review.cluster_view {
         match key {
@@ -1211,8 +1643,25 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     app.review.cluster_list.select(Some(len - 1));
                 }
             }
-            KeyCode::Char('c') | KeyCode::Esc => {
+            // c drops to items keeping whatever narrowing is in force; Esc
+            // peels one layer, so it climbs to the proposers when we got
+            // here from one and only leaves the level otherwise.
+            KeyCode::Char('c') => {
                 app.review.cluster_view = false;
+                app.reload_review()?;
+            }
+            KeyCode::Esc => {
+                app.review.cluster_view = false;
+                if app.review.proposer_filter.is_some() {
+                    app.review.proposer_filter = None;
+                    app.review.proposer_view = true;
+                }
+                app.reload_review()?;
+            }
+            KeyCode::Char('p') => {
+                app.review.cluster_view = false;
+                app.review.proposer_filter = None;
+                app.review.proposer_view = true;
                 app.reload_review()?;
             }
             // Drill in: item view filtered to this cluster (Esc pops back).
@@ -1228,6 +1677,22 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     );
                 }
             }
+            // g: semantic groups within this class — one verdict per group.
+            KeyCode::Char('g') => match app.selected_cluster() {
+                Some(cl) if cl.commitment => {
+                    app.status =
+                        "commitments do not cascade — Enter to review them individually".into();
+                }
+                Some(cl) => {
+                    app.review.group_class = Some((cl.proposed_by.clone(), cl.predicate.clone()));
+                    app.review.group_list.select(Some(0));
+                    app.review.cluster_view = false;
+                    app.review.group_view = true;
+                    app.status = "grouping (embedding the class)…".into();
+                    app.reload_groups()?;
+                }
+                None => {}
+            },
             KeyCode::Char('a') | KeyCode::Char('A') => match app.selected_cluster() {
                 Some(cl) if cl.commitment => {
                     app.status =
@@ -1294,7 +1759,10 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                 app.review.marked = app.review.items.iter().map(|c| c.id).collect();
             }
         }
-        // Esc peels one layer: marks first, then the cluster drill-down.
+        // Esc peels one layer at a time: marks, then the cluster
+        // drill-down, then the proposer filter. Never more than one per
+        // press — a key that could drop you two levels is a key you stop
+        // trusting to be reversible.
         KeyCode::Esc => {
             if !app.review.marked.is_empty() {
                 app.review.marked.clear();
@@ -1302,12 +1770,29 @@ fn handle_review(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                 app.review.cluster_filter = None;
                 app.review.cluster_view = true;
                 app.reload_review()?;
+            } else if app.review.proposer_filter.is_some() {
+                app.review.proposer_filter = None;
+                app.review.proposer_view = true;
+                app.reload_review()?;
             }
         }
-        // c: cluster view — the queue grouped by (proposer, predicate).
+        // c: cluster view — the queue grouped by (proposer, predicate),
+        // narrowed to the current proposer if one is selected.
         KeyCode::Char('c') => {
             app.review.cluster_filter = None;
             app.review.cluster_view = true;
+            app.reload_review()?;
+        }
+        // p: proposer view — the queue rolled up by proposing mechanism.
+        KeyCode::Char('p') => {
+            app.review.cluster_filter = None;
+            app.review.proposer_filter = None;
+            app.review.proposer_view = true;
+            app.reload_review()?;
+        }
+        // s: the surfaced-verdict queue — shadow facts about to matter.
+        KeyCode::Char('s') => {
+            app.review.shadow_view = true;
             app.reload_review()?;
         }
         // d twice: redact the selected candidate's SOURCE episode — kills the
@@ -1430,11 +1915,17 @@ fn handle_merge(app: &mut App, key: KeyCode) -> mecha_graph_core::Result<()> {
         }
         KeyCode::Char('m') => {
             if let Some(i) = app.merge.list.selected() {
-                if let Some((a, b, name)) = app.merge.items.get(i).cloned() {
+                if let Some((a, b, name, proposal)) = app.merge.items.get(i).cloned() {
                     let (keep, dup) = if app.merge.swap { (b, a) } else { (a, b) };
                     match graph::merge_nodes(&app.conn, &keep, &dup) {
                         Ok(()) => {
                             rollup::rebuild_person_interactions(&app.conn)?;
+                            // Decide AFTER the merge succeeded: a proposal
+                            // marked accepted whose repair then failed is a
+                            // lie the queue keeps telling.
+                            if let Some(id) = proposal {
+                                let _ = entity_audit::decide(&app.conn, id, "accepted", "user");
+                            }
                             app.status =
                                 format!("merged '{name}' → kept {}", &keep[..24.min(keep.len())]);
                         }
@@ -1776,6 +2267,7 @@ fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_grap
                     valid_from: Some(mecha_graph_core::ids::now()),
                     confidence: Some(0.95),
                     tags: Some(get("tags")).filter(|s| !s.is_empty()),
+                    ..Default::default()
                 };
                 let id = fact::propose_fact(&app.conn, &proposed, "manual:tui", None)?;
                 match fact::accept_candidate_opts(&app.conn, id, true, true) {
@@ -1804,9 +2296,95 @@ fn handle_capture(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_grap
     Ok(())
 }
 
+/// One line of text, then one call into core. Every outcome — including
+/// every refusal — lands in the status line and leaves the page open, on
+/// the same reasoning as the CLI: a collision is a *question* (merge? or
+/// did you mean this other node?), and answering it needs the page you were
+/// already reading.
+fn handle_entity_edit(
+    app: &mut App,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> mecha_graph_core::Result<()> {
+    match key {
+        KeyCode::Esc => {
+            app.entity.edit = None;
+        }
+        KeyCode::Enter => {
+            let Some(edit) = app.entity.edit.take() else {
+                return Ok(());
+            };
+            let text = edit.input.text().trim().to_string();
+            if text.is_empty() {
+                return Ok(());
+            }
+            let here = app.entity.node.as_ref().map(|n| n.id.clone());
+            match edit.kind {
+                EditKind::Rename => {
+                    let Some(id) = here else { return Ok(()) };
+                    match graph::rename_node(&app.conn, &id, &text) {
+                        Ok(fix) => {
+                            app.status = format!(
+                                "renamed {} → {} ({:?} kept as an alias)",
+                                fix.from, fix.to, fix.from
+                            );
+                            app.refresh_entity()?;
+                        }
+                        Err(e) => app.status = format!("rename refused: {e}"),
+                    }
+                }
+                EditKind::Alias => {
+                    let Some(id) = here else { return Ok(()) };
+                    match graph::add_alias(&app.conn, &id, &text, "manual") {
+                        Ok(()) => {
+                            app.status = format!("alias added: {text:?}");
+                            app.refresh_entity()?;
+                        }
+                        Err(e) => app.status = format!("alias failed: {e}"),
+                    }
+                }
+                EditKind::NewPerson => match graph::create_person(&app.conn, &text, "manual") {
+                    Ok(node) => {
+                        let id = node.id.clone();
+                        app.status = format!("created {} ({})", node.name, node.id);
+                        // Open it: the next thing anyone wants is the page of
+                        // the person they just made.
+                        app.open_entity(&id)?;
+                    }
+                    Err(e) => app.status = format!("create refused: {e}"),
+                },
+            }
+        }
+        k => {
+            if let Some(edit) = app.entity.edit.as_mut() {
+                edit.input.handle(k, mods);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_core::Result<()> {
+    // An identity edit is layered over whatever page is behind it, so it
+    // takes every key first and returns. Nothing below sees them.
+    if app.entity.edit.is_some() {
+        return handle_entity_edit(app, key, mods);
+    }
     match app.entity.mode {
         EntityMode::Input => match key {
+            // Ctrl-N, not `n`: this page accepts text, so a bare letter is a
+            // letter. Prefilled with whatever was typed, because the moment
+            // you want this is the moment a lookup came back empty.
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                let mut input = LineEdit::new();
+                for c in app.entity.input.text().trim().chars() {
+                    input.handle(KeyCode::Char(c), KeyModifiers::NONE);
+                }
+                app.entity.edit = Some(EntityEdit {
+                    kind: EditKind::NewPerson,
+                    input,
+                });
+            }
             KeyCode::Esc => {
                 app.entity.input.clear();
                 app.entity.suggestions.clear();
@@ -1909,6 +2487,31 @@ fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     move_sel(&mut app.entity.list, app.entity.facts.len(), -1)
                 }
             }
+            // The three identity edits. `n` is on the View page as well as
+            // the lookup page because "there is no node for this person" is
+            // a thing you discover *while reading* the wrong one.
+            KeyCode::Char('r') => {
+                if app.entity.node.is_some() {
+                    app.entity.edit = Some(EntityEdit {
+                        kind: EditKind::Rename,
+                        input: LineEdit::new(),
+                    });
+                }
+            }
+            KeyCode::Char('a') => {
+                if app.entity.node.is_some() {
+                    app.entity.edit = Some(EntityEdit {
+                        kind: EditKind::Alias,
+                        input: LineEdit::new(),
+                    });
+                }
+            }
+            KeyCode::Char('n') => {
+                app.entity.edit = Some(EntityEdit {
+                    kind: EditKind::NewPerson,
+                    input: LineEdit::new(),
+                });
+            }
             // Supersede the selected fact: ends both timelines now;
             // history stays queryable via timeline/as-of.
             KeyCode::Char('s') => {
@@ -1928,6 +2531,56 @@ fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                             app.refresh_entity()?;
                         }
                         Err(e) => app.status = format!("supersede failed: {e}"),
+                    }
+                }
+            }
+            // Verdicts on unreviewed (shadow) facts, in place: the entity
+            // view is a review trigger, and the reviewable object is the
+            // fact beside everything else known about its subject.
+            KeyCode::Char('y') => {
+                let fact = app
+                    .entity
+                    .list
+                    .selected()
+                    .and_then(|i| app.entity.facts.get(i))
+                    .map(|f| (f.uid.clone(), f.is_shadow()));
+                if let Some((uid, is_shadow)) = fact {
+                    if is_shadow {
+                        match fact::confirm_shadow_fact(&app.conn, &uid) {
+                            Ok(()) => {
+                                app.status = "confirmed — now reviewed".into();
+                                app.refresh_entity()?;
+                            }
+                            Err(e) => app.status = format!("confirm failed: {e}"),
+                        }
+                    } else {
+                        app.status = "already reviewed — y is for ◌ facts".into();
+                    }
+                }
+            }
+            KeyCode::Char('u') => {
+                let fact = app
+                    .entity
+                    .list
+                    .selected()
+                    .and_then(|i| app.entity.facts.get(i))
+                    .map(|f| (f.uid.clone(), f.is_shadow()));
+                if let Some((uid, is_shadow)) = fact {
+                    if is_shadow {
+                        match fact::refute_shadow_fact(
+                            &app.conn,
+                            &uid,
+                            "refuted on the entity page",
+                        ) {
+                            Ok(()) => {
+                                app.status = "refuted — retracted as never true".into();
+                                app.refresh_entity()?;
+                            }
+                            Err(e) => app.status = format!("refute failed: {e}"),
+                        }
+                    } else {
+                        app.status =
+                            "already reviewed — s supersedes what stopped being true".into();
                     }
                 }
             }
@@ -2215,6 +2868,128 @@ fn draw(f: &mut Frame, app: &mut App) {
 
 /// Cluster view: the queue grouped by (proposer, predicate), largest
 /// first, with the verdict-history prior — one decision per class.
+/// How much human evidence a rate rests on, as a word.
+///
+/// The point of the column: a bare percentage reads the same at n=2 and
+/// n=200, and the whole queue was misread once already because a rate with
+/// almost nothing behind it was taken as a verdict on the mechanism.
+fn evidence_word(n: i64) -> (&'static str, Color) {
+    match n {
+        0 => ("unjudged", Color::DarkGray),
+        1..=9 => ("thin", Color::Yellow),
+        10..=29 => ("some", Color::White),
+        _ => ("solid", Color::Green),
+    }
+}
+
+fn draw_review_proposers(f: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(area);
+
+    let total: usize = app.review.proposers.iter().map(|p| p.pending).sum();
+    let items: Vec<ListItem> = app
+        .review
+        .proposers
+        .iter()
+        .map(|p| {
+            let (word, colour) = evidence_word(p.judged());
+            // An unknown rate renders as a dash, never as 0% — the two mean
+            // opposite things and printing them alike is what made a
+            // never-reviewed mechanism look like a rejected one.
+            let rate = match p.accept_rate() {
+                Some(r) => format!("{:>4.0}%", r * 100.0),
+                None => "   —".into(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>5} ", p.pending),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(format!(
+                    "{:<24}",
+                    p.proposer.chars().take(24).collect::<String>()
+                )),
+                Span::styled(rate, Style::default().fg(colour)),
+                // No "/0" behind a dash: a denominator of nothing is not a
+                // sample size, and printing one invites reading the dash as
+                // a measured zero.
+                Span::styled(
+                    match p.judged() {
+                        0 => "      ".to_string(),
+                        n => format!(" /{n:<4} "),
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
+            ]))
+        })
+        .collect();
+    let title = format!(
+        " proposers ({total} pending from {}) — j/k · Enter classes · c items · p/Esc back ",
+        app.review.proposers.len()
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, cols[0], &mut app.review.proposer_list);
+
+    let detail = match app.selected_proposer() {
+        Some(p) => {
+            let mut t = format!(
+                "proposer:   {}\npending:    {} across {} class(es)\n\n",
+                p.proposer, p.pending, p.classes
+            );
+            match p.accept_rate() {
+                Some(r) => {
+                    t.push_str(&format!(
+                        "you accepted: {}✓ / {}✗  ({:.0}% of {} decisions)\n",
+                        p.accepted_hist,
+                        p.rejected_hist,
+                        r * 100.0,
+                        p.judged()
+                    ));
+                    if let Some(lb) = p.accept_lb {
+                        t.push_str(&format!(
+                            "confident at: {:.0}% or better (Wilson 95% lower bound)\n",
+                            lb * 100.0
+                        ));
+                    }
+                }
+                None => t.push_str(
+                    "you accepted: nothing yet — no human verdict on this\n              mechanism, so it has no rate to read.\n",
+                ),
+            }
+            t.push_str(&format!(
+                "auto-dropped: {} (duplicates and ephemerals — the\n              pipeline's own, never counted above)\n",
+                p.machine_rejected
+            ));
+            let (word, _) = evidence_word(p.judged());
+            t.push_str(&format!("\nevidence:   {word}\n"));
+            t.push_str(match p.judged() {
+                0 => "\nNo basis to judge this mechanism yet. Sample a dozen of\nits items at random — random being what makes the rate\nmean anything — before concluding it proposes badly.\n",
+                1..=9 => "\nToo few decisions to separate a bad mechanism from an\nunlucky handful. A dozen would settle it.\n",
+                10..=29 => "\nEnough to be suggestive, not enough to act on for a\nmechanism this size.\n",
+                _ => "\nEnough decisions to trust this rate.\n",
+            });
+            t.push_str("\nEnter  the classes this mechanism proposes\nc      every pending item from it, unfiltered");
+            t
+        }
+        None => "queue is empty 🎉".into(),
+    };
+    f.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" mechanism ")),
+        cols[1],
+    );
+}
+
 fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -2227,13 +3002,14 @@ fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
         .clusters
         .iter()
         .map(|cl| {
-            let hist = if cl.accepted_hist + cl.rejected_hist > 0 {
+            let judged = cl.accepted_hist + cl.rejected_hist;
+            let hist = if judged > 0 {
                 format!(
-                    " {:.0}%✓",
-                    100.0 * cl.accepted_hist as f64 / (cl.accepted_hist + cl.rejected_hist) as f64
+                    " {:.0}%✓/{judged}",
+                    100.0 * cl.accepted_hist as f64 / judged as f64
                 )
             } else {
-                " new".into()
+                " unjudged".into()
             };
             let tag = if cl.commitment { " ⏰" } else { "" };
             ListItem::new(Line::from(vec![
@@ -2251,10 +3027,18 @@ fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
             ]))
         })
         .collect();
-    let title = format!(
-        " clusters ({total} pending in {}) — j/k · a/r verdict cluster · Enter drill in · c/Esc items ",
-        app.review.clusters.len()
-    );
+    // The narrowing has to be in the title: a filtered list that does not
+    // say so is a list that looks like the whole queue got smaller.
+    let title = match &app.review.proposer_filter {
+        Some(p) => format!(
+            " clusters · {p} ({total} pending in {}) — Enter drill in · c items · Esc proposers ",
+            app.review.clusters.len()
+        ),
+        None => format!(
+            " clusters ({total} pending in {}) — a/r verdict cluster · g groups · Enter drill in · p proposers · c items ",
+            app.review.clusters.len()
+        ),
+    };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
@@ -2285,12 +3069,20 @@ fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
                     let (a, r) = (cl.accepted_hist, cl.rejected_hist);
                     if a + r > 0 {
                         text.push_str(&format!(
-                            "history:    {a}✓ / {r}✗ ({:.0}% accepted on this class)\n",
-                            100.0 * a as f64 / (a + r) as f64
+                            "you said:   {a}✓ / {r}✗ ({:.0}% over {} decision(s))\n",
+                            100.0 * a as f64 / (a + r) as f64,
+                            a + r
                         ));
                     } else {
-                        text.push_str("history:    none — first verdicts on this class\n");
+                        text.push_str("you said:   nothing yet — no human verdict here\n");
                     }
+                    // Kept out of the rate above: a class that mostly makes
+                    // duplicates is an argument about the extractor, not
+                    // about whether the predicate is wanted.
+                    text.push_str(&format!(
+                        "auto-dropped: {} (dups / ephemerals)\n",
+                        cl.machine_rejected
+                    ));
                     text.push_str(&format!(
                         "ladder:     {} · streak {}/{}\n",
                         cl.rung,
@@ -2322,7 +3114,210 @@ fn draw_review_clusters(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(para, cols[1]);
 }
 
+fn draw_review_shadow(f: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .review
+        .shadow
+        .iter()
+        .map(|sf| {
+            let contra = sf.reasons.iter().any(|r| r.starts_with("contradicts"));
+            let tag = if contra { " ⚡" } else { "" };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:.2} ", sf.fact.confidence),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(sf.fact.statement.chars().take(70).collect::<String>()),
+                Span::styled(tag, Style::default().fg(Color::Yellow)),
+            ]))
+        })
+        .collect();
+    let title = format!(
+        " surfaced for verdict ({}) — y confirm · r/R refute · s/Esc back ",
+        app.review.shadow.len()
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, cols[0], &mut app.review.shadow_list);
+
+    let para = match &app.review.mode {
+        ReviewMode::ShadowReason(buf) => Paragraph::new(format!(
+            "refute reason — it feeds rejection memory (Enter to confirm, Esc to cancel):
+> {}",
+            buf.display()
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" refute fact "),
+        ),
+        _ => {
+            let detail = match app.selected_shadow() {
+                Some(sf) => {
+                    let mut text = format!(
+                        "{}
+
+class:      {} · {}
+confidence: {:.2}
+since:      {}
+",
+                        sf.fact.statement,
+                        sf.fact.extractor.as_deref().unwrap_or("?"),
+                        sf.fact.predicate,
+                        sf.fact.confidence,
+                        &sf.fact.ingested_at[..10.min(sf.fact.ingested_at.len())],
+                    );
+                    text.push_str(
+                        "
+─ why it surfaced ─
+",
+                    );
+                    for r in &sf.reasons {
+                        text.push_str(&format!(
+                            "• {r}
+"
+                        ));
+                    }
+                    text.push_str(
+                        "
+y: confirm — a human stands behind it (tier → reviewed)
+                         r: refute — it was never true (retracted; class learns)
+",
+                    );
+                    text
+                }
+                None => "nothing surfaced — no shadow fact is about to matter.
+
+                     Shadow facts earn review when a query serves them, when they
+                     contradict a reviewed fact, or when a sampled class spot-checks
+                     them. An idle shadow fact costs nothing and waits."
+                    .into(),
+            };
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" fact "))
+        }
+    };
+    f.render_widget(para, cols[1]);
+}
+
+fn draw_review_groups(f: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .review
+        .groups
+        .iter()
+        .map(|g| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>3}× ", g.size()),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(g.leader_statement.chars().take(66).collect::<String>()),
+            ]))
+        })
+        .collect();
+    let class = app
+        .review
+        .group_class
+        .as_ref()
+        .map(|(p, k)| format!("{p} · {k}"))
+        .unwrap_or_default();
+    let title = format!(
+        " groups {class} ({}) — a/r verdict the group · R with reason · g/Esc back ",
+        app.review.groups.len()
+    );
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(list, cols[0], &mut app.review.group_list);
+
+    let para = match &app.review.mode {
+        ReviewMode::GroupReason(buf) => Paragraph::new(format!(
+            "reject reason for the WHOLE group (Enter to confirm, Esc to cancel):\n> {}",
+            buf.display()
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" reject group "),
+        ),
+        _ => {
+            let detail = match app.selected_group() {
+                Some(g) => {
+                    let mut text = format!("{}\n", g.leader_statement);
+                    if !g.members.is_empty() {
+                        text.push_str(&format!(
+                            "\n─ {} member(s) this verdict also covers ─\n",
+                            g.members.len()
+                        ));
+                        for (s, (_, sim)) in g.sample.iter().zip(g.members.iter()) {
+                            text.push_str(&format!(
+                                "• {} (cosine {sim:.2})\n",
+                                s.chars().take(70).collect::<String>()
+                            ));
+                        }
+                        if g.members.len() > g.sample.len() {
+                            text.push_str(&format!(
+                                "  … and {} more\n",
+                                g.members.len() - g.sample.len()
+                            ));
+                        }
+                    }
+                    // What a group verdict costs, in the pane where it is
+                    // spent: same-class pairs matched the owner's own record
+                    // ~89% of the time (measured 2026-08-29) — cascaded
+                    // members are machine-labeled and revisable.
+                    text.push_str(
+                        "\none keystroke = one human verdict (yours, on the leader);\n\
+                         members cascade machine-labeled — measured ~89% same-class\n\
+                         agreement, so expect ~1 in 10 to deserve a second look\n",
+                    );
+                    text
+                }
+                None => "no groups — this class's pending items share nothing at the floor".into(),
+            };
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(" group "))
+        }
+    };
+    f.render_widget(para, cols[1]);
+}
+
 fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.review.group_view {
+        draw_review_groups(f, app, area);
+        return;
+    }
+    if app.review.shadow_view {
+        draw_review_shadow(f, app, area);
+        return;
+    }
+    if app.review.proposer_view {
+        draw_review_proposers(f, app, area);
+        return;
+    }
     if app.review.cluster_view {
         draw_review_clusters(f, app, area);
         return;
@@ -2372,9 +3367,14 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
             " cluster {pred} ({}) — a accept · e edit · r reject · Esc back to clusters ",
             app.review.items.len()
         )
+    } else if let Some(p) = &app.review.proposer_filter {
+        format!(
+            " from {p} ({}) — a accept · e edit · r reject · Esc back to proposers ",
+            app.review.items.len()
+        )
     } else {
         format!(
-            " review queue ({}) — j/k · Space mark · a accept · e edit · r/R reject · c clusters ",
+            " review queue ({}) — Space mark · a accept · e edit · r/R reject · c clusters · p proposers ",
             app.review.items.len()
         )
     };
@@ -2442,12 +3442,14 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         _ => None,
     };
     let para = match &app.review.mode {
-        ReviewMode::Reason(buf) => Paragraph::new(format!(
-            "reject reason (Enter to confirm, Esc to cancel):\n> {}",
-            buf.display()
-        ))
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title(" reject ")),
+        ReviewMode::Reason(buf) | ReviewMode::ShadowReason(buf) | ReviewMode::GroupReason(buf) => {
+            Paragraph::new(format!(
+                "reject reason (Enter to confirm, Esc to cancel):\n> {}",
+                buf.display()
+            ))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" reject "))
+        }
         ReviewMode::Edit(edit) => {
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 "↑/↓ move field · Enter save · Esc cancel · →/Ctrl-F complete entity",
@@ -2512,7 +3514,7 @@ fn draw_merge(f: &mut Frame, app: &mut App, area: Rect) {
         .merge
         .items
         .iter()
-        .map(|(_, _, name)| ListItem::new(name.as_str()))
+        .map(|(_, _, name, _)| ListItem::new(name.as_str()))
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
@@ -2537,7 +3539,7 @@ fn draw_merge(f: &mut Frame, app: &mut App, area: Rect) {
         .selected()
         .and_then(|i| app.merge.items.get(i))
     {
-        Some((a, b, _)) => (app.node_summary(a), app.node_summary(b)),
+        Some((a, b, _, _)) => (app.node_summary(a), app.node_summary(b)),
         None => ("no candidates 🎉".into(), String::new()),
     };
     let (keep_left, keep_right) = if app.merge.swap {
@@ -2769,6 +3771,26 @@ fn draw_capture(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_entity(f: &mut Frame, app: &mut App, area: Rect) {
+    // An edit in flight takes the top three rows and the page keeps drawing
+    // beneath it — you are renaming *this* node, and hiding the page you are
+    // renaming behind a popup is how the wrong node gets renamed.
+    let area = match &app.entity.edit {
+        Some(edit) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(area);
+            let widget = Paragraph::new(edit.input.display()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(edit.kind.prompt()),
+            );
+            f.render_widget(widget, rows[0]);
+            rows[1]
+        }
+        None => area,
+    };
     match app.entity.mode {
         EntityMode::Input => {
             let sug_rows = (app.entity.suggestions.len() as u16).min(8);
@@ -2825,6 +3847,9 @@ fn draw_entity(f: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(
                     "Person or project page: current facts (s supersedes the stale one),\n\
                      interaction rollup, and recent episode timeline.\n\n\
+                     Identity: r renames (the old name stays an alias), a adds an alias,\n\
+                     n creates a person who has facts but no node. Ctrl-N does the same\n\
+                     from the lookup box, prefilled with what you typed.\n\n\
                      Also reachable via Enter on a person/fact search result or a GTD task.",
                 )
                 .style(Style::default().fg(Color::DarkGray))
@@ -2946,10 +3971,15 @@ fn draw_entity(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         ("", Style::default())
                     };
+                    // ◌: unreviewed (shadow) — opening the entity IS one of
+                    // the review triggers, so the page must say which facts
+                    // still need a verdict (y confirms, u refutes).
+                    let unrev = if fact.is_shadow() { "◌ " } else { "" };
                     ListItem::new(Line::from(vec![
                         Span::styled(when, Style::default().fg(Color::DarkGray)),
                         Span::styled(arrow, Style::default().fg(Color::Yellow)),
                         Span::styled(mark, Style::default().fg(Color::Red)),
+                        Span::styled(unrev, Style::default().fg(Color::Yellow)),
                         Span::styled(fact.statement.chars().take(70).collect::<String>(), body),
                     ]))
                 })

@@ -92,7 +92,196 @@ const MIGRATIONS: &[Migration] = &[
         name: "embed_meta",
         sql: V016_EMBED_META,
     },
+    Migration {
+        version: 17,
+        name: "candidate_reviewed_by",
+        sql: V017_CANDIDATE_REVIEWED_BY,
+    },
+    Migration {
+        version: 18,
+        name: "entity_proposal",
+        sql: V018_ENTITY_PROPOSAL,
+    },
+    Migration {
+        version: 19,
+        name: "unlinked_mention",
+        sql: V019_UNLINKED_MENTION,
+    },
+    Migration {
+        version: 20,
+        name: "agent_node",
+        sql: V020_AGENT_NODE,
+    },
+    Migration {
+        version: 21,
+        name: "fact_tier",
+        sql: V021_FACT_TIER,
+    },
+    Migration {
+        version: 22,
+        name: "vec_rejected",
+        sql: V022_VEC_REJECTED,
+    },
 ];
+
+/// Semantic rejection memory (review-on-use §5): the embedded index of
+/// human-rejected statements.
+///
+/// Precheck's rejection memory was exact-normalized-string only, and the
+/// mid-August embedding-model swap guarantees paraphrase leaks — the same
+/// wrong claim re-extracted in different words re-claims the owner's
+/// attention. This table holds one vector per HUMAN-rejected candidate
+/// (machine rejects are excluded for the same reason they are excluded
+/// everywhere: a lane must not feed the memory that judges its own
+/// input), populated incrementally by `pkg embed`, compared by precheck
+/// at the same 0.97 threshold the live-fact dedup earned.
+///
+/// Created at the compiled-in default width like its V001 siblings; an
+/// embedding-model change rebuilds all three through
+/// `embed::ensure_vec_dims`, and `embed::ensure_vec_rejected` re-aligns
+/// this one on a store whose vectors were rebuilt before V022 existed.
+/// The index is a derivable cache — dropping it loses nothing that one
+/// `pkg embed` cannot restore.
+const V022_VEC_REJECTED: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[768]);
+"#;
+
+/// Review-on-use (docs/REVIEW-ON-USE.md): facts get a `tier`.
+///
+/// The review model inverts: the human is the scarcest resource and
+/// retrieval is the only ground truth of usefulness, so extraction output
+/// stops queueing for review-at-birth and lands as a *shadow* fact —
+/// retrievable, rank-discounted, labeled unreviewed — that earns a human
+/// verdict only when it is about to matter. `tier` is `'reviewed'` |
+/// `'shadow'`; readers treat anything other than `'reviewed'` as shadow,
+/// so an unknown value written by a later version degrades to the safe
+/// reading (unreviewed) instead of impersonating a vetted fact.
+///
+/// Existing rows backfill `'reviewed'` via the DEFAULT: under the old
+/// regime every fact row had passed human review, an auto-accept lane the
+/// ladder had earned, or a deterministic extractor — the old queue WAS the
+/// review. The same DEFAULT keeps every direct `assert_fact` caller
+/// (linkers, ics, gtd, corrections, the owner's CLI) born-reviewed; only
+/// the shadow mint path writes `'shadow'`.
+///
+/// `fact_candidate.fact_uid` links a candidate to the fact it minted, so a
+/// later human verdict on the *fact* can settle the *candidate* — which is
+/// what keeps `HUMAN_VERDICT_SQL` and the ladder honest: a shadow row
+/// counts as no verdict at all until a human confirms or refutes it.
+const V021_FACT_TIER: &str = r#"
+ALTER TABLE fact ADD COLUMN tier TEXT NOT NULL DEFAULT 'reviewed';
+ALTER TABLE fact_candidate ADD COLUMN fact_uid TEXT;
+
+-- The surfacing queries walk shadow rows only; reviewed rows never match.
+CREATE INDEX IF NOT EXISTS idx_fact_shadow ON fact(tier) WHERE tier <> 'reviewed';
+CREATE INDEX IF NOT EXISTS idx_candidate_fact_uid ON fact_candidate(fact_uid)
+ WHERE fact_uid IS NOT NULL;
+"#;
+
+/// The agent as something a task can wait on.
+///
+/// `waiting_on` was seeded as "Task is waiting on Person" and the description
+/// is prose rather than a constraint, so this widens the sentence rather than
+/// the schema — but the sentence is what a reader and an extractor go by, and
+/// leaving it saying Person while the harness writes an agent into it is how
+/// documentation stops being true.
+///
+/// The node is seeded here rather than created on demand because
+/// `set_task_waiting_on` refuses a name the graph does not already know —
+/// that refusal is the typo protection `create_task` has for projects, and an
+/// agent node minted on first use would punch a hole straight through it.
+const V020_AGENT_NODE: &str = r#"
+UPDATE predicate SET description = 'Task is waiting on Person or Agent'
+ WHERE name = 'waiting_on';
+
+INSERT OR IGNORE INTO nodes (id, node_type, name, canonical_name, source, confidence)
+VALUES ('agent-mecha', 'agent', 'mecha', 'mecha', 'system', 1.0);
+"#;
+
+/// Weak alias matches that were refused for want of corroboration.
+///
+/// The linker used to commit every unambiguous alias match, which is how a
+/// student's first-name alias collected a thousand mentions of somebody
+/// else's toddler. Refusing an uncorroborated match is the fix; **recording
+/// what was refused is what makes the refusal useful**, because a bare
+/// first name that keeps appearing and can never be corroborated is not
+/// noise — it is a person the graph has no node for. That is exactly how
+/// Wren went unnoticed for years: mentioned constantly, with nothing to
+/// attach the mentions to and nothing anywhere saying so.
+///
+/// Keyed `(alias, episode_id)` so re-linking an episode is idempotent.
+const V019_UNLINKED_MENTION: &str = r#"
+CREATE TABLE IF NOT EXISTS unlinked_mention (
+    alias      TEXT    NOT NULL,
+    node_id    TEXT    NOT NULL REFERENCES nodes(id)   ON DELETE CASCADE,
+    episode_id INTEGER NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
+    at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (alias, episode_id)
+);
+CREATE INDEX IF NOT EXISTS idx_unlinked_alias ON unlinked_mention(alias);
+"#;
+
+/// Entity maintenance proposals — the queue the fact layer has always had
+/// and the entity layer never did.
+///
+/// Facts get proposed by a named class, queued, reviewed, and promoted up
+/// the autonomy ladder on their human accept rate. Entities got nothing:
+/// creating, renaming, merging, splitting and retyping were all hand
+/// surgery, which is why a first-name alias could quietly move one person's
+/// decade onto another person's node and go unnoticed for three years.
+///
+/// `detector` is the class, deliberately named the same way `(proposer,
+/// predicate)` is, so this queue can ride the same ladder later without a
+/// second notion of what a class is.
+///
+/// **A decided proposal is never re-proposed**, which is what the unique
+/// index buys: the nightly re-runs every detector over the whole graph and
+/// `INSERT OR IGNORE` skips anything already on file, accepted or rejected.
+/// A rejection is therefore durable — the same reasoning as mecha's retired
+/// rules, where re-deriving a refused change means the refusal was never
+/// paid for. `other_id` is '' rather than NULL so the index can be plain.
+const V018_ENTITY_PROPOSAL: &str = r#"
+CREATE TABLE IF NOT EXISTS entity_proposal (
+    id          INTEGER PRIMARY KEY,
+    detector    TEXT NOT NULL,              -- the class: email_named_person, near_duplicate_person, …
+    kind        TEXT NOT NULL,              -- merge|retype|rename|reattribute|review
+    subject_id  TEXT NOT NULL,              -- the node this is about
+    other_id    TEXT NOT NULL DEFAULT '',   -- the second node, for merge/reattribute ('' = none)
+    payload     TEXT,                       -- JSON: {"to_type":"org"} / {"new_name":"…"}
+    evidence    TEXT NOT NULL,              -- why, in words a person can act on
+    score       REAL,                       -- how strong, for ordering
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending|accepted|rejected
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    decided_at  TEXT,
+    decided_by  TEXT                        -- 'user' | 'auto'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_proposal_unique
+    ON entity_proposal(detector, kind, subject_id, other_id);
+CREATE INDEX IF NOT EXISTS idx_entity_proposal_status
+    ON entity_proposal(status, score DESC);
+"#;
+
+/// Who decided a candidate: 'user', 'auto' (precheck's lanes), or
+/// 'cascade:<seed id>' (a similarity cascade fanned out from one human
+/// verdict).
+///
+/// Added 2026-08-23, when the similarity cascade made the gap unaffordable:
+/// an accepted row carried no record of who accepted it, so every accept —
+/// the durable lane's, the ladder's, a cascade's — counted toward the
+/// "human" rate that promotes classes. Machine *rejects* were already
+/// excluded by their `precheck:%` reason; accepts had no equivalent, which
+/// is the same contamination the cluster view was caught displaying on
+/// 2026-08-22, running in the direction that widens autonomy instead of
+/// narrowing it. A cascade writing dozens of rows per keystroke would have
+/// promoted classes on their own volume.
+///
+/// NULL means pre-migration: those rows keep counting exactly as they did
+/// (accepts as the owner's, rejects filtered by reason), because zeroing
+/// the owner's verdict history would gut the record the ladder runs on.
+/// The contamination stops growing; it is not rewritten.
+const V017_CANDIDATE_REVIEWED_BY: &str = r#"
+ALTER TABLE fact_candidate ADD COLUMN reviewed_by TEXT;
+"#;
 
 const V015_AGENT_VERDICT: &str = r#"
 -- What an agent mechanism concluded about a pending candidate.

@@ -69,7 +69,7 @@ mecha-graph source list           # kind, enabled, auth state, last ok, items
 mecha-graph source sync
 
 # 3. Link entities, then embed when the GPU is free:
-mecha-graph link --auto
+mecha-graph link            # deterministic tiers; add --propose to stage link candidates
 mecha-graph embed
 
 # Query — returns a context pack (JSON):

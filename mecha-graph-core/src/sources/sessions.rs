@@ -454,13 +454,10 @@ mod tests {
         let conn = open_memory().unwrap();
         let report = crate::sources::ingest(&conn, &src, None).unwrap();
         assert_eq!(report.inserted, 1);
-        let project = crate::graph::get_node_by_identifier(
-            &conn,
-            "path",
-            &format!("{home}/Github/flowmail"),
-        )
-        .unwrap()
-        .expect("project node created");
+        let project =
+            crate::graph::get_node_by_identifier(&conn, "path", &format!("{home}/Github/flowmail"))
+                .unwrap()
+                .expect("project node created");
         assert_eq!(project.node_type, "project");
         assert_eq!(project.name, "flowmail");
         let eps = crate::episode::episodes_for_node(&conn, &project.id, 10).unwrap();

@@ -22,6 +22,18 @@ use serde::Deserialize;
 // what make that safe.
 pub const PROMPT_VERSION: i64 = 2;
 
+/// Ceiling on staged facts per episode, enforced in the grammar (`maxItems`)
+/// and again on the parsed list. The prompt has always said "few good facts
+/// beat many weak ones", but prose is a suggestion to a small model: with no
+/// cap, generation ran 15–25× the owner's review throughput and the queue
+/// reached 9,395 pending — 4× every verdict ever given. When the model
+/// over-produces anyway, the highest-confidence facts survive the cut.
+pub const MAX_FACTS_PER_EPISODE: usize = 8;
+
+/// Same ceiling for commitments — each accepted one materializes a task the
+/// owner sees daily, so over-extraction is costlier here, not cheaper.
+pub const MAX_COMMITMENTS_PER_EPISODE: usize = 4;
+
 /// The entity types the prompt admits. Duplicated into the schema below so
 /// the sampler enforces what the prose asks for — keep the two in step.
 const ENTITY_TYPES: [&str; 11] = [
@@ -57,7 +69,7 @@ fn extraction_schema(predicates: &[String]) -> serde_json::Value {
                     "identifier": { "type": ["string", "null"] }
                 }
             }},
-            "facts": { "type": "array", "items": {
+            "facts": { "type": "array", "maxItems": MAX_FACTS_PER_EPISODE, "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["subject", "predicate", "object", "object_value",
@@ -71,7 +83,7 @@ fn extraction_schema(predicates: &[String]) -> serde_json::Value {
                     "confidence": { "type": ["number", "null"] }
                 }
             }},
-            "commitments": { "type": "array", "items": {
+            "commitments": { "type": "array", "maxItems": MAX_COMMITMENTS_PER_EPISODE, "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["who", "what", "when", "direction", "confidence"],
@@ -145,8 +157,30 @@ fn predicates(conn: &Connection) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn system_prompt(conn: &Connection) -> Result<String> {
-    let predicates = predicates(conn)?;
+/// The vocabulary this run may extract: the closed set minus what the
+/// ladder has gated for the `llm` proposer (review-on-use §3 — a class
+/// below the precision floor stops being extracted AT ALL; the predicate
+/// leaves the grammar, so the waste never happens). Returns the gate
+/// report beside the survivors because a guard that acts silently is the
+/// failure mode this repo keeps finding.
+fn extraction_predicates(conn: &Connection) -> Result<(Vec<String>, Vec<String>)> {
+    let mut names = predicates(conn)?;
+    let gated: Vec<crate::ladder::GatedClass> = crate::ladder::gated_classes(conn, None)?
+        .into_iter()
+        .filter(|g| g.proposer == "llm")
+        .collect();
+    let mut report = Vec::new();
+    for g in &gated {
+        if let Some(i) = names.iter().position(|n| n == &g.predicate) {
+            names.remove(i);
+            report.push(format!("{} ({})", g.predicate, g.why));
+        }
+    }
+    Ok((names, report))
+}
+
+fn system_prompt(conn: &Connection, predicates: &[String]) -> Result<String> {
+    let predicates = predicates.to_vec();
     // The owner's name comes from the graph, never from this source file: a
     // hardcoded name is wrong for every other deployment and personal data
     // in a repo headed for the public.
@@ -204,42 +238,120 @@ pub struct ExtractReport {
     pub fact_candidates: usize,
     pub commitment_candidates: usize,
     pub errors: usize,
+    /// Predicates this run refused to extract, with why — the ladder's
+    /// generation gate (review-on-use §3). Reported, never silent.
+    pub gated: Vec<String>,
 }
 
-/// Extract over episodes not yet processed at the current prompt version.
-/// `sources`: restrict to these episode sources (None = all).
-pub fn extract_pending(
+/// The episodes the next extraction pass would take, newest first.
+///
+/// Split out of `extract_pending` so the eligibility rules are testable
+/// without a model. Two clauses beyond the prompt-version bookkeeping:
+///
+/// - `occurred_at <= now`: a future calendar invite is not evidence of
+///   anything yet — `rollup.rs` has excluded future episodes since day one
+///   for the same reason, but extraction didn't, and `ORDER BY occurred_at
+///   DESC` put *unheld meetings first in line* for the GPU every night.
+///   Known caveat, shared with rollup's identical comparison: ics.rs keeps
+///   TZID-zoned calendar times as naive local strings while
+///   `datetime('now')` is UTC, so a calendar event crosses this boundary
+///   hours early or late by the zone offset. The real fix is normalizing
+///   to UTC at ingest; until then calendar is excluded from extraction by
+///   default anyway, and an off-by-hours boundary on an *excluded* source
+///   costs nothing.
+/// - `exclude_sources`: some sources cannot contain a durable fact the
+///   deterministic tiers didn't already take. A calendar body is a title
+///   plus an attendee list `ics.rs` has already turned into facts; 65% of
+///   the corpus is calendar events, and LLM-extracting them re-derives
+///   tier-1 output as prose and queues it for human review.
+fn pending_episodes(
     conn: &Connection,
-    chat: &ChatClient,
     limit: usize,
     sources: Option<&[&str]>,
-) -> Result<ExtractReport> {
+    exclude_sources: Option<&[&str]>,
+) -> Result<Vec<(i64, String, String, String)>> {
+    let quote_list = |s: &[&str]| {
+        s.iter()
+            .map(|x| format!("'{}'", x.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let source_clause = match sources {
-        Some(s) if !s.is_empty() => format!(
-            "AND e.source IN ({})",
-            s.iter()
-                .map(|x| format!("'{x}'"))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        Some(s) if !s.is_empty() => format!("AND e.source IN ({})", quote_list(s)),
+        _ => String::new(),
+    };
+    let exclude_clause = match exclude_sources {
+        Some(s) if !s.is_empty() => format!("AND e.source NOT IN ({})", quote_list(s)),
         _ => String::new(),
     };
     let sql = format!(
         "SELECT e.id, e.uid, e.body, e.occurred_at FROM episode e
          WHERE e.id NOT IN (SELECT episode_id FROM extract_state WHERE prompt_version >= ?1)
+           AND e.occurred_at <= datetime('now')
            {source_clause}
+           {exclude_clause}
          ORDER BY e.occurred_at DESC LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(i64, String, String, String)> = stmt
+    let rows = stmt
         .query_map(params![PROMPT_VERSION, limit as i64], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
 
-    let system = system_prompt(conn)?;
-    let schema = extraction_schema(&predicates(conn)?);
-    let mut report = ExtractReport::default();
+/// The commitment deliverables that block a re-file, normalized the same
+/// way precheck normalizes statements — ONE identity function, because the
+/// two tiers previously disagreed (`lower(trim())` here vs `normalize()`
+/// there): "Send the pilot data." with a trailing period was a duplicate
+/// to precheck but not to extract, so extract re-filed what precheck then
+/// machine-rejected, every night.
+///
+/// A machine (`precheck:%`) reject does NOT block: precheck stale-rejects
+/// a commitment from an old episode minutes after extraction, and if that
+/// row then blocked forever, one machine decision would silently retire a
+/// recurring obligation for life with no human verdict anywhere in the
+/// chain. Pending, accepted, and human-rejected rows block; the machine's
+/// own rejects are its business to re-make.
+///
+/// Built once per run (the per-commitment form was an unindexed full-table
+/// scan inside the per-episode loop), and updated as the run stages.
+pub(crate) fn commitment_block_set(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(json_extract(payload, '$.what'), '') FROM fact_candidate
+         WHERE json_extract(payload, '$.kind') = 'commitment'
+           AND (status != 'rejected' OR COALESCE(reject_reason, '') NOT LIKE 'precheck:%')",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(|w| w.ok())
+        .map(|w| crate::precheck::normalize(&w))
+        .filter(|w| !w.is_empty())
+        .collect())
+}
+
+/// Extract over episodes not yet processed at the current prompt version.
+/// `sources`: restrict to these episode sources (None = all).
+/// `exclude_sources`: skip these sources (None = none) — see
+/// [`pending_episodes`] for why calendar is the intended tenant.
+pub fn extract_pending(
+    conn: &Connection,
+    chat: &ChatClient,
+    limit: usize,
+    sources: Option<&[&str]>,
+    exclude_sources: Option<&[&str]>,
+) -> Result<ExtractReport> {
+    let rows = pending_episodes(conn, limit, sources, exclude_sources)?;
+    let mut committed = commitment_block_set(conn)?;
+
+    let (vocab, gated) = extraction_predicates(conn)?;
+    let system = system_prompt(conn, &vocab)?;
+    let schema = extraction_schema(&vocab);
+    let mut report = ExtractReport {
+        gated,
+        ..Default::default()
+    };
 
     for (episode_id, _uid, body, occurred_at) in rows {
         extract_episode(
@@ -250,6 +362,7 @@ pub fn extract_pending(
             episode_id,
             &body,
             &occurred_at,
+            &mut committed,
             &mut report,
         )?;
     }
@@ -283,9 +396,14 @@ pub fn reextract_episode(
         "DELETE FROM extract_state WHERE episode_id = ?1",
         params![episode_id],
     )?;
-    let system = system_prompt(conn)?;
-    let schema = extraction_schema(&predicates(conn)?);
-    let mut report = ExtractReport::default();
+    let (vocab, gated) = extraction_predicates(conn)?;
+    let system = system_prompt(conn, &vocab)?;
+    let schema = extraction_schema(&vocab);
+    let mut report = ExtractReport {
+        gated,
+        ..Default::default()
+    };
+    let mut committed = commitment_block_set(conn)?;
     extract_episode(
         conn,
         chat,
@@ -294,11 +412,13 @@ pub fn reextract_episode(
         episode_id,
         &body,
         &occurred_at,
+        &mut committed,
         &mut report,
     )?;
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_episode(
     conn: &Connection,
     chat: &ChatClient,
@@ -307,6 +427,7 @@ fn extract_episode(
     episode_id: i64,
     body: &str,
     occurred_at: &str,
+    committed: &mut std::collections::HashSet<String>,
     report: &mut ExtractReport,
 ) -> Result<()> {
     {
@@ -379,7 +500,20 @@ fn extract_episode(
         }
 
         // Facts → staged candidates (§4.3: the sole non-deterministic write path).
-        for f in &parsed.facts {
+        // The grammar caps the list, but a schema is a request to a sampler,
+        // not a proof about it — enforce the cap on what actually parsed,
+        // keeping the highest-confidence facts when the model overran.
+        let mut facts: Vec<&ExtractedFact> = parsed.facts.iter().collect();
+        if facts.len() > MAX_FACTS_PER_EPISODE {
+            facts.sort_by(|a, b| {
+                b.confidence
+                    .unwrap_or(0.5)
+                    .partial_cmp(&a.confidence.unwrap_or(0.5))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            facts.truncate(MAX_FACTS_PER_EPISODE);
+        }
+        for f in facts {
             if f.subject.trim().is_empty() || f.statement.trim().is_empty() {
                 continue;
             }
@@ -392,19 +526,46 @@ fn extract_episode(
                 valid_from: Some(occurred_at.to_string()),
                 confidence: f.confidence,
                 tags: None,
+                ..Default::default()
             };
             fact::propose_fact(conn, &proposed, "llm", Some(episode_id))?;
             report.fact_candidates += 1;
             created += 1;
         }
 
-        // Commitments → staged with kind marker; acceptance materializes a Task.
-        for c in &parsed.commitments {
-            if c.what.trim().is_empty() {
+        // Commitments → staged with kind marker; acceptance materializes a
+        // Task. Validity is checked BEFORE the cap and the cap is
+        // confidence-ranked, mirroring the facts path above — a `take(N)`
+        // over the raw list let N junk entries consume the cap and drop a
+        // real commitment listed fifth.
+        let mut commitments: Vec<&ExtractedCommitment> = parsed
+            .commitments
+            .iter()
+            .filter(|c| {
+                !c.what.trim().is_empty()
+                    // unknown direction: skip, don't guess (§6)
+                    && matches!(c.direction.as_str(), "owed_by_me" | "owed_to_me")
+            })
+            .collect();
+        if commitments.len() > MAX_COMMITMENTS_PER_EPISODE {
+            commitments.sort_by(|a, b| {
+                b.confidence
+                    .unwrap_or(0.5)
+                    .partial_cmp(&a.confidence.unwrap_or(0.5))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            commitments.truncate(MAX_COMMITMENTS_PER_EPISODE);
+        }
+        for c in commitments {
+            // Commitments used to skip every dedup tier (precheck `continue`s
+            // past them), so a PROMPT_VERSION bump re-proposed every old
+            // commitment and the owner re-judged each one. Any prior
+            // candidate with the same deliverable — pending, accepted, or
+            // HUMAN-rejected — blocks a re-file: asked and answered. See
+            // `commitment_block_set` for why machine rejects don't block.
+            let what_norm = crate::precheck::normalize(&c.what);
+            if !what_norm.is_empty() && !committed.insert(what_norm) {
                 continue;
-            }
-            if !matches!(c.direction.as_str(), "owed_by_me" | "owed_to_me") {
-                continue; // unknown direction: skip, don't guess (§6)
             }
             let payload = serde_json::json!({
                 "kind": "commitment",
@@ -513,7 +674,9 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     }
 
     conn.execute(
-        "UPDATE fact_candidate SET status = 'accepted', reviewed_at = datetime('now') WHERE id = ?1",
+        "UPDATE fact_candidate SET status = 'accepted', reviewed_at = datetime('now'),
+                reviewed_by = 'user'
+         WHERE id = ?1",
         params![candidate_id],
     )?;
     Ok(task_id)
@@ -533,7 +696,8 @@ mod tests {
     fn the_prompt_names_the_owner_from_the_graph_not_the_source() {
         let conn = open_memory().unwrap();
         // No owner set: neutral narrator, and no personal name baked in.
-        let p = system_prompt(&conn).unwrap();
+        let vocab = predicates(&conn).unwrap();
+        let p = system_prompt(&conn, &vocab).unwrap();
         assert!(p.contains("the user"));
         assert!(
             !p.contains("Ada"),
@@ -542,10 +706,33 @@ mod tests {
 
         upsert_node(&conn, &Node::new("person-o", "person", "Ada Lovelace")).unwrap();
         crate::graph::set_owner(&conn, "person-o").unwrap();
-        let p = system_prompt(&conn).unwrap();
+        let p = system_prompt(&conn, &vocab).unwrap();
         assert!(p.contains("Ada Lovelace"));
         // Durable-vs-moment typing discipline rides in the same prompt.
         assert!(p.contains("DURABLE"));
+    }
+
+    /// A gated class's predicate leaves both the vocabulary and the run's
+    /// report says so — the gate is structural (out of the grammar), not
+    /// advisory prose.
+    #[test]
+    fn a_gated_predicate_leaves_the_extraction_vocabulary() {
+        let conn = open_memory().unwrap();
+        for _ in 0..24 {
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, proposed_by, status, reviewed_by, reviewed_at)
+                 VALUES (json_object('predicate','has_role','subject','x','statement','s'),
+                         'llm', 'rejected', 'user', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let (vocab, gated) = extraction_predicates(&conn).unwrap();
+        assert!(!vocab.iter().any(|p| p == "has_role"));
+        assert_eq!(gated.len(), 1);
+        assert!(gated[0].starts_with("has_role ("));
+        // The rest of the vocabulary is untouched.
+        assert!(vocab.iter().any(|p| p == "works_at"));
     }
 
     #[test]
@@ -608,6 +795,104 @@ mod tests {
         assert!(facts.iter().any(|f| f.predicate == "originated_in"));
     }
 
+    fn plain_episode(source: &str, sid: &str, at: &str) -> crate::episode::Episode {
+        crate::episode::Episode {
+            id: 0,
+            uid: String::new(),
+            source: source.into(),
+            source_id: sid.into(),
+            source_ref: None,
+            body: format!("episode {sid}"),
+            occurred_at: at.into(),
+            occurred_end: None,
+            ingested_at: String::new(),
+            lat: None,
+            lon: None,
+            location: None,
+            sensitivity: "personal".into(),
+            scope_id: None,
+            meta: None,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn extraction_skips_future_episodes_and_excluded_sources() {
+        let conn = open_memory().unwrap();
+        crate::episode::upsert_episode(
+            &conn,
+            &plain_episode("slack.thread", "past", "2026-01-05 10:00:00"),
+        )
+        .unwrap();
+        crate::episode::upsert_episode(
+            &conn,
+            &plain_episode("calendar.event", "cal", "2026-01-06 10:00:00"),
+        )
+        .unwrap();
+        // A meeting that hasn't happened is not evidence of anything yet —
+        // and DESC ordering used to put it FIRST in line.
+        crate::episode::upsert_episode(
+            &conn,
+            &plain_episode("calendar.event", "future", "2999-01-01 10:00:00"),
+        )
+        .unwrap();
+
+        let all = pending_episodes(&conn, 10, None, None).unwrap();
+        assert_eq!(all.len(), 2, "the future episode must not be eligible");
+        assert!(all.iter().all(|r| r.3.as_str() < "2999"));
+
+        let filtered = pending_episodes(&conn, 10, None, Some(&["calendar.event"])).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].3, "2026-01-05 10:00:00");
+    }
+
+    fn insert_commitment(conn: &Connection, what: &str, status: &str, reason: Option<&str>) {
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, proposed_by, status, reject_reason, confidence)
+             VALUES (?1, 'llm:commitment', ?2, ?3, 0.8)",
+            params![
+                serde_json::json!({
+                    "kind": "commitment", "who": "Nadia", "what": what,
+                    "when": null, "direction": "owed_to_me", "confidence": 0.8
+                })
+                .to_string(),
+                status,
+                reason
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_commitment_guard_blocks_judged_but_not_machine_rejected() {
+        let conn = open_memory().unwrap();
+        insert_commitment(&conn, "Send the pilot data.", "rejected", Some("not mine"));
+        insert_commitment(
+            &conn,
+            "Book the scanner",
+            "rejected",
+            Some("precheck: stale commitment"),
+        );
+        insert_commitment(&conn, "Draft the memo", "proposed", None);
+
+        let set = commitment_block_set(&conn).unwrap();
+        // One normalization with precheck: the trailing period and casing
+        // must not make a different identity — the two tiers previously
+        // disagreed and extract re-filed what precheck then machine-rejected.
+        assert!(
+            set.contains(&crate::precheck::normalize("send the pilot data")),
+            "a human-rejected deliverable blocks, punctuation-insensitively"
+        );
+        assert!(set.contains(&crate::precheck::normalize("Draft the memo")));
+        // A machine reject must NOT hold a lifetime block: one precheck
+        // staleness decision would otherwise silently retire a recurring
+        // obligation forever with no human verdict anywhere in the chain.
+        assert!(
+            !set.contains(&crate::precheck::normalize("Book the scanner")),
+            "the machine's own reject is not asked-and-answered"
+        );
+    }
+
     #[test]
     fn test_accept_commitment_rejects_plain_facts() {
         let conn = open_memory().unwrap();
@@ -621,6 +906,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.8),
             tags: None,
+            ..Default::default()
         };
         let id = fact::propose_fact(&conn, &proposed, "llm", None).unwrap();
         assert!(accept_commitment(&conn, id).is_err());

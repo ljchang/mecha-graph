@@ -13,7 +13,13 @@
 //! - A human reject lowers the rate and does NOT demote — one bad item
 //!   in a good class is noise, and it no longer costs the class twenty
 //!   more accepts either. Demotion is reserved for in-use corrections
-//!   (D3) via [`demote_class`], which drops straight to staged.
+//!   (D3) via [`demote_class`], which drops straight to staged — and,
+//!   ratified 2026-08-29 (review-on-use §3), for RETRIEVAL utility: a
+//!   class whose eligible facts nobody's queries ever pull demotes ONE
+//!   rung via [`utility_demotions`]. That does not reopen the accept-rate
+//!   refusal above: utility is a different signal with a different owner
+//!   (the query stream, not the reviewer), so a human reject still never
+//!   demotes anything.
 //! - Commitment classes never ride the ladder (they materialize tasks).
 //! - Promotions and demotions are logged to event_log — the first
 //!   writer of the observability spine.
@@ -90,12 +96,34 @@ pub fn wilson_lower_bound(accepted: i64, total: i64) -> f64 {
     ((centre - margin) / (1.0 + z2 / n)).max(0.0)
 }
 
+/// The SQL predicate for "this verdict was the owner's": `reviewed_by` says
+/// so, or the row predates the column (V017) and is not a machine reject by
+/// reason. Legacy accepts keep counting as the owner's — rewriting history
+/// would gut the record the ladder runs on — but every row written since the
+/// column exists is exact, which is what stops a cascade or an auto-lane
+/// from promoting the class it feeds.
+///
+/// The COALESCE is not decoration. `reviewed_by = 'user'` on a legacy NULL
+/// row is SQL NULL, and NULL survives OR when the other side is false — so a
+/// legacy machine reject made the whole predicate NULL, and one class whose
+/// decided rows were ALL machine rejects turned `SUM(...)` NULL and errored
+/// every surface that read it. In a WHERE clause that NULL merely filtered
+/// (NULL is not true), which is why `human_record` looked fine while the
+/// cluster view — the same predicate inside a SUM — fell over.
+pub const HUMAN_VERDICT_SQL: &str = "(COALESCE(reviewed_by,'') = 'user' \
+     OR (reviewed_by IS NULL AND COALESCE(reject_reason,'') NOT LIKE 'precheck:%'))";
+
 /// A class's human verdict record: (accepted, total).
 ///
 /// Human only, and that asymmetry is the ladder's oldest rule — a lane must
-/// not promote itself. Machine rejects carry a `precheck:%` reason, so they
-/// are excluded here exactly as they are excluded from moving the streak.
-fn human_record(conn: &Connection, proposer: &str, predicate: &str) -> Result<(i64, i64)> {
+/// not promote itself. Machine rejects carry a `precheck:%` reason and
+/// machine accepts carry a non-user `reviewed_by`; both are excluded here
+/// exactly as they are excluded from moving the streak.
+pub(crate) fn human_record(
+    conn: &Connection,
+    proposer: &str,
+    predicate: &str,
+) -> Result<(i64, i64)> {
     Ok(conn.query_row(
         &format!(
             "SELECT
@@ -103,7 +131,7 @@ fn human_record(conn: &Connection, proposer: &str, predicate: &str) -> Result<(i
                SUM(status IN ('accepted','rejected'))
              FROM fact_candidate
              WHERE COALESCE(proposed_by,'?') = ?1 AND {KEY_SQL} = ?2
-               AND COALESCE(reject_reason,'') NOT LIKE 'precheck:%'"
+               AND {HUMAN_VERDICT_SQL}"
         ),
         params![proposer, predicate],
         |r| {
@@ -147,7 +175,7 @@ impl Rung {
 }
 
 /// The cluster-view key expression — MUST match `precheck::cluster_key`.
-const KEY_SQL: &str =
+pub(crate) const KEY_SQL: &str =
     "COALESCE(json_extract(payload,'$.predicate'), '(' || COALESCE(json_extract(payload,'$.kind'),'none') || ')')";
 
 /// A class's current rung; absent classes are staged.
@@ -305,10 +333,476 @@ pub fn ladder_rows(conn: &Connection) -> Result<Vec<(String, String, Rung, i64)>
         .collect())
 }
 
+/// One class as the ladder sees it: where it sits, what its human record
+/// is, and the rung that record would support.
+#[derive(Debug, Clone, Serialize)]
+pub struct LadderView {
+    pub proposer: String,
+    pub predicate: String,
+    pub rung: Rung,
+    /// The rung one recompute pass would leave it at — at most one rung above
+    /// `rung`, never below it.
+    pub earned: Rung,
+    pub accepted: i64,
+    pub judged: i64,
+    pub wilson_lb: f64,
+    /// Candidates of this class waiting in the queue right now.
+    pub pending: i64,
+}
+
+/// Every class with either a ledger row or a human verdict on record.
+///
+/// The union matters: `ensure_class` runs only inside `note_verdict`, so a
+/// class whose verdicts all predate the ladder has no ledger row at all —
+/// and those are exactly the classes a recompute exists to reach.
+pub fn ladder_view(conn: &Connection) -> Result<Vec<LadderView>> {
+    let mut classes: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT DISTINCT COALESCE(proposed_by,'?'), {KEY_SQL}
+             FROM fact_candidate
+             WHERE status IN ('accepted','rejected')
+               AND COALESCE(reject_reason,'') NOT LIKE 'precheck:%'
+             UNION
+             SELECT proposer, predicate FROM class_ledger"
+        ))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    classes.sort();
+
+    let mut out = Vec::new();
+    for (proposer, predicate) in classes {
+        // Kind-keyed classes (`(commitment)` and kin) never auto-accept and
+        // `note_verdict` refuses to move them; the recompute mirrors that.
+        if predicate.starts_with('(') {
+            continue;
+        }
+        let rung = get_rung(conn, &proposer, &predicate)?;
+        let (accepted, judged) = human_record(conn, &proposer, &predicate)?;
+        let lb = wilson_lower_bound(accepted, judged);
+        // One rung per pass, exactly as `note_verdict` promotes one rung per
+        // verdict. Trusted means no spot-check ever again, so a class walks
+        // through Sampled — where 1-in-10 still reaches a human — first.
+        let earned = if rung == Rung::Trusted {
+            Rung::Trusted
+        } else {
+            let up = rung.next();
+            if lb >= promote_floor(up) {
+                up
+            } else {
+                rung
+            }
+        };
+        let pending: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM fact_candidate
+                 WHERE status = 'proposed'
+                   AND COALESCE(proposed_by,'?') = ?1 AND {KEY_SQL} = ?2"
+            ),
+            params![proposer, predicate],
+            |r| r.get(0),
+        )?;
+        out.push(LadderView {
+            proposer,
+            predicate,
+            rung,
+            earned,
+            accepted,
+            judged,
+            wilson_lb: lb,
+            pending,
+        });
+    }
+    Ok(out)
+}
+
+/// Re-derive rungs from the human verdict record: promote every class whose
+/// record already clears the next floor, one rung per pass, never demoting.
+///
+/// One-shot maintenance on the `recompute-confidence` precedent. The Wilson
+/// rule replaced the streak on 2026-08-16, but promotion still fires only
+/// inside [`note_verdict`] — so a class whose verdicts all landed before the
+/// switch sits at `staged` however strong its record, and nothing ever
+/// re-reads it. This is still the owner's own verdict history doing the
+/// promoting; the lane has not promoted itself. Demotion stays where it was:
+/// correction-driven ([`demote_class`]), never statistical.
+///
+/// Returns the classes a pass would move; with `apply` false nothing is
+/// written.
+pub fn recompute_rungs(conn: &Connection, apply: bool) -> Result<Vec<LadderView>> {
+    let moves: Vec<LadderView> = ladder_view(conn)?
+        .into_iter()
+        .filter(|v| v.earned != v.rung)
+        .collect();
+    if !apply {
+        return Ok(moves);
+    }
+    for v in &moves {
+        ensure_class(conn, &v.proposer, &v.predicate)?;
+        conn.execute(
+            "UPDATE class_ledger SET rung = ?3, streak = 0,
+                    promoted_at = datetime('now'), updated_at = datetime('now')
+             WHERE proposer = ?1 AND predicate = ?2",
+            params![v.proposer, v.predicate, v.earned.as_str()],
+        )?;
+        log_event(
+            conn,
+            "class_promoted",
+            Some(&format!("{}\u{b7}{}", v.proposer, v.predicate)),
+            Some(&format!(
+                "{{\"from\":\"{}\",\"to\":\"{}\",\"accepted\":{},\"judged\":{},\
+                  \"wilson_lb\":{:.3},\"recompute\":true}}",
+                v.rung.as_str(),
+                v.earned.as_str(),
+                v.accepted,
+                v.judged,
+                v.wilson_lb
+            )),
+        )?;
+    }
+    Ok(moves)
+}
+
+// ─── Utility: retrieval is the ground truth of usefulness ───────────────
+// (review-on-use §3 — the half of the loop `accept_lb` never had.)
+
+/// One (proposer, predicate) class's retrieval record. `rate` is `None`
+/// over an empty denominator — a class whose facts are all younger than
+/// the opportunity window has not been measured, and a dash is never zero.
+#[derive(Debug, Serialize)]
+pub struct ClassUtility {
+    pub proposer: String,
+    pub predicate: String,
+    /// Live facts in the class (any tier — utility asks whether the class
+    /// is worth having at all, not whether review got to it).
+    pub live: i64,
+    /// Live facts old enough to have had retrieval opportunity.
+    pub eligible: i64,
+    /// Eligible facts a context pack has ever served.
+    pub retrieved: i64,
+    pub rate: Option<f64>,
+}
+
+/// Floors for the utility half of the loop. Deliberately not consts: the
+/// right numbers need weeks of `fact_usage` data at the new generation
+/// rate (open decision 3), so callers pass them — the nightly from env,
+/// report-only until the owner sets a floor.
+#[derive(Debug, Clone, Copy)]
+pub struct UtilityFloors {
+    /// Retrieval rate below which a class demotes/gates.
+    pub floor: f64,
+    /// Classes with fewer eligible facts than this are not measured.
+    pub min_eligible: i64,
+    /// Days a fact must have been live to count as an opportunity.
+    pub opportunity_days: i64,
+}
+
+/// Per-class retrieval record over facts older than the opportunity
+/// window. Class identity is (extractor, predicate) — the extractor on a
+/// minted fact IS the proposer that staged it.
+pub fn class_utility(conn: &Connection, opportunity_days: i64) -> Result<Vec<ClassUtility>> {
+    let cutoff = format!("-{opportunity_days} days");
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(f.extractor,'?') AS proposer, f.predicate,
+                COUNT(*) AS live,
+                SUM(f.ingested_at <= datetime('now', ?1)) AS eligible,
+                SUM(f.ingested_at <= datetime('now', ?1) AND t.ref_id IS NOT NULL) AS retrieved
+         FROM fact f
+         LEFT JOIN retrieval_touch t ON t.kind = 'fact' AND t.ref_id = f.uid
+         WHERE f.valid_to IS NULL AND f.invalidated_at IS NULL
+         GROUP BY proposer, f.predicate
+         ORDER BY proposer, f.predicate",
+    )?;
+    let rows = stmt
+        .query_map(params![cutoff], |r| {
+            let eligible: i64 = r.get::<_, Option<i64>>("eligible")?.unwrap_or(0);
+            let retrieved: i64 = r.get::<_, Option<i64>>("retrieved")?.unwrap_or(0);
+            Ok(ClassUtility {
+                proposer: r.get("proposer")?,
+                predicate: r.get("predicate")?,
+                live: r.get("live")?,
+                eligible,
+                retrieved,
+                rate: (eligible > 0).then(|| retrieved as f64 / eligible as f64),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Demote classes the query stream has voted against: rung above staged,
+/// enough eligible facts to mean something, retrieval rate under the
+/// floor. ONE rung per run — trusted falls to sampled, sampled to staged
+/// — beside the human-verdict promotion, never replacing it. `apply:
+/// false` reports what would demote; either way the caller owns the
+/// loud nightly line, and applied demotions also land in `event_log`
+/// (`class_demoted_utility`) — a guard that acts silently is the failure
+/// mode this repo keeps finding.
+pub fn utility_demotions(
+    conn: &Connection,
+    floors: &UtilityFloors,
+    apply: bool,
+) -> Result<Vec<(ClassUtility, Rung, Rung)>> {
+    let mut out = Vec::new();
+    for cu in class_utility(conn, floors.opportunity_days)? {
+        if cu.eligible < floors.min_eligible {
+            continue;
+        }
+        let Some(rate) = cu.rate else { continue };
+        if rate >= floors.floor {
+            continue;
+        }
+        let from = get_rung(conn, &cu.proposer, &cu.predicate)?;
+        let to = match from {
+            Rung::Trusted => Rung::Sampled,
+            Rung::Sampled => Rung::Staged,
+            Rung::Staged => continue, // nowhere lower to go
+        };
+        if apply {
+            conn.execute(
+                "UPDATE class_ledger SET rung = ?3, streak = 0,
+                        demoted_at = datetime('now'), updated_at = datetime('now')
+                 WHERE proposer = ?1 AND predicate = ?2",
+                params![cu.proposer, cu.predicate, to.as_str()],
+            )?;
+            log_event(
+                conn,
+                "class_demoted_utility",
+                Some(&format!("{}·{}", cu.proposer, cu.predicate)),
+                Some(&format!(
+                    "{{\"from\":\"{}\",\"to\":\"{}\",\"rate\":{:.3},\"eligible\":{}}}",
+                    from.as_str(),
+                    to.as_str(),
+                    rate,
+                    cu.eligible
+                )),
+            )?;
+        }
+        out.push((cu, from, to));
+    }
+    Ok(out)
+}
+
+/// How many human verdicts a class needs before its precision can gate
+/// generation. Below this, `accept_lb` is noise about a class nobody has
+/// really judged.
+pub const GATE_MIN_JUDGED: i64 = 20;
+
+/// The precision floor: a class judged at least [`GATE_MIN_JUDGED`] times
+/// whose Wilson lower bound sits under this stops being extracted — even
+/// optimistically, fewer than ~1 in 7 of its claims survive review.
+/// Calibrated against the measured tail: kNN/structural/rules ran 4–14%
+/// accept and were hand-retired; `llm·has_role` ran 2% while its class
+/// kept flooding the queue. `accept_lb` was computed on every render
+/// since 08-16 and consumed by nothing — this is its consumer.
+pub const GATE_ACCEPT_LB_FLOOR: f64 = 0.15;
+
+/// A class generation should stop producing, and why — the self-limiting
+/// half of the system. Consumed by extraction (the predicate drops out of
+/// the prompt enum for that proposer) and printed by the nightly.
+#[derive(Debug, Serialize)]
+pub struct GatedClass {
+    pub proposer: String,
+    pub predicate: String,
+    pub why: String,
+}
+
+/// Classes below the precision floor (always measured — the human record
+/// is real evidence today) or, when `utility` floors are supplied, below
+/// the retrieval-utility floor (opt-in until the usage data has tenure).
+pub fn gated_classes(
+    conn: &Connection,
+    utility: Option<&UtilityFloors>,
+) -> Result<Vec<GatedClass>> {
+    let mut out: Vec<GatedClass> = Vec::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT COALESCE(proposed_by,'?') AS proposer, {KEY_SQL} AS k,
+                SUM(status = 'accepted') AS acc,
+                COUNT(*) AS judged
+         FROM fact_candidate
+         WHERE status IN ('accepted','rejected') AND {HUMAN_VERDICT_SQL}
+         GROUP BY proposer, k
+         HAVING judged >= ?1"
+    ))?;
+    let rows = stmt.query_map(params![GATE_MIN_JUDGED], |r| {
+        Ok((
+            r.get::<_, String>("proposer")?,
+            r.get::<_, String>("k")?,
+            r.get::<_, Option<i64>>("acc")?.unwrap_or(0),
+            r.get::<_, i64>("judged")?,
+        ))
+    })?;
+    for row in rows {
+        let (proposer, predicate, acc, judged) = row?;
+        if predicate.starts_with('(') {
+            continue; // kind-keyed classes (commitments) never gate
+        }
+        let lb = wilson_lower_bound(acc, judged);
+        if lb < GATE_ACCEPT_LB_FLOOR {
+            out.push(GatedClass {
+                proposer,
+                predicate,
+                why: format!("accept_lb {lb:.2} over {judged} human verdicts"),
+            });
+        }
+    }
+    if let Some(floors) = utility {
+        for cu in class_utility(conn, floors.opportunity_days)? {
+            if cu.eligible < floors.min_eligible {
+                continue;
+            }
+            let Some(rate) = cu.rate else { continue };
+            if rate < floors.floor
+                && !out
+                    .iter()
+                    .any(|g| g.proposer == cu.proposer && g.predicate == cu.predicate)
+            {
+                out.push(GatedClass {
+                    proposer: cu.proposer,
+                    predicate: cu.predicate,
+                    why: format!("retrieval {rate:.2} over {} eligible facts", cu.eligible),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.proposer, &a.predicate).cmp(&(&b.proposer, &b.predicate)));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::open_memory;
+
+    fn seed_fact(
+        conn: &Connection,
+        extractor: &str,
+        predicate: &str,
+        age_days: i64,
+        touched: bool,
+    ) {
+        let node = crate::graph::Node::new("ada", "person", "Ada");
+        crate::graph::upsert_node(conn, &node).unwrap();
+        let uid = crate::ids::new_uid();
+        conn.execute(
+            "INSERT INTO fact (uid, subject_id, predicate, statement, extractor, sensitivity,
+                               polarity, tier, ingested_at, confidence)
+             VALUES (?1, 'ada', ?2, ?1 || ' statement', ?3, 'personal', 'positive', 'shadow',
+                     datetime('now', '-' || ?4 || ' days'), 0.8)",
+            params![uid, predicate, extractor, age_days],
+        )
+        .unwrap();
+        if touched {
+            conn.execute(
+                "INSERT INTO retrieval_touch (kind, ref_id, touches, first_at, last_at)
+                 VALUES ('fact', ?1, 1, datetime('now'), datetime('now'))",
+                params![uid],
+            )
+            .unwrap();
+        }
+    }
+
+    /// A class is measured only over facts old enough to have had a
+    /// chance; a class of only-young facts reports None, never 0%.
+    #[test]
+    fn utility_rate_needs_opportunity_and_a_dash_is_never_zero() {
+        let conn = open_memory().unwrap();
+        for _ in 0..3 {
+            seed_fact(&conn, "llm", "works_on", 30, false);
+        }
+        seed_fact(&conn, "llm", "works_on", 30, true);
+        for _ in 0..4 {
+            seed_fact(&conn, "llm", "about", 1, false); // too young to judge
+        }
+        let cu = class_utility(&conn, 21).unwrap();
+        let works_on = cu.iter().find(|c| c.predicate == "works_on").unwrap();
+        assert_eq!(works_on.eligible, 4);
+        assert_eq!(works_on.retrieved, 1);
+        assert_eq!(works_on.rate, Some(0.25));
+        let about = cu.iter().find(|c| c.predicate == "about").unwrap();
+        assert_eq!(about.eligible, 0);
+        assert_eq!(
+            about.rate, None,
+            "no opportunity is not the same as useless"
+        );
+    }
+
+    /// Utility demotion drops ONE rung, only above staged, only over the
+    /// floors — and an applied demotion is loud (event_log), while a dry
+    /// run writes nothing.
+    #[test]
+    fn utility_demotion_is_one_rung_floored_and_loud() {
+        let conn = open_memory().unwrap();
+        for _ in 0..25 {
+            seed_fact(&conn, "llm", "works_on", 30, false); // never retrieved
+        }
+        conn.execute(
+            "INSERT INTO class_ledger (proposer, predicate, rung) VALUES ('llm','works_on','trusted')",
+            [],
+        )
+        .unwrap();
+        let floors = UtilityFloors {
+            floor: 0.05,
+            min_eligible: 20,
+            opportunity_days: 21,
+        };
+        // Dry run: reported, nothing moves, nothing logged.
+        let would = utility_demotions(&conn, &floors, false).unwrap();
+        assert_eq!(would.len(), 1);
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Trusted);
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE kind = 'class_demoted_utility'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "a dry run must not write the ledger");
+        // Applied: trusted falls exactly one rung, and says so.
+        let done = utility_demotions(&conn, &floors, true).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Sampled);
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE kind = 'class_demoted_utility'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        // Second application: sampled → staged; third finds nowhere lower.
+        utility_demotions(&conn, &floors, true).unwrap();
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Staged);
+        assert!(utility_demotions(&conn, &floors, true).unwrap().is_empty());
+    }
+
+    /// The precision gate: a class the owner has judged often and almost
+    /// always rejected stops being extracted; a vindicated class and a
+    /// barely-judged class do not gate.
+    #[test]
+    fn the_precision_gate_needs_a_real_and_bad_record() {
+        let conn = open_memory().unwrap();
+        let seed = |pred: &str, status: &str, n: usize| {
+            for _ in 0..n {
+                conn.execute(
+                    "INSERT INTO fact_candidate (payload, proposed_by, status, reviewed_by, reviewed_at)
+                     VALUES (json_object('predicate', ?1, 'subject', 'x', 'statement', 's'),
+                             'llm', ?2, 'user', datetime('now'))",
+                    params![pred, status],
+                )
+                .unwrap();
+            }
+        };
+        seed("has_role", "rejected", 24);
+        seed("has_role", "accepted", 1); // 1/25 — hopeless
+        seed("works_at", "accepted", 20);
+        seed("works_at", "rejected", 2); // vindicated
+        seed("mentors", "rejected", 5); // bad but barely judged
+
+        let gated = gated_classes(&conn, None).unwrap();
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].predicate, "has_role");
+        assert!(gated[0].why.contains("25 human verdicts"));
+    }
 
     fn seed_verdict(conn: &Connection, status: &str, ts: &str) {
         conn.execute(
@@ -492,5 +986,82 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM class_ledger", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "commitment verdicts must not create ladder state");
+    }
+
+    /// The recompute exists for exactly this shape: a strong record whose
+    /// verdicts all predate the ladder, so `ensure_class` never ran and the
+    /// class has no ledger row at all. `get_rung` reads it as staged forever;
+    /// one recompute pass reads the record instead.
+    #[test]
+    fn recompute_promotes_a_pre_ladder_record() {
+        let conn = open_memory().unwrap();
+        seed_record(&conn, 41, 10); // uses-shaped: LB ~0.675, clears 0.65
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Staged);
+
+        let moves = recompute_rungs(&conn, true).unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].earned, Rung::Sampled);
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Sampled);
+
+        // One rung per pass: the same record does not clear the Trusted
+        // floor, so a second pass moves nothing — the spot-check rung is
+        // where a class waits for more evidence.
+        let again = recompute_rungs(&conn, true).unwrap();
+        assert!(again.is_empty(), "0.675 must not clear the 0.85 floor");
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Sampled);
+    }
+
+    /// `apply: false` is a preview: it names the moves and writes nothing.
+    #[test]
+    fn recompute_dry_run_writes_nothing() {
+        let conn = open_memory().unwrap();
+        seed_record(&conn, 41, 10);
+        let moves = recompute_rungs(&conn, false).unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Staged);
+    }
+
+    /// Never demotes: a class review promoted keeps its rung however the
+    /// record has drifted since. Demotion stays correction-driven (D3).
+    #[test]
+    fn recompute_never_demotes() {
+        let conn = open_memory().unwrap();
+        seed_record(&conn, 5, 20); // LB far below every floor
+        ensure_class(&conn, "llm", "works_on").unwrap();
+        conn.execute(
+            "UPDATE class_ledger SET rung = 'sampled' WHERE proposer = 'llm'",
+            [],
+        )
+        .unwrap();
+        let moves = recompute_rungs(&conn, true).unwrap();
+        assert!(moves.is_empty());
+        assert_eq!(get_rung(&conn, "llm", "works_on").unwrap(), Rung::Sampled);
+    }
+
+    /// Machine rejects must not starve a promotion, and machine accepts must
+    /// not fuel one — the human record is the only evidence, here exactly as
+    /// in `note_verdict`. A pile of precheck rejects alone is no class at all.
+    #[test]
+    fn recompute_sees_only_human_verdicts() {
+        let conn = open_memory().unwrap();
+        for i in 0..30 {
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, proposed_by, status, reviewed_at, reject_reason)
+                 VALUES ('{\"predicate\":\"works_on\",\"subject\":\"x\",\"statement\":\"s\"}',
+                         'llm', 'rejected', ?1, 'precheck: duplicate')",
+                params![format!("2026-08-02 01:00:{:02}", i % 60)],
+            )
+            .unwrap();
+        }
+        assert!(recompute_rungs(&conn, true).unwrap().is_empty());
+        // And with a real human record beside them, the machine rows change
+        // nothing about the outcome.
+        seed_record(&conn, 41, 10);
+        let moves = recompute_rungs(&conn, true).unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(
+            moves[0].judged, 51,
+            "machine rejects out of the denominator"
+        );
     }
 }

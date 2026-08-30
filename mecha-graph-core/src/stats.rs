@@ -26,7 +26,31 @@ pub struct HealthStats {
     /// a class's threshold or λ is mis-tuned — a calibration signal, NOT
     /// a trust signal (decay does not demote; corrections do).
     pub decayed_beliefs: i64,
+    /// Retrieval per extractor origin: live facts, how many were EVER
+    /// served in a context pack, and total serves. The graph's only ground
+    /// truth of usefulness — `retrieval_touch` has recorded it since day
+    /// one and nothing read it, which is how the queue could grow at
+    /// 15–25× review throughput while 83% of live facts had never once
+    /// been retrieved. Review-accept rate says a fact isn't wrong; this
+    /// says whether it was ever worth having.
+    pub fact_usage: Vec<FactUsageRow>,
+    /// Review-on-use: live unreviewed facts, how many a pack ever served,
+    /// and how many the verdict queue is surfacing right now. The three
+    /// numbers that say whether the demand loop is moving.
+    pub shadow_live: i64,
+    pub shadow_served: i64,
+    pub shadow_surfaced: i64,
     pub ingest_state: Vec<IngestStateRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FactUsageRow {
+    pub extractor: String,
+    pub live: i64,
+    pub retrieved: i64,
+    /// None when `live` is 0 — a rate over an empty denominator is not 0%.
+    pub retrieved_pct: Option<f64>,
+    pub touches: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +113,30 @@ pub fn health(conn: &Connection) -> Result<HealthStats> {
         })?
         .collect::<std::result::Result<_, _>>()?;
 
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(f.extractor, '(none)') AS ex,
+                COUNT(*),
+                SUM(rt.ref_id IS NOT NULL),
+                COALESCE(SUM(rt.touches), 0)
+         FROM fact_current f
+         LEFT JOIN retrieval_touch rt ON rt.kind = 'fact' AND rt.ref_id = f.uid
+         GROUP BY ex ORDER BY COUNT(*) DESC",
+    )?;
+    let fact_usage = stmt
+        .query_map([], |r| {
+            let live: i64 = r.get(1)?;
+            let retrieved: i64 = r.get(2)?;
+            Ok(FactUsageRow {
+                extractor: r.get(0)?,
+                live,
+                retrieved,
+                retrieved_pct: (live > 0).then(|| 100.0 * retrieved as f64 / live as f64),
+                touches: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let shadow_live_served = crate::shadow::shadow_counts(conn)?;
     Ok(HealthStats {
         episodes_by_source: pairs(
             "SELECT source, COUNT(*) FROM episode GROUP BY source ORDER BY COUNT(*) DESC",
@@ -112,6 +160,64 @@ pub fn health(conn: &Connection) -> Result<HealthStats> {
         llm_only_facts: scalar(
             "SELECT COUNT(*) FROM fact_current WHERE extractor = 'llm' AND observation_count = 1",
         )?,
+        fact_usage,
+        shadow_live: shadow_live_served.0,
+        shadow_served: shadow_live_served.1,
+        shadow_surfaced: crate::shadow::surfaced(conn, crate::shadow::DEFAULT_SURFACE_LIMIT)?.len()
+            as i64,
         ingest_state,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_memory;
+    use crate::graph::{upsert_node, Node};
+
+    #[test]
+    fn fact_usage_counts_serves_not_beliefs() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("person-a", "person", "Ada")).unwrap();
+        upsert_node(&conn, &Node::new("project-p", "project", "Hypercourse")).unwrap();
+        let served = crate::fact::assert_fact(
+            &conn,
+            "person-a",
+            "works_on",
+            Some("project-p"),
+            None,
+            "Ada works on Hypercourse",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+        crate::fact::assert_fact(
+            &conn,
+            "person-a",
+            "uses",
+            None,
+            Some("git"),
+            "Ada uses git",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO retrieval_touch (kind, ref_id, touches, first_at, last_at)
+             VALUES ('fact', ?1, 3, datetime('now'), datetime('now'))",
+            rusqlite::params![served],
+        )
+        .unwrap();
+
+        let h = health(&conn).unwrap();
+        let llm = h.fact_usage.iter().find(|u| u.extractor == "llm").unwrap();
+        assert_eq!(llm.live, 2);
+        assert_eq!(llm.retrieved, 1, "one of the two was ever served");
+        assert_eq!(llm.touches, 3);
+        assert_eq!(llm.retrieved_pct, Some(50.0));
+    }
 }

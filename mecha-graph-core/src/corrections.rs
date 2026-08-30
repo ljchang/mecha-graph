@@ -223,6 +223,7 @@ fn apply(
                 valid_from: None,
                 confidence: Some(0.95),
                 tags: None,
+                ..Default::default()
             },
             "correction",
             Some(episode_id),
@@ -306,6 +307,7 @@ fn stage_unresolved(conn: &Connection, episode_id: i64, c: &Correction) -> Resul
             valid_from: None,
             confidence: Some(0.94), // just under resolved corrections, above the flood
             tags: None,
+            ..Default::default()
         },
         "correction:unresolved",
         Some(episode_id),

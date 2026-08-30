@@ -296,12 +296,88 @@ pub fn ensure_vec_dims(conn: &Connection, dims: usize) -> Result<bool> {
             conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS vec_episode;
                  DROP TABLE IF EXISTS vec_fact;
+                 DROP TABLE IF EXISTS vec_rejected;
                  CREATE VIRTUAL TABLE vec_episode USING vec0(episode_id INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);
-                 CREATE VIRTUAL TABLE vec_fact    USING vec0(fact_id    INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);"
+                 CREATE VIRTUAL TABLE vec_fact    USING vec0(fact_id    INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);
+                 CREATE VIRTUAL TABLE vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);"
             ))?;
             Ok(true)
         }
     }
+}
+
+/// Make `vec_rejected` exist at the store's current vector width.
+///
+/// V022 creates it at the compiled-in default, but a store whose vectors
+/// were rebuilt to another width BEFORE V022 existed gets the migration's
+/// default-width table beside non-default siblings — and sqlite-vec's
+/// dimension-mismatch error names the column, not the cause. The index is
+/// a derivable cache, so on mismatch it is dropped and rebuilt empty; the
+/// next `pkg embed` refills it.
+pub fn ensure_vec_rejected(conn: &Connection) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let Some(dims) = declared_vec_dims(conn)? else {
+        return Ok(());
+    };
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_rejected'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let current = sql
+        .as_deref()
+        .and_then(|s| s.find("FLOAT[").map(|i| (s, i)))
+        .and_then(|(s, i)| s[i + 6..].split(']').next()?.parse::<usize>().ok());
+    if current == Some(dims) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS vec_rejected;
+         CREATE VIRTUAL TABLE vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[{dims}]);"
+    ))?;
+    Ok(())
+}
+
+/// Embed HUMAN-rejected candidate statements lacking vectors — the
+/// incremental build of the semantic rejection memory (review-on-use §5).
+/// Machine rejects stay out: precheck's own duplicate-rejections must not
+/// enter the memory that judges the next sweep's input.
+pub fn embed_pending_rejects(
+    conn: &Connection,
+    embedder: &Embedder,
+    limit: usize,
+    batch_size: usize,
+) -> Result<usize> {
+    ensure_vec_rejected(conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT c.id, json_extract(c.payload, '$.statement') AS stmt
+         FROM fact_candidate c
+         WHERE c.status = 'rejected'
+           AND {}
+           AND COALESCE(json_extract(c.payload, '$.statement'), '') <> ''
+           AND c.id NOT IN (SELECT candidate_id FROM vec_rejected)
+         ORDER BY c.id LIMIT ?1",
+        crate::ladder::HUMAN_VERDICT_SQL
+    ))?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get("stmt")?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut total = 0;
+    for chunk in rows.chunks(batch_size.max(1)) {
+        let texts: Vec<String> = chunk.iter().map(|(_, s)| s.clone()).collect();
+        let vecs = embedder.embed(&texts, EmbedTask::Document)?;
+        for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
+            conn.execute(
+                "INSERT OR REPLACE INTO vec_rejected (candidate_id, embedding) VALUES (?1, ?2)",
+                params![id, vec_to_json(vec)],
+            )?;
+            total += 1;
+        }
+    }
+    Ok(total)
 }
 
 /// Record what produced the vectors currently in the store.
@@ -309,7 +385,12 @@ pub fn ensure_vec_dims(conn: &Connection, dims: usize) -> Result<bool> {
 /// Without this, swapping a model leaves a table of numbers that look fine,
 /// answer queries, and mean something different than the thresholds reading
 /// them assume. Nothing about a vector reveals that from the outside.
-pub fn set_embed_meta(conn: &Connection, model: &str, dims: usize, instruction: &str) -> Result<()> {
+pub fn set_embed_meta(
+    conn: &Connection,
+    model: &str,
+    dims: usize,
+    instruction: &str,
+) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS embed_meta (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -412,6 +493,43 @@ pub fn embed_pending_facts(
 
 #[cfg(test)]
 mod tests {
+    /// The rejected index follows every width rebuild, and re-aligns
+    /// itself when it was created at the migration default beside
+    /// siblings rebuilt earlier.
+    #[test]
+    fn vec_rejected_tracks_the_vector_width() {
+        let conn = crate::db::open_memory().unwrap();
+        let dims_of = |name: &str| -> Option<usize> {
+            use rusqlite::OptionalExtension;
+            let sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = ?1",
+                    rusqlite::params![name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            let s = sql?;
+            let i = s.find("FLOAT[")?;
+            s[i + 6..].split(']').next()?.parse().ok()
+        };
+        assert_eq!(dims_of("vec_rejected"), Some(768), "V022 default");
+        assert!(super::ensure_vec_dims(&conn, 1024).unwrap());
+        assert_eq!(dims_of("vec_rejected"), Some(1024), "rebuild carries it");
+        // Simulate a store rebuilt before V022: recreate at the wrong width.
+        conn.execute_batch(
+            "DROP TABLE vec_rejected;
+             CREATE VIRTUAL TABLE vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[768]);",
+        )
+        .unwrap();
+        super::ensure_vec_rejected(&conn).unwrap();
+        assert_eq!(
+            dims_of("vec_rejected"),
+            Some(1024),
+            "re-aligned to siblings"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -458,7 +576,9 @@ mod tests {
         assert!(is_context_overflow(&Error::Embed(
             "request (9292 tokens) exceeds the available context size (8192 tokens)".into()
         )));
-        assert!(!is_context_overflow(&Error::Embed("connection refused".into())));
+        assert!(!is_context_overflow(&Error::Embed(
+            "connection refused".into()
+        )));
     }
 
     #[test]

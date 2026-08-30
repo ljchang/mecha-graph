@@ -33,6 +33,21 @@ pub struct Fact {
     /// memory — "X does NOT work at Y" stops the system re-asking; the
     /// statement text carries the negation.
     pub polarity: String,
+    /// V021: 'reviewed' | 'shadow' (review-on-use). A shadow fact is
+    /// retrievable but unvetted: rank-discounted, labeled `unreviewed`
+    /// wherever it is served, and surfaced for a human verdict only when
+    /// it is about to matter. Test with [`Fact::is_shadow`], never
+    /// `== "shadow"` — an unknown tier must read as unreviewed.
+    pub tier: String,
+}
+
+impl Fact {
+    /// Anything not explicitly reviewed is shadow — fail-closed, so a
+    /// tier value this build has never heard of degrades to "unvetted"
+    /// rather than impersonating a fact a human stood behind.
+    pub fn is_shadow(&self) -> bool {
+        self.tier != "reviewed"
+    }
 }
 
 pub fn row_to_fact(row: &rusqlite::Row) -> std::result::Result<Fact, rusqlite::Error> {
@@ -56,24 +71,31 @@ pub fn row_to_fact(row: &rusqlite::Row) -> std::result::Result<Fact, rusqlite::E
         tags: row.get("tags")?,
         sensitivity: row.get("sensitivity")?,
         polarity: row.get("polarity")?,
+        tier: row.get("tier")?,
     })
 }
 
-/// Normalize a predicate through `predicate_alias`, auto-registering unknown
-/// predicates. The controlled vocabulary is enforced at extractor level (LLM
-/// extraction uses the closed list); deterministic/manual writes may extend it.
+/// Normalize a predicate for a write: alias table, then the stem ladder,
+/// and only then auto-registration.
+///
+/// **The stem rung used to be missing here, and that was the leak.** Two
+/// normalizers existed side by side — this one, which registers whatever it
+/// cannot alias, and [`resolve_predicate`], which stem-matches into the
+/// closed vocabulary and never grows it. Candidates went through the second;
+/// `assert_fact` went through this one. So every predicate the alias table
+/// did not already know became vocabulary, unreviewed, and 49 of the 83
+/// predicates in this graph arrived that way carrying about 900 live facts:
+/// `is_located_in` beside seeded `located_in`, `discusses` and `discussing`
+/// beside `discussed`, `is_blocked_by` beside a `blocked_by` holding none.
+///
+/// Delegating to the ladder first means a morphological variant of a known
+/// predicate is *learned as an alias* rather than registered as a rival.
+/// Auto-registration still happens for a genuinely new relation — a write
+/// must not fail because the vocabulary is short — but it is now the last
+/// resort rather than the second step, and `predicate_unblessed` puts what
+/// still lands there in front of a person.
 pub fn normalize_predicate(conn: &Connection, predicate: &str) -> Result<String> {
-    let p = predicate.trim().to_lowercase().replace(' ', "_");
-    if let Some(name) = conn
-        .query_row(
-            "SELECT name FROM predicate_alias WHERE alias = ?1",
-            params![p],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        return Ok(name);
-    }
+    let p = resolve_predicate(conn, predicate)?;
     let exists: bool = conn.query_row(
         "SELECT COUNT(*) > 0 FROM predicate WHERE name = ?1",
         params![p],
@@ -116,6 +138,7 @@ pub fn assert_fact(
         confidence,
         extractor,
         "positive",
+        "reviewed",
     )
 }
 
@@ -146,6 +169,7 @@ pub fn assert_negative_fact(
         confidence,
         extractor,
         "negative",
+        "reviewed",
     )
 }
 
@@ -162,6 +186,7 @@ fn assert_fact_polarity(
     confidence: f64,
     extractor: &str,
     polarity: &str,
+    tier: &str,
 ) -> Result<String> {
     let predicate = normalize_predicate(conn, predicate)?;
 
@@ -180,20 +205,20 @@ fn assert_fact_polarity(
 
     // Corroboration path: same live (subject, predicate, object) AND
     // polarity — a positive sighting must never corroborate a negation.
-    let existing: Option<(i64, String, String)> = conn
+    let existing: Option<(i64, String, String, String)> = conn
         .query_row(
-            "SELECT id, uid, sensitivity FROM fact
+            "SELECT id, uid, sensitivity, tier FROM fact
              WHERE subject_id = ?1 AND predicate = ?2
                AND ((object_id IS NULL AND ?3 IS NULL) OR object_id = ?3)
                AND ((?4 IS NULL) OR object_value IS NULL OR object_value = ?4)
                AND polarity = ?5
                AND valid_to IS NULL AND invalidated_at IS NULL",
             params![subject_id, predicate, object_id, object_value, polarity],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
 
-    if let Some((id, uid, old_sens)) = existing {
+    if let Some((id, uid, old_sens, old_tier)) = existing {
         // Sensitivity is MAX over all contributing evidence: a personal fact
         // re-observed in a private transcript becomes private, never the
         // other way (hops don't launder, and corroboration is a hop too).
@@ -237,11 +262,22 @@ fn assert_fact_polarity(
             }
             None => true, // episodeless assertions (manual/user) always count
         };
+        // Tier takes the MAX the way sensitivity does, in the opposite
+        // direction of trust: a reviewed sighting (a deterministic
+        // extractor, the owner's own assert, an earned auto-accept lane)
+        // upgrades a shadow fact, while a shadow sighting corroborating a
+        // reviewed fact must never demote what a human already stands
+        // behind.
+        let tier = if old_tier == "reviewed" || tier == "reviewed" {
+            "reviewed"
+        } else {
+            old_tier.as_str()
+        };
         conn.execute(
             "UPDATE fact SET observation_count = observation_count + ?3,
-                             sensitivity = ?2
+                             sensitivity = ?2, tier = ?4
              WHERE id = ?1",
-            params![id, sens, counts as i64],
+            params![id, sens, counts as i64, tier],
         )?;
         recompute_confidence(conn, id)?;
         return Ok(uid);
@@ -250,8 +286,9 @@ fn assert_fact_polarity(
     let uid = new_uid();
     conn.execute(
         "INSERT INTO fact (uid, subject_id, predicate, object_id, object_value, statement,
-                           episode_id, valid_from, confidence, extractor, sensitivity, polarity)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                           episode_id, valid_from, confidence, extractor, sensitivity, polarity,
+                           tier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             uid,
             subject_id,
@@ -264,7 +301,8 @@ fn assert_fact_polarity(
             confidence,
             extractor,
             sensitivity,
-            polarity
+            polarity,
+            tier
         ],
     )?;
     let fact_id = conn.last_insert_rowid();
@@ -394,8 +432,256 @@ fn stem_token(t: &str) -> &str {
     t
 }
 
+/// Tokens that carry no relation and only ever prefix one. Stripping them
+/// is what lets the stemmer see through the single largest source of
+/// vocabulary fragmentation here: `is_located_in` stems to `is_locat_in`
+/// and therefore matches nothing, while seeded `located_in` sits beside it
+/// holding a third of the facts. Measured on this graph — `is_located_in`
+/// (15 live facts) against `located_in` (11), and `is_blocked_by` (2)
+/// against a seeded `blocked_by` holding none at all.
+const COPULA_PREFIXES: &[&str] = &["is", "are", "was", "were", "be", "been", "being"];
+
+/// `stem_predicate` for callers outside this module — the predicate
+/// detectors need the same notion of kinship the resolver uses, and two
+/// definitions of "same relation" would let the audit propose merges the
+/// normalizer would never make.
+pub fn stem_predicate_public(p: &str) -> String {
+    stem_predicate(p)
+}
+
 fn stem_predicate(p: &str) -> String {
-    p.split('_').map(stem_token).collect::<Vec<_>>().join("_")
+    let mut parts: Vec<&str> = p.split('_').collect();
+    // Only a *leading* copula, and never the whole predicate: `is` alone is
+    // a (contentless) predicate in its own right, and stemming it to the
+    // empty string would make it match everything.
+    if parts.len() > 1 && COPULA_PREFIXES.contains(&parts[0]) {
+        parts.remove(0);
+    }
+    parts
+        .into_iter()
+        .map(stem_token)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Predicates that assert nothing beyond "these are related" — copulas and
+/// bare auxiliaries. The extractor mints them when a sentence has no verb
+/// worth keeping ("Wren **is** a twin daughter"), and they carried 252 live
+/// facts here before anyone looked.
+pub const CONTENTLESS_PREDICATES: &[&str] = &[
+    "is", "are", "was", "were", "be", "been", "has", "have", "had", "do", "does", "did",
+];
+
+/// Fold one predicate into another: every fact re-pointed, the old name
+/// learned as an alias so future extractions normalize to the survivor, and
+/// the emptied predicate removed.
+///
+/// Returns (facts moved, facts blocked). A fact is blocked when the
+/// destination already holds an identical live triple — the live-unique
+/// index refuses it — and those are reported rather than resolved, on
+/// `move_facts`'s rule: the ways to resolve a collision are folding
+/// observation counts and deleting evidence, and neither should happen
+/// silently inside a merge somebody asked for.
+///
+/// **The alias is the point, not the fact move.** Re-pointing 15 facts is
+/// bookkeeping; teaching `normalize_predicate` that `is_located_in` means
+/// `located_in` is what stops the fragment coming back tomorrow night.
+pub fn merge_predicate(conn: &Connection, from: &str, to: &str) -> Result<(usize, usize)> {
+    if from == to {
+        return Err(Error::Other("a predicate cannot absorb itself".into()));
+    }
+    for name in [from, to] {
+        let known: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM predicate WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        if !known {
+            return Err(Error::Other(format!("no predicate named {name:?}")));
+        }
+    }
+    let tx = conn.is_autocommit();
+    if tx {
+        conn.execute_batch("BEGIN;")?;
+    }
+    let result = (|| -> Result<(usize, usize)> {
+        let moved = conn.execute(
+            "UPDATE OR IGNORE fact SET predicate = ?2 WHERE predicate = ?1",
+            params![from, to],
+        )?;
+        let blocked: usize = conn.query_row(
+            "SELECT COUNT(*) FROM fact WHERE predicate = ?1",
+            params![from],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+        // Any alias that pointed at the absorbed name has to follow it, or
+        // it resolves to a predicate that no longer exists.
+        conn.execute(
+            "UPDATE OR IGNORE predicate_alias SET name = ?2 WHERE name = ?1",
+            params![from, to],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO predicate_alias (alias, name) VALUES (?1, ?2)",
+            params![from, to],
+        )?;
+        if blocked == 0 {
+            conn.execute("DELETE FROM predicate WHERE name = ?1", params![from])?;
+        }
+        Ok((moved, blocked))
+    })();
+    if tx {
+        match &result {
+            Ok(_) => conn.execute_batch("COMMIT;")?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+        }
+    }
+    result
+}
+
+/// Rewrite a name inside **proposed** fact candidates.
+///
+/// The hazard this exists for is specific and was live: a candidate stores
+/// its subject and object as *text*, resolved to nodes only when accepted.
+/// So a queue of candidates naming "Marisol B. Farrow" was pending while
+/// that name was **reassigned** — taken off a daughter's node during a split
+/// and given to the student it had really belonged to. Every one of those
+/// would have resolved, on accept, to a Ostrander undergraduate:
+/// `Avery J Calder is the parent of Marisol B. Farrow` filed against a real
+/// stranger. 112 of them, waiting behind a review screen.
+///
+/// Merges do not have this problem — the absorbed name survives as an alias
+/// of the survivor, so a pending candidate still lands on the right person.
+/// **Renames and splits do**, because the old name stops meaning what it
+/// meant and may come to mean somebody else entirely.
+///
+/// Only `proposed` rows are touched. An accepted candidate has already
+/// become a fact with real node ids, and its statement is the record of
+/// what a source said; rewriting that would be restating history rather
+/// than repairing a queue.
+///
+/// The payload is parsed and re-serialised rather than string-replaced, so
+/// a name containing a quote cannot corrupt the JSON of a row this is
+/// supposed to be fixing.
+pub fn retext_candidates(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    except: &[i64],
+    dry_run: bool,
+) -> Result<Vec<(i64, String)>> {
+    if from.trim().is_empty() {
+        return Err(Error::Other("refusing to rewrite the empty string".into()));
+    }
+    // The prefilter runs against the RAW payload, where the name is JSON
+    // *escaped* — a quote in it is stored as \" and a plain LIKE would miss
+    // the very row this is meant to repair. Searching for the escaped form
+    // is what makes the fast path correct rather than merely fast.
+    let escaped = json_inner(from);
+    let mut stmt = conn.prepare(
+        "SELECT id, payload FROM fact_candidate
+         WHERE status = 'proposed' AND payload LIKE '%' || ?1 || '%'",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(params![escaped], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut changed = Vec::new();
+    for (id, payload) in rows {
+        if except.contains(&id) {
+            continue;
+        }
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if !replace_in_strings(&mut v, from, to) {
+            continue;
+        }
+        let next = serde_json::to_string(&v)
+            .map_err(|e| Error::Other(format!("re-serialising candidate {id}: {e}")))?;
+        let statement = v
+            .get("statement")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !dry_run {
+            conn.execute(
+                "UPDATE fact_candidate SET payload = ?2 WHERE id = ?1",
+                params![id, next],
+            )?;
+        }
+        changed.push((id, statement));
+    }
+    Ok(changed)
+}
+
+/// Substring-replace inside every string in a JSON value. Returns whether
+/// anything changed.
+///
+/// The folds below look like `.any()` and must not be: `any()`
+/// short-circuits, so it would stop rewriting after the first match and
+/// leave the rest of the payload carrying the old name — the object field
+/// untouched behind a fixed statement, which is the dangerous half. The
+/// call comes first in `f(x) || acc` for the same reason.
+#[allow(clippy::unnecessary_fold)]
+fn replace_in_strings(v: &mut serde_json::Value, from: &str, to: &str) -> bool {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.contains(from) {
+                *s = s.replace(from, to);
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(a) => a
+            .iter_mut()
+            .fold(false, |acc, x| replace_in_strings(x, from, to) || acc),
+        serde_json::Value::Object(o) => o
+            .values_mut()
+            .fold(false, |acc, x| replace_in_strings(x, from, to) || acc),
+        _ => false,
+    }
+}
+
+/// A string as it appears *inside* a JSON document — escaped, without the
+/// surrounding quotes. `O"Brien` becomes `O\"Brien`, which is what a LIKE
+/// against a stored payload has to match.
+fn json_inner(s: &str) -> String {
+    let quoted = serde_json::Value::String(s.to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// How many proposed candidates name this string? The cheap check a rename
+/// should make before leaving a queue pointing at a name that no longer
+/// means what it did.
+pub fn candidates_naming(conn: &Connection, name: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM fact_candidate
+         WHERE status = 'proposed' AND payload LIKE '%' || ?1 || '%'",
+        params![json_inner(name)],
+        |r| r.get(0),
+    )?)
+}
+
+/// Promote an auto-registered predicate to one somebody decided on.
+///
+/// The distinction is not cosmetic: `description = 'auto-registered'` is the
+/// marker separating vocabulary the owner chose from vocabulary that
+/// appeared because an extractor said a word once. The predicate table is
+/// interpolated into the extraction prompt, so a blessed predicate is
+/// actively taught — which is exactly why blessing is a decision and not a
+/// side effect.
+pub fn bless_predicate(conn: &Connection, name: &str, description: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE predicate SET description = ?2 WHERE name = ?1",
+        params![name, description],
+    )?;
+    if n == 0 {
+        return Err(Error::Other(format!("no predicate named {name:?}")));
+    }
+    Ok(())
 }
 
 /// The predicate resolution ladder, one rung past the alias table:
@@ -837,10 +1123,14 @@ pub struct FactCandidate {
     pub created_at: String,
     pub reviewed_at: Option<String>,
     pub reject_reason: Option<String>,
+    /// V021: the fact this candidate minted (shadow mint or accept). The
+    /// join that lets a human verdict on a *served fact* settle the
+    /// *candidate* that staged it.
+    pub fact_uid: Option<String>,
 }
 
 /// Proposed-fact payload shape (also the `kg_upsert` wire format).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProposedFact {
     pub subject: String,
     pub predicate: String,
@@ -857,6 +1147,17 @@ pub struct ProposedFact {
     /// handle (`pkg facts --tag recommendation`).
     #[serde(default)]
     pub tags: Option<String>,
+    /// Node ids behind `subject`/`object`, set only by producers that
+    /// derived the pair FROM nodes (linkers, rules). Names are what accept
+    /// resolves and what a reviewer reads, but names are not unique — two
+    /// people really can be June — so a dedup guard keyed on names alone
+    /// silently suppresses a distinct same-named pair. Producers that
+    /// start from text (extraction, bee, kg_upsert) leave these None;
+    /// `skip_serializing_if` keeps their payloads byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_node: Option<String>,
 }
 
 /// Stage a proposed fact. The sole write path for anything non-deterministic
@@ -904,6 +1205,7 @@ fn row_to_candidate(row: &rusqlite::Row) -> std::result::Result<FactCandidate, r
         created_at: row.get("created_at")?,
         reviewed_at: row.get("reviewed_at")?,
         reject_reason: row.get("reject_reason")?,
+        fact_uid: row.get("fact_uid")?,
     })
 }
 
@@ -1171,6 +1473,105 @@ pub fn accept_candidate(conn: &Connection, candidate_id: i64) -> Result<String> 
     accept_candidate_opts(conn, candidate_id, false, true)
 }
 
+/// Whether a failed subject string deserves to become an alias when it is
+/// bound — pronouns and articles resolve *something* every time and would
+/// poison entity resolution forever. Shared by the TUI's `b` and the CLI's
+/// `bind`, because two copies of this list is two lists that drift.
+pub fn alias_worthy(s: &str) -> bool {
+    let c = s.trim().to_lowercase();
+    c.len() >= 3
+        && ![
+            "they", "them", "he", "she", "it", "we", "us", "the", "this", "that", "everyone",
+        ]
+        .contains(&c.as_str())
+        && !c.starts_with("the ")
+        && !c.starts_with("a ")
+        && !c.starts_with("an ")
+}
+
+/// Rebind a pending candidate's unresolvable subject to a real entity.
+///
+/// This is the way through the commonest accept failure — `cannot resolve
+/// subject 'X'` — without abandoning the review surface that surfaced it:
+/// the extractor wrote a name the graph almost knows ("John Kulvicki" for a
+/// node named slightly otherwise), and the fix is a rebind plus an alias so
+/// the *next* candidate with that spelling resolves on its own.
+///
+/// `to` names the target explicitly; absent, the top `suggest_entities`
+/// match is taken — the same choice the TUI's `b` makes. Returns
+/// `(old_subject, new_name)` so the caller can show exactly what moved.
+/// Refuses rather than guesses when: the candidate is not pending, has no
+/// subject, the subject already resolves (nothing to fix), an explicit `to`
+/// does not resolve to exactly one node, or no suggestion exists.
+pub fn bind_subject(
+    conn: &Connection,
+    candidate_id: i64,
+    to: Option<&str>,
+) -> Result<(String, String)> {
+    let cand = conn
+        .query_row(
+            "SELECT payload FROM fact_candidate WHERE id = ?1 AND status = 'proposed'",
+            params![candidate_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Other(format!("no pending candidate {candidate_id}")))?;
+    let mut payload: serde_json::Value = serde_json::from_str(&cand)?;
+    let subject = payload
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if subject.is_empty() {
+        return Err(Error::Other(format!(
+            "candidate {candidate_id} has no subject to bind"
+        )));
+    }
+    let node = match to {
+        Some(name) => {
+            let mut hits = crate::graph::resolve_entity_all(conn, name)?;
+            match hits.len() {
+                1 => hits.remove(0),
+                0 => return Err(Error::Other(format!("'{name}' resolves to nothing"))),
+                n => {
+                    return Err(Error::Other(format!(
+                        "'{name}' is ambiguous ({n} matches) — use the exact display name"
+                    )))
+                }
+            }
+        }
+        None => {
+            if crate::graph::resolve_entity_all(conn, &subject)?.len() == 1 {
+                return Err(Error::Other(format!(
+                    "'{subject}' already resolves — nothing to bind"
+                )));
+            }
+            crate::graph::suggest_entities(conn, &subject, 1)?
+                .into_iter()
+                .next()
+                .map(|s| s.node)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "no suggestion for '{subject}' — name a target with --to"
+                    ))
+                })?
+        }
+    };
+    if let serde_json::Value::Object(map) = &mut payload {
+        map.insert(
+            "subject".into(),
+            serde_json::Value::String(node.name.clone()),
+        );
+    }
+    update_candidate_payload(conn, candidate_id, &payload)?;
+    // The alias is the half with a future: it makes the next candidate
+    // carrying this spelling resolve without anyone binding anything.
+    if alias_worthy(&subject) && subject.to_lowercase() != node.name.to_lowercase() {
+        crate::graph::add_alias(conn, &node.id, &subject, "review")?;
+    }
+    Ok((subject, node.name))
+}
+
 /// Accept a candidate: resolve subject/object names against the graph and
 /// promote to a real fact. When `create_missing_subject` is set, an
 /// unresolvable subject becomes a new topic node — the human accepting IS
@@ -1186,6 +1587,56 @@ pub fn accept_candidate_opts(
     create_missing_subject: bool,
     reviewed_by_user: bool,
 ) -> Result<String> {
+    let label = if reviewed_by_user { "user" } else { "auto" };
+    accept_candidate_labeled(
+        conn,
+        candidate_id,
+        create_missing_subject,
+        reviewed_by_user,
+        label,
+    )
+}
+
+/// Accept a candidate because the owner accepted a semantically similar one:
+/// the cascade half of a `--like` verdict. Machine-labeled by construction —
+/// `reviewed_by = "cascade:<seed>"` — so nothing about it enters the human
+/// record the ladder promotes on: one keystroke fanning out to a group must
+/// count as ONE human verdict (the seed's), or the lane promotes itself on
+/// its own volume.
+pub fn accept_candidate_cascade(
+    conn: &Connection,
+    candidate_id: i64,
+    seed_id: i64,
+) -> Result<String> {
+    accept_candidate_labeled(
+        conn,
+        candidate_id,
+        false,
+        false,
+        &format!("cascade:{seed_id}"),
+    )
+}
+
+/// What [`resolve_candidate_parts`] hands back: the candidate row, its
+/// parsed payload, the resolved subject node, the resolved object node
+/// (if the name matched one), and the literal object value otherwise.
+type ResolvedCandidate = (
+    FactCandidate,
+    ProposedFact,
+    crate::graph::Node,
+    Option<crate::graph::Node>,
+    Option<String>,
+);
+
+/// The shared front half of turning a staged payload into a fact row:
+/// load the pending candidate, resolve its subject/object names against
+/// today's graph. Used by both the human accept path and the shadow mint —
+/// two tiers, one notion of what a payload means.
+fn resolve_candidate_parts(
+    conn: &Connection,
+    candidate_id: i64,
+    create_missing_subject: bool,
+) -> Result<ResolvedCandidate> {
     let cand = conn
         .query_row(
             "SELECT * FROM fact_candidate WHERE id = ?1 AND status = 'proposed'",
@@ -1227,6 +1678,18 @@ pub fn accept_candidate_opts(
         (Some(o), None) => Some(o.clone()),
         _ => proposed.object_value.clone(),
     };
+    Ok((cand, proposed, subject, object_node, object_value))
+}
+
+fn accept_candidate_labeled(
+    conn: &Connection,
+    candidate_id: i64,
+    create_missing_subject: bool,
+    reviewed_by_user: bool,
+    label: &str,
+) -> Result<String> {
+    let (cand, proposed, subject, object_node, object_value) =
+        resolve_candidate_parts(conn, candidate_id, create_missing_subject)?;
 
     let uid = assert_fact(
         conn,
@@ -1265,8 +1728,10 @@ pub fn accept_candidate_opts(
     }
 
     conn.execute(
-        "UPDATE fact_candidate SET status = 'accepted', reviewed_at = datetime('now') WHERE id = ?1",
-        params![candidate_id],
+        "UPDATE fact_candidate SET status = 'accepted', reviewed_at = datetime('now'),
+                reviewed_by = ?2, fact_uid = ?3
+         WHERE id = ?1",
+        params![candidate_id, label, uid],
     )?;
     // Score any agent verdicts as a side effect of ordinary review. A
     // separate scoring chore is one nobody runs, and an unscored ledger
@@ -1284,6 +1749,208 @@ pub fn accept_candidate_opts(
         },
     )?;
     Ok(uid)
+}
+
+/// Mint a shadow fact from a pending candidate (review-on-use, V021).
+///
+/// The write half of "extraction output lands retrievable": the machine
+/// tiers have already triaged this candidate and no human is asked —
+/// the fact goes live at `tier = 'shadow'`, rank-discounted and labeled
+/// `unreviewed` wherever it is served, and earns its verdict when a
+/// query pulls it. The candidate row stays behind as bookkeeping:
+/// `status = 'shadow'`, linked by `fact_uid`, with `reviewed_at` and
+/// `reviewed_by` NULL because *nobody reviewed anything* — a later human
+/// verdict on the served fact settles it through
+/// [`confirm_shadow_fact`] / [`refute_shadow_fact`], and only then does
+/// the row enter the human record the ladder promotes on.
+///
+/// Refuses when the subject cannot resolve: a fact row needs a
+/// `subject_id`, and binding a name the graph does not know is genuinely
+/// human work — the caller leaves such candidates queued. Deliberately no
+/// `create_missing_subject`: minting topic nodes wholesale from
+/// unreviewed extraction would trade a queue of candidates for a graph
+/// of junk nodes.
+pub fn mint_shadow_candidate(conn: &Connection, candidate_id: i64) -> Result<String> {
+    let (cand, proposed, subject, object_node, object_value) =
+        resolve_candidate_parts(conn, candidate_id, false)?;
+
+    let uid = assert_fact_polarity(
+        conn,
+        &subject.id,
+        &proposed.predicate,
+        object_node.as_ref().map(|n| n.id.as_str()),
+        object_value.as_deref(),
+        &proposed.statement,
+        cand.episode_id,
+        proposed.valid_from.as_deref(),
+        proposed.confidence.unwrap_or(0.7),
+        cand.proposed_by.as_deref().unwrap_or("candidate"),
+        "positive",
+        "shadow",
+    )?;
+    if let Some(tags) = proposed.tags.as_deref().filter(|t| !t.trim().is_empty()) {
+        conn.execute(
+            "UPDATE fact SET tags = ?2 WHERE uid = ?1",
+            params![uid, tags],
+        )?;
+    }
+    conn.execute(
+        "UPDATE fact_candidate SET status = 'shadow', fact_uid = ?2 WHERE id = ?1",
+        params![candidate_id, uid],
+    )?;
+    Ok(uid)
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ShadowConvertReport {
+    pub scanned: usize,
+    pub minted: usize,
+    /// Commitments and precheck-flagged candidates: deliberately still a
+    /// queue.
+    pub held: usize,
+    /// Subject would not resolve — binding is human work; stays queued.
+    pub unresolvable: usize,
+}
+
+/// Bulk-convert the pending backlog to shadow facts (review-on-use day
+/// one, open decision 4: "the backlog disappears as a concept").
+///
+/// Every clean pending candidate mints via [`mint_shadow_candidate`];
+/// what stays queued is exactly what the ingest path would also hold —
+/// commitments (a claim on the owner's attention is reviewed as a task,
+/// not discovered mid-retrieval), candidates precheck flagged as a
+/// contradiction or near-duplicate (annotated for a human, and minting a
+/// flagged near-twin would put both twins in retrieval), and subjects
+/// the graph cannot resolve. One rule for the flood and the trickle, so
+/// day-one conversion and tomorrow's extraction land in the same place.
+pub fn convert_pending_to_shadow(conn: &Connection, limit: i64) -> Result<ShadowConvertReport> {
+    let mut report = ShadowConvertReport::default();
+    for cand in pending_candidates(conn, limit)? {
+        report.scanned += 1;
+        let is_commitment = cand.payload.get("kind").and_then(|k| k.as_str()) == Some("commitment");
+        let flagged = cand.payload.get("precheck_contradicts").is_some()
+            || cand.payload.get("precheck_similar_to").is_some();
+        if is_commitment || flagged {
+            report.held += 1;
+            continue;
+        }
+        match mint_shadow_candidate(conn, cand.id) {
+            Ok(_) => report.minted += 1,
+            Err(_) => report.unresolvable += 1,
+        }
+    }
+    Ok(report)
+}
+
+/// The candidates a shadow fact settles when a human votes on it. Usually
+/// one; corroboration can link several (a second staged claim of the same
+/// triple mints into the existing row).
+fn shadow_candidates_for(conn: &Connection, fact_uid: &str) -> Result<Vec<FactCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM fact_candidate WHERE fact_uid = ?1 AND status = 'shadow'
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![fact_uid], row_to_candidate)?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// A human confirms a served shadow fact: promote it to `reviewed`.
+///
+/// This is what "accepting" becomes under review-on-use — the same
+/// strong post-selection evidence a review-surface accept always
+/// recorded (a verified/user observation, the ladder verdict for the
+/// staging class), applied to the fact where it was actually seen.
+/// When corroboration linked several candidates to this one fact, all of
+/// them settle but only the oldest moves the ladder: one human keystroke
+/// is one human verdict, never a fan-out (the cascade rule).
+pub fn confirm_shadow_fact(conn: &Connection, uid: &str) -> Result<()> {
+    let fact = get_fact_by_uid(conn, uid)?
+        .ok_or_else(|| Error::Other(format!("no fact with uid {uid}")))?;
+    if !fact.is_shadow() {
+        return Err(Error::Other(format!("fact {uid} is already reviewed")));
+    }
+    if fact.invalidated_at.is_some() {
+        return Err(Error::Other(format!(
+            "fact {uid} is retracted — nothing to confirm"
+        )));
+    }
+    conn.execute(
+        "UPDATE fact SET tier = 'reviewed' WHERE uid = ?1",
+        params![uid],
+    )?;
+    record_observation(conn, fact.id, fact.episode_id, "verified", "user", None)?;
+    recompute_confidence(conn, fact.id)?;
+
+    for (i, cand) in shadow_candidates_for(conn, uid)?.iter().enumerate() {
+        conn.execute(
+            "UPDATE fact_candidate SET status = 'accepted', reviewed_at = datetime('now'),
+                    reviewed_by = 'user'
+             WHERE id = ?1",
+            params![cand.id],
+        )?;
+        score_verdicts(conn, cand.id, "accepted")?;
+        if i == 0 {
+            let (key, commitment) = crate::precheck::cluster_key(&cand.payload);
+            crate::ladder::note_verdict(
+                conn,
+                cand.proposed_by.as_deref().unwrap_or("?"),
+                &key,
+                true,
+                commitment,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A human refutes a served shadow fact: it was never true.
+///
+/// The fact is invalidated with both timelines pinned
+/// ([`invalidate_never_true`] — no as-of date may serve a claim the
+/// owner called wrong), and the staging candidates settle as rejected
+/// under the human label, which is exactly what feeds precheck's
+/// rejection memory and the ladder. `reason` must be the human's, not a
+/// `precheck:%` string — a machine-shaped reason would exclude the
+/// verdict from the human record.
+///
+/// Reviewed facts are out of scope on purpose: retracting what a human
+/// once stood behind is a correction, not a review verdict.
+pub fn refute_shadow_fact(conn: &Connection, uid: &str, reason: &str) -> Result<()> {
+    let fact = get_fact_by_uid(conn, uid)?
+        .ok_or_else(|| Error::Other(format!("no fact with uid {uid}")))?;
+    if !fact.is_shadow() {
+        return Err(Error::Other(format!(
+            "fact {uid} is reviewed — use retract/corrections, not a shadow verdict"
+        )));
+    }
+    if fact.invalidated_at.is_some() {
+        return Err(Error::Other(format!("fact {uid} is already retracted")));
+    }
+    invalidate_never_true(conn, uid)?;
+    record_observation(conn, fact.id, fact.episode_id, "disputed", "user", None)?;
+
+    for (i, cand) in shadow_candidates_for(conn, uid)?.iter().enumerate() {
+        conn.execute(
+            "UPDATE fact_candidate SET status = 'rejected', reviewed_at = datetime('now'),
+                    reviewed_by = 'user', reject_reason = ?2
+             WHERE id = ?1",
+            params![cand.id, reason],
+        )?;
+        score_verdicts(conn, cand.id, "rejected")?;
+        if i == 0 {
+            let (key, commitment) = crate::precheck::cluster_key(&cand.payload);
+            crate::ladder::note_verdict(
+                conn,
+                cand.proposed_by.as_deref().unwrap_or("?"),
+                &key,
+                false,
+                commitment,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Live facts carrying a tag (comma-separated matching) — the revisit list.
@@ -1314,6 +1981,39 @@ pub fn reject_candidate_opts(
     reason: &str,
     by_user: bool,
 ) -> Result<()> {
+    let label = if by_user { "user" } else { "auto" };
+    reject_candidate_labeled(conn, candidate_id, reason, by_user, label)
+}
+
+/// The cascade half of a `--like` rejection — see [`accept_candidate_cascade`]
+/// for why it is machine-labeled and never moves the ladder.
+pub fn reject_candidate_cascade(
+    conn: &Connection,
+    candidate_id: i64,
+    seed_id: i64,
+    cosine: Option<f64>,
+) -> Result<()> {
+    let reason = match cosine {
+        Some(c) => format!("cascade: similar to #{seed_id} (cosine {c:.2})"),
+        // An explicit listing carries no score — the person read the group.
+        None => format!("cascade: listed with #{seed_id}"),
+    };
+    reject_candidate_labeled(
+        conn,
+        candidate_id,
+        &reason,
+        false,
+        &format!("cascade:{seed_id}"),
+    )
+}
+
+fn reject_candidate_labeled(
+    conn: &Connection,
+    candidate_id: i64,
+    reason: &str,
+    by_user: bool,
+    label: &str,
+) -> Result<()> {
     let cand: Option<(Option<String>, String)> = conn
         .query_row(
             "SELECT proposed_by, payload FROM fact_candidate
@@ -1327,9 +2027,9 @@ pub fn reject_candidate_opts(
     };
     conn.execute(
         "UPDATE fact_candidate SET status = 'rejected', reviewed_at = datetime('now'),
-                reject_reason = ?2
+                reject_reason = ?2, reviewed_by = ?3
          WHERE id = ?1",
-        params![candidate_id, reason],
+        params![candidate_id, reason, label],
     )?;
     score_verdicts(
         conn,
@@ -1354,6 +2054,262 @@ pub fn reject_candidate_opts(
 mod tests {
     use super::*;
 
+    fn person(conn: &Connection, id: &str, name: &str) {
+        let node = crate::graph::Node::new(id, "person", name);
+        crate::graph::upsert_node(conn, &node).unwrap();
+    }
+
+    fn stage(conn: &Connection, subject: &str, predicate: &str, statement: &str) -> i64 {
+        let p = ProposedFact {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            statement: statement.into(),
+            confidence: Some(0.8),
+            ..Default::default()
+        };
+        propose_fact(conn, &p, "llm", None).unwrap()
+    }
+
+    /// The shadow mint is not a review: the fact goes live at tier
+    /// 'shadow', the candidate leaves the pending queue as bookkeeping
+    /// (status 'shadow', fact_uid link, no reviewer), and nothing enters
+    /// the human record — the ladder must not move on a mint.
+    #[test]
+    fn a_shadow_mint_is_retrievable_bookkept_and_not_a_verdict() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let cid = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+
+        let uid = mint_shadow_candidate(&conn, cid).unwrap();
+
+        let fact = get_fact_by_uid(&conn, &uid).unwrap().unwrap();
+        assert!(fact.is_shadow());
+        assert!(fact.invalidated_at.is_none());
+
+        assert!(pending_candidates(&conn, 100).unwrap().is_empty());
+        let (status, fact_uid, reviewed_by): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, fact_uid, reviewed_by FROM fact_candidate WHERE id = ?1",
+                params![cid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "shadow");
+        assert_eq!(fact_uid.as_deref(), Some(uid.as_str()));
+        assert_eq!(reviewed_by, None);
+
+        let ladder_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM class_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ladder_rows, 0, "a mint moved the ladder");
+    }
+
+    /// A subject the graph cannot resolve refuses to mint — a fact row
+    /// needs a subject_id, and binding is human work — and the candidate
+    /// stays pending rather than vanishing.
+    #[test]
+    fn an_unresolvable_subject_refuses_to_mint_and_stays_queued() {
+        let conn = crate::db::open_memory().unwrap();
+        let cid = stage(
+            &conn,
+            "Nobody Known",
+            "works_at",
+            "Nobody Known works somewhere",
+        );
+        assert!(mint_shadow_candidate(&conn, cid).is_err());
+        assert_eq!(pending_candidates(&conn, 100).unwrap().len(), 1);
+    }
+
+    /// Confirming a served shadow fact is the accept of review-on-use:
+    /// tier flips, the candidate settles under the human label, and the
+    /// staging class earns exactly one ladder verdict.
+    #[test]
+    fn confirming_a_shadow_fact_promotes_it_and_settles_the_candidate() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let cid = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+        let uid = mint_shadow_candidate(&conn, cid).unwrap();
+
+        confirm_shadow_fact(&conn, &uid).unwrap();
+
+        let fact = get_fact_by_uid(&conn, &uid).unwrap().unwrap();
+        assert!(!fact.is_shadow());
+        assert!(is_user_verified(&conn, fact.id).unwrap());
+        let (status, reviewed_by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, reviewed_by FROM fact_candidate WHERE id = ?1",
+                params![cid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "accepted");
+        assert_eq!(reviewed_by.as_deref(), Some("user"));
+        let ladder_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM class_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ladder_rows, 1);
+        // Confirming twice is a state error, not a second verdict.
+        assert!(confirm_shadow_fact(&conn, &uid).is_err());
+    }
+
+    /// Refuting says "never true": both timelines pin so no as-of date
+    /// serves the claim, and the candidate's rejection carries the human
+    /// reason — which is what precheck's rejection memory mines.
+    #[test]
+    fn refuting_a_shadow_fact_invalidates_it_and_records_the_human_reject() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let cid = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+        let uid = mint_shadow_candidate(&conn, cid).unwrap();
+
+        refute_shadow_fact(&conn, &uid, "wrong observatory").unwrap();
+
+        let fact = get_fact_by_uid(&conn, &uid).unwrap().unwrap();
+        assert!(fact.invalidated_at.is_some());
+        let (status, reviewed_by, reason): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, reviewed_by, reject_reason FROM fact_candidate WHERE id = ?1",
+                params![cid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "rejected");
+        assert_eq!(reviewed_by.as_deref(), Some("user"));
+        assert_eq!(reason.as_deref(), Some("wrong observatory"));
+        // A reviewed fact is out of scope: retraction is a correction.
+        person(&conn, "p-june", "June");
+        let reviewed = assert_fact(
+            &conn,
+            "p-june",
+            "works_at",
+            None,
+            Some("the lab"),
+            "June works at the lab",
+            None,
+            None,
+            0.9,
+            "user",
+        )
+        .unwrap();
+        assert!(refute_shadow_fact(&conn, &reviewed, "no").is_err());
+    }
+
+    /// Corroboration takes MAX tier the way it takes MAX sensitivity: a
+    /// reviewed sighting upgrades a shadow fact, and a shadow sighting
+    /// must never demote what a human already stands behind.
+    #[test]
+    fn corroboration_upgrades_tier_and_never_downgrades_it() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let cid = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+        let uid = mint_shadow_candidate(&conn, cid).unwrap();
+        assert!(get_fact_by_uid(&conn, &uid).unwrap().unwrap().is_shadow());
+
+        // A reviewed sighting of the same triple corroborates and upgrades.
+        let uid2 = assert_fact(
+            &conn,
+            "p-vera",
+            "works_at",
+            None,
+            None,
+            "Vera works at the observatory",
+            None,
+            None,
+            0.9,
+            "user",
+        )
+        .unwrap();
+        assert_eq!(
+            uid, uid2,
+            "same live triple must corroborate, not duplicate"
+        );
+        assert!(!get_fact_by_uid(&conn, &uid).unwrap().unwrap().is_shadow());
+
+        // A second shadow mint of the triple corroborates without demoting.
+        let cid2 = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+        let uid3 = mint_shadow_candidate(&conn, cid2).unwrap();
+        assert_eq!(uid, uid3);
+        assert!(!get_fact_by_uid(&conn, &uid).unwrap().unwrap().is_shadow());
+    }
+
+    /// Day-one conversion holds exactly what the ingest path holds:
+    /// commitments, precheck-flagged candidates, unresolvable subjects.
+    /// Everything else stops being a backlog.
+    #[test]
+    fn converting_the_backlog_mints_the_clean_and_keeps_the_held() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let clean = stage(&conn, "Vera", "works_at", "Vera works at the observatory");
+        let unresolvable = stage(
+            &conn,
+            "Nobody Known",
+            "works_at",
+            "Nobody Known works somewhere",
+        );
+        let flagged = stage(&conn, "Vera", "works_at", "Vera works at the annex");
+        conn.execute(
+            "UPDATE fact_candidate
+             SET payload = json_set(payload, '$.precheck_contradicts', 'held')
+             WHERE id = ?1",
+            params![flagged],
+        )
+        .unwrap();
+        let commitment = conn
+            .execute(
+                "INSERT INTO fact_candidate (payload, proposed_by, confidence)
+                 VALUES ('{\"kind\":\"commitment\",\"what\":\"send the data\"}', 'llm:commitment', 0.8)",
+                [],
+            )
+            .map(|_| conn.last_insert_rowid())
+            .unwrap();
+
+        let r = convert_pending_to_shadow(&conn, 1000).unwrap();
+        assert_eq!(r.scanned, 4);
+        assert_eq!(r.minted, 1);
+        assert_eq!(r.held, 2);
+        assert_eq!(r.unresolvable, 1);
+
+        let status = |id: i64| -> String {
+            conn.query_row(
+                "SELECT status FROM fact_candidate WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status(clean), "shadow");
+        assert_eq!(status(unresolvable), "proposed");
+        assert_eq!(status(flagged), "proposed");
+        assert_eq!(status(commitment), "proposed");
+    }
+
+    /// Unknown is never clean: a tier value this build has never heard of
+    /// reads as shadow, not as reviewed.
+    #[test]
+    fn an_unknown_tier_reads_as_shadow() {
+        let conn = crate::db::open_memory().unwrap();
+        person(&conn, "p-vera", "Vera");
+        let uid = assert_fact(
+            &conn,
+            "p-vera",
+            "works_at",
+            None,
+            None,
+            "Vera works at the observatory",
+            None,
+            None,
+            0.9,
+            "user",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fact SET tier = 'tier-from-the-future' WHERE uid = ?1",
+            params![uid],
+        )
+        .unwrap();
+        assert!(get_fact_by_uid(&conn, &uid).unwrap().unwrap().is_shadow());
+    }
+
     /// The entity axis crosses classes, and finds candidates whose staged
     /// subject never named the entity at all.
     ///
@@ -1376,6 +2332,7 @@ mod tests {
                 valid_from: None,
                 confidence: Some(0.8),
                 tags: None,
+                ..Default::default()
             };
             propose_fact(&conn, &p, proposer, None).unwrap()
         };
@@ -1399,9 +2356,10 @@ mod tests {
             "the empty-subject candidate must be found by its statement"
         );
         assert!(
-            !found
-                .iter()
-                .any(|c| c.payload["statement"].as_str().unwrap().contains("sigtools")),
+            !found.iter().any(|c| c.payload["statement"]
+                .as_str()
+                .unwrap()
+                .contains("sigtools")),
             "someone else's candidate must not come back"
         );
 
@@ -1435,6 +2393,7 @@ mod tests {
                 valid_from: None,
                 confidence: Some(0.8),
                 tags: None,
+                ..Default::default()
             };
             propose_fact(&conn, &p, "llm", None).unwrap()
         };
@@ -1477,6 +2436,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.8),
             tags: None,
+            ..Default::default()
         };
         let id = propose_fact(&conn, &p, "llm", None).unwrap();
         assert_eq!(
@@ -1515,6 +2475,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.5),
             tags: None,
+            ..Default::default()
         };
         let cid = propose_fact(&conn, &p, "bee:suggested", None).unwrap();
         let err = accept_candidate_opts(&conn, cid, true, true).unwrap_err();
@@ -1582,6 +2543,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.8),
             tags: None,
+            ..Default::default()
         };
         let cid = propose_fact(&conn, &p, "llm", None).unwrap();
         let payload: String = conn
@@ -1633,6 +2595,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.5),
             tags: None,
+            ..Default::default()
         };
         let cid = propose_fact(&conn, &p, "bee:suggested", None).unwrap();
         record_verdict(
@@ -1691,19 +2654,12 @@ mod tests {
                 valid_from: None,
                 confidence: Some(0.5),
                 tags: None,
+                ..Default::default()
             };
             propose_fact(&conn, &p, proposer, None).unwrap();
         };
-        stage(
-            "bee:suggested",
-            "related_to",
-            "Ada prefers DIY approaches.",
-        );
-        stage(
-            "bee:suggested",
-            "related_to",
-            "Ada interrupts in meetings.",
-        );
+        stage("bee:suggested", "related_to", "Ada prefers DIY approaches.");
+        stage("bee:suggested", "related_to", "Ada interrupts in meetings.");
         stage("bee:suggested", "has_role", "Ada is a PI.");
         stage("llm", "related_to", "Ada uses SSO.");
 
@@ -1755,7 +2711,6 @@ mod tests {
         );
     }
 
-    use super::*;
     use crate::db::open_memory;
     use crate::graph::{upsert_node, Node};
 
@@ -1857,6 +2812,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.9),
             tags: None,
+            ..Default::default()
         };
         for i in 0..10 {
             let cid = propose_fact(&conn, &proposed, "llm", None).unwrap();
@@ -1902,6 +2858,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.9),
             tags: None,
+            ..Default::default()
         };
         // Same 10%-acceptance history as above.
         for i in 0..10 {
@@ -2465,6 +3422,181 @@ mod tests {
         assert_eq!((people, events), (16, 6));
     }
 
+    /// The leak, closed: a write whose predicate is a morphological variant
+    /// of a known one must LEARN an alias, not register a rival. Before the
+    /// stem rung was added here, `is_located_in` arriving through
+    /// `assert_fact` became vocabulary sitting beside seeded `located_in`.
+    #[test]
+    fn a_write_learns_an_alias_instead_of_registering_a_rival() {
+        let conn = open_memory().unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM predicate", [], |r| r.get(0))
+            .unwrap();
+
+        // `located_in` is seeded; the copula-prefixed form is a variant.
+        assert_eq!(
+            normalize_predicate(&conn, "is_located_in").unwrap(),
+            "located_in"
+        );
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM predicate", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, before, "the vocabulary must not have grown");
+        let learned: String = conn
+            .query_row(
+                "SELECT name FROM predicate_alias WHERE alias = 'is_located_in'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(learned, "located_in");
+
+        // A genuinely new relation still registers — a write must not fail
+        // because the vocabulary is short — but it is now the last resort.
+        assert_eq!(
+            normalize_predicate(&conn, "co_signed_a_lease_with").unwrap(),
+            "co_signed_a_lease_with"
+        );
+        let desc: String = conn
+            .query_row(
+                "SELECT description FROM predicate WHERE name = 'co_signed_a_lease_with'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(desc, "auto-registered", "and it is marked for review");
+    }
+
+    /// The hazard, reconstructed. A candidate stores its object as TEXT, so
+    /// a queue pending while a name is reassigned resolves, on accept, to
+    /// whoever holds that name now — here, a real student who would have
+    /// acquired a family relationship to a stranger.
+    #[test]
+    fn a_reassigned_name_is_rewritten_only_where_it_is_wrong() {
+        let conn = open_memory().unwrap();
+        let mk = |statement: &str, object: &str| {
+            let payload = serde_json::json!({
+                "subject": "Avery J Calder",
+                "predicate": "family_of",
+                "object": object,
+                "statement": statement,
+                "confidence": 1.0,
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, status, proposed_by) VALUES (?1, 'proposed', 'llm')",
+                params![payload],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let daughter = mk(
+            "Avery J Calder is the parent of Marisol B. Farrow.",
+            "Marisol B. Farrow",
+        );
+        let student = mk(
+            "Avery J Calder advised Marisol B. Farrow during her second year at Ostrander.",
+            "Marisol B. Farrow",
+        );
+        assert_eq!(candidates_naming(&conn, "Marisol B. Farrow").unwrap(), 2);
+
+        // Dry run writes nothing.
+        let preview = retext_candidates(
+            &conn,
+            "Marisol B. Farrow",
+            "Marisol Calder",
+            &[student],
+            true,
+        )
+        .unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(candidates_naming(&conn, "Marisol B. Farrow").unwrap(), 2);
+
+        let changed = retext_candidates(
+            &conn,
+            "Marisol B. Farrow",
+            "Marisol Calder",
+            &[student],
+            false,
+        )
+        .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, daughter);
+
+        // Both the statement AND the object field move, because the object
+        // is what resolves to a node on accept — rewriting only the prose
+        // would leave the dangerous half untouched.
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM fact_candidate WHERE id = ?1",
+                params![daughter],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["object"], "Marisol Calder");
+        assert!(v["statement"].as_str().unwrap().contains("Marisol Calder"));
+
+        // The one that really means the student is untouched.
+        let kept: String = conn
+            .query_row(
+                "SELECT payload FROM fact_candidate WHERE id = ?1",
+                params![student],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(kept.contains("Marisol B. Farrow"));
+    }
+
+    /// Accepted candidates are history, not a queue: they already became
+    /// facts with real node ids, and their statement records what a source
+    /// said. Only `proposed` rows are repairable.
+    #[test]
+    fn retexting_never_touches_a_decided_candidate() {
+        let conn = open_memory().unwrap();
+        let payload =
+            serde_json::json!({"statement": "about Old Name", "subject": "Old Name"}).to_string();
+        for status in ["accepted", "rejected"] {
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, status, proposed_by) VALUES (?1, ?2, 'llm')",
+                params![payload, status],
+            )
+            .unwrap();
+        }
+        let changed = retext_candidates(&conn, "Old Name", "New Name", &[], false).unwrap();
+        assert!(changed.is_empty());
+        let untouched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_candidate WHERE payload LIKE '%Old Name%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 2);
+    }
+
+    /// A name with a quote in it must not corrupt the JSON of the row this
+    /// is repairing — which is why the payload is parsed rather than
+    /// string-replaced.
+    #[test]
+    fn a_name_containing_a_quote_survives_the_rewrite() {
+        let conn = open_memory().unwrap();
+        let payload =
+            serde_json::json!({"statement": "about O\"Brien here", "subject": "O\"Brien"})
+                .to_string();
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, status, proposed_by) VALUES (?1, 'proposed', 'llm')",
+            params![payload],
+        )
+        .unwrap();
+        retext_candidates(&conn, "O\"Brien", "O'Brien", &[], false).unwrap();
+        let out: String = conn
+            .query_row("SELECT payload FROM fact_candidate", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(v["subject"], "O'Brien");
+    }
+
     #[test]
     fn test_predicate_alias_normalization() {
         let conn = setup();
@@ -2567,6 +3699,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.8),
             tags: Some("recommendation".into()),
+            ..Default::default()
         };
         let cid = propose_fact(&conn, &proposed, "agent:hermes", None).unwrap();
 
@@ -2620,5 +3753,109 @@ mod tests {
         let contradictions = live_contradictions(&conn).unwrap();
         assert_eq!(contradictions.len(), 1);
         assert_eq!(contradictions[0].0, "nadia");
+    }
+
+    /// `bind` fixes the commonest accept failure and teaches the graph the
+    /// spelling, so the failure does not recur.
+    ///
+    /// The scenario is #4499 verbatim: an extractor writes "John Kulvicki",
+    /// the graph holds a nearly-identical node, `accept` fails with `cannot
+    /// resolve subject`, and before this the only way through was another
+    /// program. After a bind: the candidate accepts, and a SECOND candidate
+    /// arriving with the same wrong spelling resolves on its own through the
+    /// learned alias — the half of the fix with a future.
+    #[test]
+    fn bind_rebinds_the_subject_and_the_alias_prevents_the_recurrence() {
+        let conn = setup();
+        // A middle initial is the real shape of #4499: "John Kulvicki" is
+        // not a substring of "John V. Kulvicki", so even the fuzzy LIKE
+        // tier cannot resolve it.
+        crate::graph::upsert_node(
+            &conn,
+            &crate::graph::Node::new("jk", "person", "John V. Kulvicki"),
+        )
+        .unwrap();
+        let stage = |stmt: &str| {
+            propose_fact(
+                &conn,
+                &ProposedFact {
+                    subject: "John Kulvicki".into(),
+                    predicate: "works_on".into(),
+                    object: None,
+                    object_value: Some("chairing Philosophy".into()),
+                    statement: stmt.into(),
+                    valid_from: None,
+                    confidence: Some(0.9),
+                    tags: None,
+                    ..Default::default()
+                },
+                "llm",
+                None,
+            )
+            .unwrap()
+        };
+        let cid = stage("John Kulvicki chairs the Philosophy department.");
+        let err = accept_candidate(&conn, cid).unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot resolve subject"),
+            "the failure this exists for: {err}"
+        );
+
+        // Bound by explicit name — the CLI's `--to`. (Whether the top
+        // *suggestion* would also have found it is `suggest_entities`'
+        // business, tested where it lives.)
+        let (old, new) = bind_subject(&conn, cid, Some("John V. Kulvicki")).unwrap();
+        assert_eq!(old, "John Kulvicki");
+        assert_eq!(new, "John V. Kulvicki");
+        accept_candidate(&conn, cid).expect("bound subject accepts");
+
+        // The alias outlives the bind: the same wrong spelling now resolves
+        // without anyone binding anything.
+        let cid2 = stage("John Kulvicki also teaches aesthetics.");
+        accept_candidate(&conn, cid2).expect("the alias makes the next one resolve on its own");
+    }
+
+    /// The refusals, each by name — a bind that guesses is worse than none.
+    #[test]
+    fn bind_refuses_rather_than_guessing() {
+        let conn = setup();
+        crate::graph::upsert_node(
+            &conn,
+            &crate::graph::Node::new("n1", "person", "Nadia Habib"),
+        )
+        .unwrap();
+        let cid = propose_fact(
+            &conn,
+            &ProposedFact {
+                subject: "Nadia Habib".into(),
+                predicate: "works_on".into(),
+                object: None,
+                object_value: Some("x".into()),
+                statement: "resolves already".into(),
+                valid_from: None,
+                confidence: Some(0.9),
+                tags: None,
+                ..Default::default()
+            },
+            "llm",
+            None,
+        )
+        .unwrap();
+        let err = bind_subject(&conn, cid, None).unwrap_err();
+        assert!(format!("{err}").contains("already resolves"), "{err}");
+        let err = bind_subject(&conn, cid, Some("Nobody Anywhere")).unwrap_err();
+        assert!(format!("{err}").contains("resolves to nothing"), "{err}");
+        let err = bind_subject(&conn, 999_999, None).unwrap_err();
+        assert!(format!("{err}").contains("no pending candidate"), "{err}");
+    }
+
+    /// A pronoun subject binds without becoming an alias — "they" as an
+    /// alias would resolve every future "they" to one person forever.
+    #[test]
+    fn a_pronoun_never_becomes_an_alias() {
+        assert!(!alias_worthy("they"));
+        assert!(!alias_worthy("it"));
+        assert!(!alias_worthy("the department"));
+        assert!(alias_worthy("John Kulvicki"));
     }
 }

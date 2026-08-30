@@ -228,6 +228,13 @@ pub fn hybrid_episodes(
 /// tiers exactly as in [`hybrid_episodes`]: derived facts inherit their
 /// evidence's sensitivity (V008), so a belief extracted from a private Bee
 /// transcript is filtered out of default retrieval along with the transcript.
+/// How much of a shadow fact's fused score survives the tier discount.
+/// Applied after RRF fusion and the liveness/sensitivity retains, before
+/// the final truncation — deep enough that a strongly relevant shadow
+/// fact still makes the pack (and thereby earns its review), shallow
+/// enough that it never displaces a reviewed fact of equal relevance.
+pub const SHADOW_DISCOUNT: f64 = 0.8;
+
 pub fn hybrid_facts(
     conn: &Connection,
     embedder: Option<&Embedder>,
@@ -273,6 +280,28 @@ pub fn hybrid_facts(
             allowed.insert(id?);
         }
         hits.retain(|h| allowed.contains(&h.id));
+    }
+
+    // Tier discount (review-on-use, V021): shadow facts ARE served — an
+    // unserved fact can never earn review, and demand is the only honest
+    // review trigger — but a shadow fact must never outrank a reviewed
+    // fact at equal relevance, which any multiplier below 1.0 guarantees.
+    // The filter is `tier <> 'reviewed'`, not `= 'shadow'`: an unknown
+    // tier is unreviewed until proven otherwise.
+    {
+        let mut shadow: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut stmt = conn.prepare_cached("SELECT id FROM fact WHERE tier <> 'reviewed'")?;
+        for id in stmt.query_map([], |r| r.get::<_, i64>(0))? {
+            shadow.insert(id?);
+        }
+        if !shadow.is_empty() {
+            for h in hits.iter_mut() {
+                if shadow.contains(&h.id) {
+                    h.score *= SHADOW_DISCOUNT;
+                }
+            }
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        }
     }
     hits.truncate(k);
     Ok(hits)
@@ -428,6 +457,62 @@ mod tests {
             ids,
             vec![id_of(&keep)],
             "all three retraction semantics must remove a fact from retrieval"
+        );
+    }
+
+    #[test]
+    fn a_shadow_fact_is_served_but_never_outranks_a_reviewed_one() {
+        // Review-on-use: an unserved fact can never earn review, so shadow
+        // facts must appear — discounted. The shadow fact is inserted
+        // FIRST so that without the discount it would win the tie.
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("ada", "person", "Ada")).unwrap();
+        upsert_node(&conn, &Node::new("iris", "person", "Iris")).unwrap();
+        let shadow = crate::fact::assert_fact(
+            &conn,
+            "ada",
+            "works_on",
+            None,
+            Some("the reef survey"),
+            "Ada charts the reef survey transects",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fact SET tier = 'shadow' WHERE uid = ?1",
+            params![shadow],
+        )
+        .unwrap();
+        let reviewed = crate::fact::assert_fact(
+            &conn,
+            "iris",
+            "works_on",
+            None,
+            Some("the reef survey"),
+            "Iris charts the reef survey transects",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+
+        let hits = hybrid_facts(&conn, None, "reef survey transects", true, 10).unwrap();
+        let uid_of = |id: i64| -> String {
+            conn.query_row("SELECT uid FROM fact WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let uids: Vec<String> = hits.iter().map(|h| uid_of(h.id)).collect();
+        assert!(uids.contains(&shadow), "shadow facts must still be served");
+        assert_eq!(
+            uids.first(),
+            Some(&reviewed),
+            "at equal relevance the reviewed fact must rank first"
         );
     }
 

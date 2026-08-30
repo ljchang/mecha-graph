@@ -23,6 +23,33 @@ pub struct TaskItem {
     pub project: Option<String>,
     /// Who this waits on (live `waiting_on` fact), if anyone.
     pub waiting_on: Option<String>,
+    /// The agent conversation that worked this task, if one has.
+    ///
+    /// An **attribute, not an edge**, and the distinction was argued rather
+    /// than defaulted to. The obvious alternative is a fact pointing at the
+    /// session's episode — but an episode is evidence of what happened, so it
+    /// exists only after the run *and* only if the distiller judged the run
+    /// worth remembering, which it deliberately does not for "smoke tests,
+    /// one-line lookups, greetings, aborted or purely mechanical runs". Those
+    /// are exactly the runs a person most wants to click back into, so an
+    /// edge-based link would be missing precisely where it is needed.
+    ///
+    /// It is also the more general of the two: the episode's idempotence key
+    /// *is* the session id, so holding this finds the episode too, whenever
+    /// one appears. The edge remains available later as an addition — it
+    /// answers a different question (traversal and provenance) and so cannot
+    /// disagree with this one.
+    pub session: Option<String>,
+    /// What the task was captured *from* — the email that asked, the
+    /// stranger's request, the conversation it fell out of. See
+    /// [`set_task_captured_from`] for the shape and why it is a pointer.
+    ///
+    /// Absent when there is none, and that is the honest answer rather than a
+    /// gap: a task typed into the board was captured *here*, so a
+    /// `{"kind": "manual"}` placeholder would be a link that goes nowhere. A
+    /// surface shows the way back only when there is one. Same rule as
+    /// [`TaskItem::session`], one field over.
+    pub captured_from: Option<serde_json::Value>,
 }
 
 /// All tasks, actionable statuses first then by due date. `include_closed`
@@ -31,6 +58,8 @@ pub fn list_tasks(conn: &Connection, include_closed: bool) -> Result<Vec<TaskIte
     let mut stmt = conn.prepare_cached(
         "SELECT n.id, n.name, td.status, td.task_type, td.due_at, td.defer_until,
                 td.context_tag, td.completed_at,
+                json_extract(n.properties, '$.session'),
+                json_extract(n.properties, '$.captured_from'),
                 (SELECT p.name FROM nodes p WHERE p.id = td.parent_id),
                 (SELECT pn.name FROM fact_current f JOIN nodes pn ON pn.id = f.object_id
                  WHERE f.subject_id = n.id AND f.predicate = 'waiting_on' LIMIT 1)
@@ -53,8 +82,16 @@ pub fn list_tasks(conn: &Connection, include_closed: bool) -> Result<Vec<TaskIte
                 defer_until: r.get(5)?,
                 context_tag: r.get(6)?,
                 completed_at: r.get(7)?,
-                project: r.get(8)?,
-                waiting_on: r.get(9)?,
+                session: r.get(8)?,
+                // `json_extract` hands back an object as a TEXT of JSON, so
+                // it is re-parsed here rather than passed on as a string —
+                // a caller handed `"{\"kind\":\"mail\"}"` would have to
+                // parse it itself, and one of them would forget.
+                captured_from: r
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
+                project: r.get(10)?,
+                waiting_on: r.get(11)?,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -156,6 +193,276 @@ pub fn update_task_schedule(
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     Ok(())
+}
+
+/// Record which agent conversation worked a task, or clear it with `""`.
+///
+/// Written by the harness, never derived: mecha knows its own session id at
+/// run start and this is where it puts it, so "open the conversation" is one
+/// read rather than a traversal through a node that may not exist. See
+/// [`TaskItem::session`] for why this is an attribute and not an edge.
+pub fn set_task_session(conn: &Connection, node_id: &str, session: &str) -> Result<()> {
+    let mut node = match crate::graph::get_node(conn, node_id)? {
+        Some(n) => n,
+        None => return Err(Error::Other(format!("{node_id} is not a node"))),
+    };
+    if node.node_type != "task" {
+        return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+    let session = session.trim();
+    if session.is_empty() {
+        if let serde_json::Value::Object(ref mut map) = node.properties {
+            map.remove("session");
+        }
+    } else {
+        node.set_property("session", serde_json::json!(session));
+    }
+    crate::graph::upsert_node(conn, &node)?;
+    Ok(())
+}
+
+/// The kinds of thing a task can be captured from, and the whole set of them.
+///
+/// **Closed on purpose**, the same rule that makes the mail surface's triage
+/// actions an enum: a free-form kind is one a surface cannot open, so the
+/// board would grow rows offering a way back that dead-ends. Adding a kind is
+/// a line here *plus* a reader that can follow it, and the two have to arrive
+/// together — which is why `slack` is absent despite being an obvious source.
+/// Nothing on this side can render a Slack thread, so accepting the kind would
+/// buy a row with a button that opens nothing, which is worse than the plain
+/// absence this whole field exists to fix.
+pub const CAPTURE_KINDS: &[&str] = &["mail", "frontdoor", "session"];
+
+/// The keys a capture pointer may carry. Everything else is refused.
+const CAPTURE_KEYS: &[&str] = &["kind", "id", "account", "label", "at"];
+
+/// A label is a subject line somebody else wrote. Capped at the door rather
+/// than refused, on the image rule: the caller with a pathological one still
+/// has a real task to capture, and losing it over a long subject is the worse
+/// failure. Whole graphemes are not worth the dependency here — this is a
+/// recognisable handle in a list, not a document.
+const LABEL_MAX: usize = 200;
+
+/// Record what a task was captured from, or clear it with `None`.
+///
+/// The shape is a small typed pointer and deliberately nothing more:
+///
+/// ```json
+/// {"kind": "mail", "account": "ostrander", "id": "<thread_id>",
+///  "label": "SAS 2027 award nominations", "at": "2026-08-11T14:02:00Z"}
+/// ```
+///
+/// **A pointer, never a copy, and the key list is what enforces it.** The
+/// obvious convenience is to store the email's body alongside — one read, no
+/// provider round-trip, works offline. It is the wrong trade twice over: the
+/// graph would become a store of other people's words that everything reading
+/// it treats as belief, and the copy would go stale against the thread it
+/// names, so a person clicking through to "the original" would be shown
+/// something the original no longer says. Refusing unknown keys makes that a
+/// property of the store instead of a convention somebody remembers — a
+/// caller that tries to put a `body` here is told no.
+///
+/// `label` is **prose somebody else chose** and is stored as a handle for a
+/// human reading a list, exactly as the mail triage record's `subject` is. It
+/// is not evidence about anything and must not be reasoned about.
+///
+/// Written by whatever captured the task, never derived — the harness that
+/// read the mail knows the thread id at the moment it creates the task, and
+/// reconstructing it afterwards by matching subject lines is a guess. Same
+/// argument as [`set_task_session`], one field over.
+pub fn set_task_captured_from(
+    conn: &Connection,
+    node_id: &str,
+    captured_from: Option<&serde_json::Value>,
+) -> Result<()> {
+    let mut node = match crate::graph::get_node(conn, node_id)? {
+        Some(n) => n,
+        None => return Err(Error::Other(format!("{node_id} is not a node"))),
+    };
+    if node.node_type != "task" {
+        return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+    match captured_from {
+        None => {
+            if let serde_json::Value::Object(ref mut map) = node.properties {
+                map.remove("captured_from");
+            }
+        }
+        Some(value) => {
+            node.set_property("captured_from", validate_captured_from(value)?);
+        }
+    }
+    crate::graph::upsert_node(conn, &node)?;
+    Ok(())
+}
+
+/// Bounce a malformed pointer rather than storing it — `parse_due`'s rule,
+/// and it matters more here: a stored pointer nothing can follow looks
+/// exactly like provenance right up until somebody clicks it.
+fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| Error::Other("captured_from must be an object".into()))?;
+    if let Some(key) = object.keys().find(|k| !CAPTURE_KEYS.contains(&k.as_str())) {
+        return Err(Error::Other(format!(
+            "captured_from has no '{key}' field — it holds a pointer ({}), never a copy of \
+             what it points at",
+            CAPTURE_KEYS.join(", ")
+        )));
+    }
+    let mut out = serde_json::Map::new();
+    for key in CAPTURE_KEYS {
+        let Some(raw) = object.get(*key) else {
+            continue;
+        };
+        let text = raw
+            .as_str()
+            .ok_or_else(|| Error::Other(format!("captured_from.{key} must be a string")))?
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let text = if *key == "label" && text.chars().count() > LABEL_MAX {
+            let cut: String = text.chars().take(LABEL_MAX - 1).collect();
+            format!("{cut}…")
+        } else {
+            text.to_string()
+        };
+        out.insert((*key).to_string(), serde_json::json!(text));
+    }
+    let kind = out
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Other("captured_from needs a `kind`".into()))?;
+    if !CAPTURE_KINDS.contains(&kind) {
+        return Err(Error::Other(format!(
+            "captured_from.kind '{kind}' is not one of: {}",
+            CAPTURE_KINDS.join(", ")
+        )));
+    }
+    // Without an id there is nothing to open, and a kind alone would render a
+    // "read the original" affordance over no original at all.
+    if !out.contains_key("id") {
+        return Err(Error::Other(format!(
+            "captured_from needs an `id` — which {kind} it came from"
+        )));
+    }
+    // Thread ids are account-scoped, so a mail pointer without its account
+    // names a thread in whichever mailbox the reader happens to ask first.
+    if kind == "mail" && !out.contains_key("account") {
+        return Err(Error::Other(
+            "captured_from.kind 'mail' needs an `account` — thread ids are account-scoped".into(),
+        ));
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
+/// The stand-in for whoever this graph is about, usable wherever a
+/// `waiting_on` name is taken.
+///
+/// A literal rather than a lookup at the call site, because the callers that
+/// need it are harnesses handing work back to a person, and a person's name is
+/// exactly the thing a harness should not be carrying around.
+pub const OWNER: &str = "@owner";
+
+/// Point a task's `waiting_on` at a node, or clear it with `""`.
+///
+/// `@owner` ([`OWNER`]) resolves to whoever the graph is about.
+///
+/// **The delegation half of the board.** OmniFocus's insight is that
+/// delegation is a status which suppresses an item from "what can I do now"
+/// while keeping it reviewable, and `waiting` + `waiting_on` already is that —
+/// this gives it an object the harness can set, so a task handed to the agent
+/// is visibly held by the agent rather than merely "waiting" for reasons the
+/// board cannot state.
+///
+/// Two rules carried from elsewhere in this file. The name must **resolve to
+/// a node that already exists**, exactly as `create_task` requires of a
+/// project: an implicit node on a typo is how a graph fills with junk, and
+/// here it would also mean "waiting on Nadai" silently becoming a real
+/// person. And the previous belief is **invalidated, never deleted** — one
+/// live fact per (subject, predicate, object) is the schema's rule, and who
+/// used to have the ball is exactly the history a bi-temporal store is for.
+///
+/// Returns the resolved name, or `None` when the field was cleared.
+pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Result<Option<String>> {
+    let is_task: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if !is_task {
+        return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+
+    // **Resolve before retiring anything.** Retiring first and resolving after
+    // means a typo does not merely fail — it *clears* who actually had the
+    // ball, so `waiting_on: "Nadai"` silently turns "Nadia owes me this" into
+    // "nobody owes me this" and the error message says nothing about what was
+    // lost. Found by the test written for the typo protection, which is a
+    // fair description of how that protection was incomplete.
+    let who = who.trim();
+    let target = if who.is_empty() {
+        None
+    } else if who == OWNER {
+        // **The one name a caller cannot be expected to know.** A harness
+        // handing a task back says "this is yours now", and making it look up
+        // the owner's actual name first would mean shipping that name into
+        // config on every machine — and getting it wrong the day it changes.
+        // The graph already records who it is about (`owner_node`, an explicit
+        // mark rather than a heuristic), so this asks it.
+        match crate::graph::owner_node(conn)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(
+                    "this graph has no owner set, so `@owner` names nobody — \
+                     `mecha-graph owner <node>` marks one"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        match crate::graph::resolve_entity(conn, who)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(format!(
+                    "no node matches '{who}' — waiting_on must name someone the graph already knows"
+                )))
+            }
+        }
+    };
+
+    // Now that the answer is known, retire the old belief. Clearing and
+    // re-pointing are the same operation from here, so neither can leave two
+    // live claims about who owes this.
+    conn.execute(
+        "UPDATE fact SET invalidated_at = datetime('now')
+          WHERE subject_id = ?1 AND predicate = 'waiting_on'
+            AND valid_to IS NULL AND invalidated_at IS NULL",
+        params![node_id],
+    )?;
+
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let task_name: String = conn.query_row(
+        "SELECT name FROM nodes WHERE id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    crate::fact::assert_fact(
+        conn,
+        node_id,
+        "waiting_on",
+        Some(&target.id),
+        None,
+        &format!("{task_name} is waiting on {}", target.name),
+        None,
+        None,
+        1.0,
+        "manual",
+    )?;
+    Ok(Some(target.name))
 }
 
 /// Move a task through its lifecycle. Sets/clears `completed_at` so 'done'
@@ -504,6 +811,105 @@ mod tests {
 
         assert!(set_task_status(&conn, "t1", "someday").is_err());
         assert!(set_task_status(&conn, "nope", "done").is_err());
+    }
+
+    /// What a task was captured from, and the four ways a pointer is refused.
+    ///
+    /// The refusals are the test: a stored pointer nothing can follow renders
+    /// a "read the original" affordance over nothing, which is worse than the
+    /// absence this feature exists to fix.
+    #[test]
+    fn a_task_remembers_what_it_was_captured_from() {
+        let conn = open_memory().unwrap();
+        let id = create_task(&conn, "Decide on the award nominations", None, None, None).unwrap();
+
+        // A task nobody captured from anywhere names nothing — the honest
+        // answer for one typed into the board, and no button on the card.
+        assert!(
+            list_tasks(&conn, false).unwrap()[0].captured_from.is_none(),
+            "a hand-captured task has no provenance to show"
+        );
+
+        let mail = serde_json::json!({
+            "kind": "mail",
+            "account": "ostrander",
+            "id": "thread-19a2f",
+            "label": "SAS 2027 award nominations",
+            "at": "2026-08-11T14:02:00Z",
+        });
+        set_task_captured_from(&conn, &id, Some(&mail)).unwrap();
+        let got = list_tasks(&conn, false).unwrap()[0]
+            .captured_from
+            .clone()
+            .expect("the pointer survives the round trip");
+        assert_eq!(got["kind"], "mail");
+        assert_eq!(got["account"], "ostrander");
+        assert_eq!(got["id"], "thread-19a2f");
+        assert_eq!(got["label"], "SAS 2027 award nominations");
+
+        // A copy is refused, which is what keeps this a pointer. The graph is
+        // not where other people's words live.
+        let with_body = serde_json::json!({
+            "kind": "mail", "account": "ostrander", "id": "t", "body": "Dear Ada, …",
+        });
+        assert!(set_task_captured_from(&conn, &id, Some(&with_body)).is_err());
+
+        // A kind no surface can open, and a kind with nothing to open.
+        assert!(set_task_captured_from(
+            &conn,
+            &id,
+            Some(&serde_json::json!({"kind": "fax", "id": "1"}))
+        )
+        .is_err());
+        assert!(
+            set_task_captured_from(&conn, &id, Some(&serde_json::json!({"kind": "mail"}))).is_err()
+        );
+        // Thread ids are account-scoped; without one this names a thread in
+        // whichever mailbox the reader asks first.
+        assert!(set_task_captured_from(
+            &conn,
+            &id,
+            Some(&serde_json::json!({"kind": "mail", "id": "t"}))
+        )
+        .is_err());
+
+        // A refused pointer leaves the good one standing rather than half-
+        // writing over it.
+        assert_eq!(
+            list_tasks(&conn, false).unwrap()[0]
+                .captured_from
+                .as_ref()
+                .unwrap()["id"],
+            "thread-19a2f"
+        );
+
+        // A subject line is somebody else's prose: capped at the door, like an
+        // image, because the caller still has a real task to capture.
+        let long = "x".repeat(500);
+        set_task_captured_from(
+            &conn,
+            &id,
+            Some(&serde_json::json!({"kind": "frontdoor", "id": "41", "label": long})),
+        )
+        .unwrap();
+        let label = list_tasks(&conn, false).unwrap()[0]
+            .captured_from
+            .clone()
+            .unwrap()["label"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(label.chars().count(), LABEL_MAX);
+        assert!(label.ends_with('…'));
+
+        // Cleared, and the session it may sit beside is untouched.
+        set_task_session(&conn, &id, "20260826T101804-476080dd").unwrap();
+        set_task_captured_from(&conn, &id, None).unwrap();
+        let row = &list_tasks(&conn, false).unwrap()[0];
+        assert!(row.captured_from.is_none());
+        assert_eq!(row.session.as_deref(), Some("20260826T101804-476080dd"));
+
+        assert!(set_task_captured_from(&conn, "task-nope", Some(&mail)).is_err());
     }
 
     #[test]

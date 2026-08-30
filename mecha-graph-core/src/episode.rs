@@ -266,6 +266,56 @@ pub fn episodes_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result
     Ok(eps)
 }
 
+/// Every (name, node, weak) the scanner may match, with the ambiguity guard
+/// already applied. Shared by the live linker and the reconcile pass so a
+/// backfill cannot judge against a different vocabulary than the one that
+/// made the mentions.
+///
+/// `weak` marks a match reachable only through a bare first name. That is
+/// the one alias kind that says nothing about *which* person is meant, and
+/// it is the exact mechanism behind the 2026-08-24 repair: a student seen
+/// once on a calendar invitation carried the alias "marisol", so a
+/// thousand kitchen conversations about somebody's toddler landed on her
+/// node — silently, because a first name held by exactly ONE node passes
+/// the ambiguity guard. Canonical names stay strong however short they
+/// are; matching "flowmail" or "tidelab" is distinctive, not a guess.
+/// MAX(weak) is the conservative fold: a name reachable both ways is
+/// treated as the weaker of the two.
+fn alias_pairs(conn: &Connection) -> Result<Vec<(String, String, bool)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, MIN(nid), MAX(weak) FROM (
+             SELECT a.alias AS name, a.node_id AS nid, a.source = 'firstname' AS weak
+             FROM node_alias a
+             UNION ALL
+             SELECT n.canonical_name, n.id, 0 FROM nodes n
+             WHERE n.node_type NOT IN ('event','event_series','document','artifact')
+         ) WHERE length(name) >= 3
+         GROUP BY name HAVING COUNT(DISTINCT nid) = 1",
+    )?;
+    let pairs: Vec<(String, String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(pairs)
+}
+
+/// Whole-word containment. Shared for the same reason as `alias_pairs`:
+/// a reconcile that matched differently from the linker would retract
+/// mentions the live path would still make.
+fn appears_in(body_lower: &str, alias: &str) -> bool {
+    let is_boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+    let mut start = 0;
+    while let Some(pos) = body_lower[start..].find(alias) {
+        let abs = start + pos;
+        let before = body_lower[..abs].chars().next_back();
+        let after = body_lower[abs + alias.len()..].chars().next();
+        if is_boundary(before) && is_boundary(after) {
+            return true;
+        }
+        start = abs + alias.len();
+    }
+    false
+}
+
 /// Cheap alias-scan linker: match known `node_alias` values against an episode
 /// body (word-boundary, case-insensitive) and record mentions. This is what
 /// makes calendar-seeded aliases pay off for name-only sources like Bee (§5.1).
@@ -283,40 +333,216 @@ pub fn link_by_alias_scan(conn: &Connection, episode_id: i64, body: &str) -> Res
     // only), so text mentions of "flowmail" produced no mention edges and
     // entity-filtered retrieval silently excluded those episodes. Event/
     // document names stay out — matching meeting titles in prose is noise.
-    let mut stmt = conn.prepare_cached(
-        "SELECT name, MIN(nid) FROM (
-             SELECT a.alias AS name, a.node_id AS nid FROM node_alias a
-             UNION
-             SELECT n.canonical_name, n.id FROM nodes n
-             WHERE n.node_type NOT IN ('event','event_series','document','artifact')
-         ) WHERE length(name) >= 3
-         GROUP BY name HAVING COUNT(DISTINCT nid) = 1",
-    )?;
-    let pairs: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
+    // `weak` marks a match reachable only through a bare first name. That is
+    // the one alias kind that says nothing about *which* person is meant,
+    // and it is the exact mechanism behind the 2026-08-24 repair: a student
+    // seen once on a calendar invitation carried the alias "marisol", so a
+    // thousand kitchen conversations about somebody's toddler landed on her
+    // node — silently, because a first name held by exactly ONE node passes
+    // the ambiguity guard below. Canonical names stay strong however short
+    // they are; matching "flowmail" or "tidelab" is distinctive, not a
+    // guess. MAX(weak) is the conservative fold: a name reachable both ways
+    // is treated as the weaker of the two.
+    let pairs = alias_pairs(conn)?;
 
-    let is_boundary = |c: Option<char>| c.map_or(true, |c| !c.is_alphanumeric());
-    let mut n = 0;
-    for (alias, node_id) in pairs {
-        let mut start = 0;
-        let mut hit = false;
-        while let Some(pos) = body_lower[start..].find(&alias) {
-            let abs = start + pos;
-            let before = body_lower[..abs].chars().next_back();
-            let after = body_lower[abs + alias.len()..].chars().next();
-            if is_boundary(before) && is_boundary(after) {
-                hit = true;
-                break;
-            }
-            start = abs + alias.len();
-        }
-        if hit {
-            add_mention(conn, episode_id, &node_id, "alias", 0.8)?;
-            n += 1;
-        }
+    let appears = |alias: &str| appears_in(&body_lower, alias);
+
+    let verdict = alias_verdict(conn, episode_id, &pairs, &appears)?;
+    let n = verdict.keep.len();
+    for node_id in &verdict.keep {
+        add_mention(conn, episode_id, node_id, "alias", 0.8)?;
+    }
+    for (alias, node_id) in &verdict.refuse {
+        // Refused, and recorded. A first name that keeps appearing and can
+        // never be corroborated is not noise — it is a person the graph has
+        // no node for, which is the only cheap signal there is for an entity
+        // that is missing rather than wrong.
+        conn.execute(
+            "INSERT OR IGNORE INTO unlinked_mention (alias, node_id, episode_id)
+             VALUES (?1, ?2, ?3)",
+            params![alias, node_id, episode_id],
+        )?;
     }
     Ok(n)
+}
+
+/// What the linker believes about one episode: which nodes it links, and
+/// which weak matches it refuses.
+pub struct AliasVerdict {
+    pub keep: Vec<String>,
+    /// (alias text, node it would have linked to)
+    pub refuse: Vec<(String, String)>,
+}
+
+/// The linker's decision, factored out so that ADDING mentions and
+/// RECONCILING existing ones cannot disagree about what it believes. Two
+/// implementations of "should this link" is how a backfill ends up
+/// retracting things the live path would still make.
+///
+/// Two passes, and the order is the whole mechanism. Strong matches commit
+/// first and become the context a weak match is judged against:
+/// "Marisol" in an episode that already mentions Avery, Ingrid and Wren
+/// means the daughter; the same word in an episode with no connection to
+/// her means nothing anyone can act on.
+fn alias_verdict(
+    conn: &Connection,
+    episode_id: i64,
+    pairs: &[(String, String, bool)],
+    appears: &dyn Fn(&str) -> bool,
+) -> Result<AliasVerdict> {
+    let mut keep: Vec<String> = Vec::new();
+    for (alias, node_id, weak) in pairs {
+        if !*weak && appears(alias) {
+            keep.push(node_id.clone());
+        }
+    }
+    let strong = keep.clone();
+    let mut refuse = Vec::new();
+    for (alias, node_id, weak) in pairs {
+        if !*weak || !appears(alias) {
+            continue;
+        }
+        if corroborates(conn, episode_id, node_id, &strong)? {
+            keep.push(node_id.clone());
+        } else {
+            refuse.push((alias.clone(), node_id.clone()));
+        }
+    }
+    Ok(AliasVerdict { keep, refuse })
+}
+
+/// Re-judge the alias mentions already on file against the corroboration
+/// rule, and report (or retract) the ones it would no longer make.
+///
+/// The gate guards new links; every mention made before it existed was
+/// made under the old rule, which committed any unambiguous alias match.
+/// 18,720 of them on this graph — including the thousand that put one
+/// person's decade onto another person's node. A gate that only applies
+/// going forward leaves the damage it was written for exactly where it is.
+///
+/// **Reporting is the default and `apply` is opt-in**, the opposite of
+/// `promote_human_names`. That verb's `--dry-run` defaults to false and it
+/// rewrote seven nodes for somebody who ran it expecting a survey; a pass
+/// that can retract thousands of mentions should not be able to do that.
+///
+/// One alias mention the reconcile would no longer make.
+pub struct Retraction {
+    pub alias: String,
+    pub node_id: String,
+    pub episode_id: i64,
+}
+
+/// Returns (episodes examined, mentions that would be or were retracted).
+pub fn relink_alias_mentions(
+    conn: &Connection,
+    apply: bool,
+    limit: Option<i64>,
+) -> Result<(usize, Vec<Retraction>)> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT e.id, e.body FROM episode e
+         JOIN mention m ON m.episode_id = e.id AND m.extractor = 'alias'
+         ORDER BY e.id LIMIT ?1",
+    )?;
+    let episodes: Vec<(i64, String)> = stmt
+        .query_map(params![limit.unwrap_or(i64::MAX)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let pairs = alias_pairs(conn)?;
+    let mut retracted = Vec::new();
+    for (episode_id, body) in &episodes {
+        let body_lower = body.to_lowercase();
+        let appears = |alias: &str| appears_in(&body_lower, alias);
+        let verdict = alias_verdict(conn, *episode_id, &pairs, &appears)?;
+        for (alias, node_id) in verdict.refuse {
+            // Only retract what is actually on file as an alias mention.
+            // The verdict speaks about what the linker WOULD do; a node it
+            // refuses that was never linked needs no retraction, and
+            // counting it would inflate the report.
+            let present: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM mention
+                  WHERE episode_id = ?1 AND node_id = ?2 AND extractor = 'alias')",
+                params![episode_id, node_id],
+                |r| r.get(0),
+            )?;
+            if !present {
+                continue;
+            }
+            if apply {
+                conn.execute(
+                    "DELETE FROM mention WHERE episode_id = ?1 AND node_id = ?2
+                     AND extractor = 'alias'",
+                    params![episode_id, node_id],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO unlinked_mention (alias, node_id, episode_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![alias, node_id, episode_id],
+                )?;
+            }
+            retracted.push(Retraction {
+                alias,
+                node_id,
+                episode_id: *episode_id,
+            });
+        }
+    }
+    Ok((episodes.len(), retracted))
+}
+
+/// Does anything about this episode support a bare-first-name match?
+///
+/// Two signals, either sufficient, both answerable from data already here:
+///
+/// - **Company.** The episode already mentions someone this node has a live
+///   fact with. Everything the graph knows about who goes with whom is in
+///   that table, and it is what separates a daughter from a stranger who
+///   shares her name.
+/// - **Familiarity.** The node has been mentioned before from this kind of
+///   source. Somebody who turns up in your conversations has turned up
+///   there before; somebody known only from one calendar invitation has not.
+///
+/// Deliberately permissive — one signal is enough. The cost of a false
+/// negative is an unlinked mention, which is recoverable and now recorded;
+/// the cost of a false positive is a decade of somebody's life filed under
+/// the wrong person, which took a day to undo.
+fn corroborates(
+    conn: &Connection,
+    episode_id: i64,
+    node_id: &str,
+    linked: &[String],
+) -> Result<bool> {
+    if !linked.is_empty() {
+        let list = linked
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let company: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM fact
+                  WHERE valid_to IS NULL
+                    AND ((subject_id = ?1 AND object_id IN ({list}))
+                      OR (object_id = ?1 AND subject_id IN ({list}))))"
+            ),
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        if company {
+            return Ok(true);
+        }
+    }
+    let familiar: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM mention m
+             JOIN episode e  ON e.id = m.episode_id
+             JOIN episode me ON me.id = ?2
+             WHERE m.node_id = ?1 AND m.episode_id <> ?2 AND e.source = me.source)",
+        params![node_id, episode_id],
+        |r| r.get(0),
+    )?;
+    Ok(familiar)
 }
 
 // ─── Annotations ─────────────────────────────────────────────────────────────
@@ -760,6 +986,178 @@ pub fn redact_episode(conn: &Connection, uid: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    // ── the corroboration gate ────────────────────────────────────────────
+
+    use crate::graph::{create_person, get_or_create_person};
+
+    fn ep_from(conn: &rusqlite::Connection, source: &str, id: &str, body: &str) -> i64 {
+        let ep = Episode {
+            id: 0,
+            uid: String::new(),
+            source: source.into(),
+            source_id: id.into(),
+            source_ref: None,
+            body: body.into(),
+            occurred_at: "2026-08-01 12:00:00".into(),
+            occurred_end: None,
+            ingested_at: String::new(),
+            lat: None,
+            lon: None,
+            location: None,
+            sensitivity: "personal".into(),
+            scope_id: None,
+            meta: None,
+            raw: None,
+        };
+        upsert_episode(conn, &ep).unwrap().0
+    }
+
+    /// The 2026-08-24 conflation, reconstructed. A student seen once on a
+    /// calendar invitation carries the first-name alias "marisol"; a
+    /// kitchen conversation names her daughter. Before the gate this linked
+    /// silently — the alias is held by exactly one node, so the ambiguity
+    /// guard passed — and a thousand such episodes landed on the wrong
+    /// person.
+    #[test]
+    fn a_bare_first_name_does_not_link_to_a_stranger_who_shares_it() {
+        let conn = crate::db::open_memory().unwrap();
+        let student = get_or_create_person(
+            &conn,
+            Some("marisol.b.farrow.27@ostrander.edu"),
+            "Marisol B. Farrow",
+            "llm",
+        )
+        .unwrap();
+        // Her one appearance: a calendar event, a different source entirely.
+        let cal = ep_from(&conn, "calendar.event", "advising", "Marisol Farrow");
+        add_mention(&conn, cal, &student.id, "attendee", 1.0).unwrap();
+
+        let talk = ep_from(
+            &conn,
+            "bee.conversation",
+            "bath",
+            "Bath time with Marisol and her sister.",
+        );
+        link_by_alias_scan(&conn, talk, "Bath time with Marisol and her sister.").unwrap();
+
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+                params![talk, student.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 0, "an uncorroborated first name must not link");
+
+        // And the refusal is recorded, because a name nobody can place is
+        // the only cheap signal that a person is missing.
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM unlinked_mention WHERE alias = 'marisol'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1);
+    }
+
+    /// Company: the same weak name links when the episode also names
+    /// somebody this node is actually connected to.
+    #[test]
+    fn a_bare_first_name_links_when_the_episode_names_her_family() {
+        let conn = crate::db::open_memory().unwrap();
+        let avery = create_person(&conn, "Avery J Calder", "t").unwrap();
+        let jo = create_person(&conn, "Marisol Calder", "t").unwrap();
+        conn.execute(
+            "INSERT INTO fact (uid, subject_id, predicate, object_id, statement, polarity,
+                               confidence, observation_count, valid_from)
+             VALUES (hex(randomblob(8)), ?1, 'related_to', ?2, 'family', 'positive', 1.0, 1,
+                     datetime('now'))",
+            params![avery.id, jo.id],
+        )
+        .unwrap();
+
+        let body = "Avery J Calder made dinner while Marisol played.";
+        let e = ep_from(&conn, "bee.conversation", "dinner", body);
+        link_by_alias_scan(&conn, e, body).unwrap();
+
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+                params![e, jo.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            landed, 1,
+            "a strong match in the same episode corroborates it"
+        );
+    }
+
+    /// Familiarity: somebody who has turned up in this kind of source before
+    /// links on a first name without needing company.
+    #[test]
+    fn a_bare_first_name_links_for_someone_already_seen_in_that_source() {
+        let conn = crate::db::open_memory().unwrap();
+        let emma = create_person(&conn, "Emma Calloway", "t").unwrap();
+        let earlier = ep_from(&conn, "bee.conversation", "lab", "Emma Calloway came by.");
+        add_mention(&conn, earlier, &emma.id, "alias", 0.8).unwrap();
+
+        let body = "Emma mentioned the paper again.";
+        let e = ep_from(&conn, "bee.conversation", "again", body);
+        link_by_alias_scan(&conn, e, body).unwrap();
+
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+                params![e, emma.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 1);
+    }
+
+    /// The gate is aimed at first names and nothing else. A distinctive
+    /// canonical name is not a guess about which person is meant, and
+    /// requiring corroboration for it would break the case the scan was
+    /// widened for — text mentions of a project by name.
+    #[test]
+    fn a_canonical_name_still_links_without_corroboration() {
+        let conn = crate::db::open_memory().unwrap();
+        let proj = crate::graph::create_node(&conn, "project", "flowmail", "t").unwrap();
+        let body = "Spent the evening on flowmail.";
+        let e = ep_from(&conn, "bee.conversation", "eve", body);
+        link_by_alias_scan(&conn, e, body).unwrap();
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+                params![e, proj.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 1);
+    }
+
+    /// A multi-word alias is evidence about which person is meant, so it is
+    /// strong however the node was created.
+    #[test]
+    fn a_full_name_alias_is_never_weak() {
+        let conn = crate::db::open_memory().unwrap();
+        let n = create_person(&conn, "Somebody Else", "t").unwrap();
+        add_alias(&conn, &n.id, "Thalia P. Wheatley", "manual").unwrap();
+        let body = "Met Thalia P. Wheatley today.";
+        let e = ep_from(&conn, "bee.conversation", "met", body);
+        link_by_alias_scan(&conn, e, body).unwrap();
+        let landed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mention WHERE episode_id = ?1 AND node_id = ?2",
+                params![e, n.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 1);
+    }
+
     use super::*;
     use crate::db::open_memory;
     use crate::graph::{add_alias, upsert_node, Node};
@@ -1006,8 +1404,7 @@ mod tests {
         upsert_node(&conn, &Node::new("nadia", "person", "Nadia Petrova")).unwrap();
         add_alias(&conn, "nadia", "Nadia", "attendee").unwrap();
 
-        let (id, _) =
-            upsert_episode(&conn, &ep("b1", "Talked to Nadia about the pilot.")).unwrap();
+        let (id, _) = upsert_episode(&conn, &ep("b1", "Talked to Nadia about the pilot.")).unwrap();
         let n = link_by_alias_scan(&conn, id, "Talked to Nadia about the pilot.").unwrap();
         assert_eq!(n, 1);
 

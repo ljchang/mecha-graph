@@ -117,7 +117,6 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// annotations, undo history and tombstones until the fork work caught it.)
 const COPY_TABLES: &[&str] = &[
     "embed_meta",
-    "nodes",
     "node_alias",
     "node_identifier",
     "episode",
@@ -141,6 +140,7 @@ const COPY_TABLES: &[&str] = &[
     "extract_state",
     "vec_episode",
     "vec_fact",
+    "vec_rejected",
     "episode_annotation", // V004
     "undo_log",           // V006
     "episode_tombstone",  // V007
@@ -149,12 +149,60 @@ const COPY_TABLES: &[&str] = &[
     "event_log",          // V009
     "fact_observation",   // V010
     "class_ledger",       // V012
+    // Entity maintenance proposals. Copied for the same reason
+    // `agent_verdict` is: the decided ones are the only record of what has
+    // already been asked and answered, and a fork that drops them re-files
+    // every rejection the next time the audit runs.
+    "entity_proposal", // V018
+    // Refused weak alias matches. Copied because they are the evidence the
+    // missing-entity detector reads: a fork that dropped them would forget
+    // which names keep appearing with nobody to attach them to.
+    "unlinked_mention", // V019
 ];
-const SEEDED_TABLES: &[&str] = &["predicate", "predicate_alias", "node_slot"];
+/// Copied with `INSERT OR IGNORE`, because a freshly migrated target already
+/// holds rows the source is about to send.
+///
+/// `nodes` is here for **one row**, not because it is a seed table: V020 seeds
+/// the `agent-mecha` node into every new schema, so a straight `INSERT` from a
+/// source that also has it fails the primary key and takes encrypt, decrypt
+/// and fork down with it. Skipping it is right rather than merely convenient —
+/// the target's copy is the current seed, and the rest of the table is
+/// untouched because a fresh target has no other nodes to collide with.
+///
+/// The lesson generalises: seeding *data* in a migration is not free while a
+/// copy path exists, and the copy path is where you find out.
+const SEEDED_TABLES: &[&str] = &["predicate", "predicate_alias", "node_slot", "nodes"];
 
 /// Copy all data from the attached schema `src` into `main` on `conn`.
 /// `conn` must already have the full (empty) schema.
+/// Copy every table from an attached `src` into `main`.
+///
+/// **The vector width is reconciled here, not by the callers.** `main`'s
+/// schema came from `run_migrations`, which creates the `vec0` tables at the
+/// compiled-in default; `src` may hold a different one, because changing the
+/// embedding model rebuilds them through [`crate::embed::ensure_vec_dims`].
+/// Copying wide vectors into a narrow table fails with a sqlite-vec
+/// "Dimension mismatch for inserted vector … Expected 768 dimensions but
+/// received 1024" that names the column and not the cause.
+///
+/// It lives in here because putting it at the call sites is what broke: the
+/// reconciliation was added to `export_plaintext` alone, and `encrypt_in_place`
+/// and `fork_db` — which run the identical migrate-then-copy sequence twelve
+/// and a hundred lines away — went on failing. Fork was the one anybody
+/// noticed, because it is the only one of the three that people run on a
+/// whim, so a broken test-bed copy read as "forking is broken" rather than as
+/// "two of our three copy paths are". This trio has now been broken together
+/// twice by a change made to the destination's schema before the copy; the
+/// first time was a migration seeding a node. A step that every copy path
+/// needs belongs in the function every copy path calls.
+///
+/// Read off `src`'s own schema rather than off config, because **a copy must
+/// reproduce the database it is a copy of**, even when config has since moved
+/// on to a different model.
 fn copy_all_tables(conn: &Connection) -> Result<()> {
+    if let Some(dims) = crate::embed::declared_vec_dims_in(conn, "src")? {
+        crate::embed::ensure_vec_dims(conn, dims)?;
+    }
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     for t in SEEDED_TABLES {
         conn.execute_batch(&format!(
@@ -276,17 +324,8 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
         db_path.display(),
         key.replace('"', "")
     ))?;
-    // The destination schema came from run_migrations, which creates the vector
-    // tables at the default width. The SOURCE may hold a different one — a
-    // model change rebuilds them through embed::ensure_vec_dims — and copying
-    // wide vectors into a narrow table fails with a sqlite-vec "Dimension
-    // mismatch" that names the column and not the cause. Match the destination
-    // to what the source actually holds, read off its schema rather than off
-    // config: a snapshot must reproduce the database it is a snapshot of, even
-    // when config has since moved on.
-    if let Some(dims) = crate::embed::declared_vec_dims_in(&conn, "src")? {
-        crate::embed::ensure_vec_dims(&conn, dims)?;
-    }
+    // The vector width is reconciled inside copy_all_tables, which is where
+    // every copy path gets it — see its doc for why it is not here.
     // Transaction pins a consistent read snapshot vs concurrent writers.
     conn.execute_batch("BEGIN;")?;
     copy_all_tables(&conn)?;
@@ -464,7 +503,8 @@ mod tests {
                    AND name NOT LIKE 'fts_%'
                    -- vec0 shadow tables: the virtual tables themselves are listed
                    AND name NOT LIKE 'vec_episode_%'
-                   AND name NOT LIKE 'vec_fact_%'",
+                   AND name NOT LIKE 'vec_fact_%'
+                   AND name NOT LIKE 'vec_rejected_%'",
             )
             .unwrap();
         let schema: std::collections::BTreeSet<String> = stmt
@@ -532,6 +572,53 @@ mod tests {
         assert!(fork_db(&db_path, &same_dir).is_err());
         // Existing destination is refused.
         assert!(fork_db(&db_path, &out).is_err());
+    }
+
+    /// **Every copy path survives a store whose vectors are wider than the
+    /// migrations' default**, which is the state any embedding-model change
+    /// leaves behind.
+    ///
+    /// `fork_db` and `encrypt_in_place` both failed here with sqlite-vec's
+    /// "Expected 768 dimensions but received 1024" — a message that names the
+    /// column and not the cause — while `export_plaintext` passed, because the
+    /// reconciliation had been added to that one call site alone. The
+    /// assertion is the copy itself: it fails on the old code for two of the
+    /// three, and the third is in the loop so the fix cannot be undone for one
+    /// path without the test noticing.
+    #[test]
+    fn every_copy_path_carries_a_store_wider_than_the_default() {
+        for (name, run) in [("fork", 0usize), ("encrypt", 1usize), ("export", 2usize)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("graph.db");
+            {
+                let conn = open(&db_path).unwrap();
+                // What a model change leaves behind: the vec0 tables rebuilt
+                // wider than `run_migrations` creates them.
+                assert!(crate::embed::ensure_vec_dims(&conn, 1024).unwrap());
+                let (id, _) = upsert_episode(&conn, &sample_episode("wide")).unwrap();
+                let wide: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+                conn.execute(
+                    "INSERT INTO vec_episode (episode_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![id, serde_json::to_string(&wide).unwrap()],
+                )
+                .unwrap();
+            }
+            match run {
+                0 => {
+                    let out_dir = tempfile::tempdir().unwrap();
+                    fork_db(&db_path, &out_dir.path().join("fork.db"))
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                1 => {
+                    encrypt_in_place(&db_path).unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                _ => {
+                    encrypt_in_place(&db_path).unwrap();
+                    let out = dir.path().join("plain.db");
+                    export_plaintext(&db_path, &out).unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+            }
+        }
     }
 
     #[test]

@@ -559,9 +559,10 @@ mod tests {
             ),
         ];
         let mut enrich = Enrichment::default();
-        enrich
-            .pr
-            .insert(("adalovelace/pkg".into(), 7), ("Entity browser".into(), true));
+        enrich.pr.insert(
+            ("adalovelace/pkg".into(), 7),
+            ("Entity browser".into(), true),
+        );
         enrich.push.insert(
             ("adalovelace/private".into(), "abc123".into()),
             (2, vec!["Wire the GTD form".into(), "Fix tests".into()]),

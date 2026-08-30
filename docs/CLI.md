@@ -22,7 +22,7 @@ JSON, no flag needed.
 | `source sync [name]` | Ingest everything enabled (or one source). Cursored and idempotent — re-runs are no-ops. |
 | `source remove <name>` | Unregister; already-ingested episodes are kept (`redact` purges). |
 | `ingest` | One-off ingestion of a single source, for scripting around `sync`. |
-| `link --auto` | Re-run the cheap linkers and rollups over existing episodes — after new aliases land, entities pick up their mentions. |
+| `link` | Re-run the deterministic linkers and rollups over existing episodes — alias scan, temporal join, NPMI — after new aliases land, entities pick up their mentions. The candidate-staging tiers (kNN, structural, rules) run only with `--propose`: they measured 4–14% human accept with nothing consuming the rate, so proposing is opt-in until a precision gate exists. |
 | `embed` | Embed pending episodes and facts via the llama-server embedding endpoint (:8081). Rebuilds the `vec0` tables if `[llm] embed_dims` changed, which discards every stored vector — see docs/INTEGRATIONS.md. Batch it when the GPU is free; nothing else waits on it. |
 | `extract` | LLM extraction over pending episodes → fact *candidates* for review. The expensive tier, deliberately separate from ingestion. |
 
@@ -42,14 +42,22 @@ JSON, no flag needed.
 
 ## Curate — the review loop
 
-Nothing an agent or extractor writes becomes a belief until it clears this
-loop.
+Since review-on-use (docs/REVIEW-ON-USE.md), extraction output no longer
+queues for review at birth: clean candidates go live as **shadow facts** —
+retrievable, rank-discounted, labeled `unreviewed` — and earn a human
+verdict when they are about to matter. What still queues is what cannot
+exist as a fact without a human: commitments, precheck-flagged
+contradictions and near-duplicates, and unresolvable subjects.
 
 | Command | What it does |
 |---|---|
-| `review` | The pending fact-candidate queue. |
+| `shadow` | The surfaced-verdict queue: live shadow facts that are about to matter — contradicting a reviewed fact, actually served in a context pack, or spot-checked by a sampled class. `--confirm <uid>` promotes to reviewed; `--refute <uid> [--reason …]` retracts as never true (the reason feeds rejection memory). At most ten at a time: the human is the scarce resource. |
+| `shadow-convert` | One-shot: bulk-convert the standing pending backlog to shadow facts under the same held-classes rule the ingest path applies. |
+| `calibrate-groups` | Measure the cascade thresholds against the recorded human verdicts: at each cosine floor, how often two decided statements that close carried the same verdict — split same-class vs cross-class, Document vs Dedup space. The 2026-08-29 run: same-class ~89% flat across floors, cross-class ~63% at every usable floor — which is why cross-class cascades warn and the TUI group view never crosses. |
+| `utility` | The utility loop's report: per-class retrieval record (facts old enough to have had a chance, and whether any query ever pulled them), what the precision gate blocks from extraction, and — with `--floor`, `--apply` — utility ladder demotions. One grep-able summary line for the nightly log. |
+| `review` | The pending fact-candidate queue. `--clusters` groups it by (proposer, predicate); `--proposers` rolls it up by proposing mechanism with each one's **human** accept rate — machine rejects are reported beside the rate, never inside it, and a mechanism nobody has judged shows a dash, not 0%. `--proposer` / `--predicate` filter, and `--sample N [--seed S]` draws uniformly at random from what the filters left: the queue is ordered, every order is correlated with something, and judging the first N measures the ordering. The seed is printed so a sample can be redrawn and checked. |
 | `accept` / `reject` | Decide candidates by id, or in bulk by filter (`reject` records the reason). |
-| `precheck` | Auto-triage the queue: drop duplicates (against the graph and within the queue), flag contradictions, optionally accept the rest. Run it before reviewing by hand. |
+| `precheck` | Auto-triage the queue: drop duplicates (against the graph and within the queue, exact and paraphrase — the embedded rejection memory catches a rejected claim rewritten), flag contradictions, auto-accept what the ladder earned, and mint the clean rest as shadow facts. Run it before reviewing by hand. |
 | `corrections` | The corrections ledger — what arrived from agents saying the graph was wrong, and what was done about it. |
 | `note` | Quick note capture; entities are auto-linked. |
 | `annotate` | Tag or note an existing episode. |

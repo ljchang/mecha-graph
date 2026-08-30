@@ -180,9 +180,12 @@ pub fn assemble_context(
         } else {
             ""
         };
+        // A shadow fact is knowledge nobody vetted; the label rides the
+        // line itself so no consumer can drop it in passing.
+        let unrev = if f.is_shadow() { "[UNREVIEWED] " } else { "" };
         let line = match &f.valid_from {
-            Some(v) => format!("{neg}as of {}: {}", v, f.statement),
-            None => format!("{neg}{}", f.statement),
+            Some(v) => format!("{unrev}{neg}as of {}: {}", v, f.statement),
+            None => format!("{unrev}{neg}{}", f.statement),
         };
         let t = estimate_tokens(&line);
         if spent_facts + t > fact_budget {
@@ -236,6 +239,57 @@ mod tests {
         assert_eq!(ctx.sections.len(), 2); // task itself has no context row
         assert_eq!(ctx.sections[0].node_id, "goal-r01"); // root first
         assert_eq!(ctx.sections[1].node_id, "proj-aim2");
+    }
+
+    /// The unreviewed label rides the fact line itself, beside the
+    /// [KNOWN FALSE] precedent — no consumer can take the statement and
+    /// drop the caveat.
+    #[test]
+    fn an_unreviewed_fact_line_says_so() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("ada", "person", "Ada")).unwrap();
+        let reviewed = crate::fact::assert_fact(
+            &conn,
+            "ada",
+            "works_on",
+            None,
+            None,
+            "Ada charts the reef survey",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+        let shadow = crate::fact::assert_fact(
+            &conn,
+            "ada",
+            "member_of",
+            None,
+            None,
+            "Ada belongs to the dive club",
+            None,
+            None,
+            0.9,
+            "llm",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fact SET tier = 'shadow' WHERE uid = ?1",
+            rusqlite::params![shadow],
+        )
+        .unwrap();
+        let _ = reviewed;
+
+        let ctx = assemble_context(&conn, "ada", 500).unwrap();
+        let shadow_line = ctx.facts.iter().find(|l| l.contains("dive club")).unwrap();
+        assert!(shadow_line.starts_with("[UNREVIEWED] "));
+        let reviewed_line = ctx
+            .facts
+            .iter()
+            .find(|l| l.contains("reef survey"))
+            .unwrap();
+        assert!(!reviewed_line.contains("[UNREVIEWED]"));
     }
 
     #[test]

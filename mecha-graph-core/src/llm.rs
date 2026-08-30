@@ -146,7 +146,11 @@ impl Backend {
         let port = port_of(base_url).ok_or_else(|| {
             Error::Other(format!("cannot parse a port out of base_url '{base_url}'"))
         })?;
-        let binary = cfg.server_bin.as_deref().unwrap_or("llama-server").to_string();
+        let binary = cfg
+            .server_bin
+            .as_deref()
+            .unwrap_or("llama-server")
+            .to_string();
 
         let mut cmd = Command::new(&binary);
         cmd.arg("-m")
@@ -171,9 +175,9 @@ impl Backend {
             cmd.args(extra);
         }
 
-        let child = cmd.spawn().map_err(|e| {
-            Error::Other(format!("could not start '{binary}': {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::Other(format!("could not start '{binary}': {e}")))?;
         let mut backend = Backend::Managed {
             base_url: base_url.to_string(),
             child,

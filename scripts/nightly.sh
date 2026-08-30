@@ -9,9 +9,16 @@
 #   MECHA_GRAPH_SELF_EMAIL=you@example.edu
 #   EXTRACT_LIMIT=100        # Tier-7 episodes per night
 #   EXTRACT_MODEL=gemma4:e4b
+#   EXTRACT_EXCLUDE="calendar.event"  # sources kept OUT of LLM extraction
+#                            # (space-separated; empty string = extract all)
 #   SUMMARIZE_LIMIT=30       # scope summaries refreshed per night (§4.5)
 #   PRECHECK_AUTO_ACCEPT=0   # 0 disables auto-accept (durable predicates only)
+#   LINK_PROPOSE=1           # re-enable the candidate-staging linker tiers
+#   BEE_PULL_LIMIT=100       # re-enable the Bee suggested-facts pull
 #   GPU_BUSY_THRESHOLD=30    # skip embed/extract above this % utilization
+#   UTILITY_FLOOR=0.05       # retrieval-rate floor: demote + gate classes
+#                            # under it (unset = report-only; set only after
+#                            # fact_usage has weeks of data at the new rate)
 
 set -uo pipefail
 umask 077   # everything this script creates (logs, MEMORY.md) is private
@@ -54,6 +61,13 @@ find "$LOG_DIR" -name 'nightly-*.log' -mtime +30 -delete 2>/dev/null
 [ -f "$MECHA_GRAPH_DIR/nightly.env" ] && . "$MECHA_GRAPH_DIR/nightly.env"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
+# Calendar is 65% of the corpus and its bodies are titles + attendee lists
+# the deterministic tiers already extracted; LLM-extracting them was the
+# single largest manufacturer of review-queue trivia. Opt back in with
+# EXTRACT_EXCLUDE="" in nightly.env — which is why this is `-`, not `:-`:
+# the colon form treats empty as unset and would silently re-apply the
+# default, making the documented opt-out a no-op.
+EXTRACT_EXCLUDE="${EXTRACT_EXCLUDE-calendar.event}"
 SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
 PRECHECK_AUTO_ACCEPT="${PRECHECK_AUTO_ACCEPT:-1}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
@@ -75,7 +89,17 @@ fi
 run "$PKG" source sync
 
 # ── Linkers (cheap, CPU-only) ────────────────────────────────────────────────
-run "$PKG" link --auto
+# Deterministic tiers only (alias, temporal, NPMI): the mention substrate
+# decay and the rollups read. The candidate-staging tiers (kNN, structural,
+# rules) ran at 4–14% human accept for a month with nothing consuming that
+# rate — ~190 unwanted proposals a night. They are opt-in per run now:
+# LINK_PROPOSE=1 in nightly.env turns them back on.
+LINK_PROPOSE="${LINK_PROPOSE:-0}"
+if [ "$LINK_PROPOSE" = "1" ]; then
+    run "$PKG" link --propose
+else
+    run "$PKG" link
+fi
 
 # Phantom repair, BEFORE decay and AFTER link, and the order is the whole
 # point. `link` learns aliases — that an address belongs to a person — and
@@ -102,9 +126,15 @@ run "$PKG" invalidate-phantoms
 # visibly via `mecha-graph stats`. MUST follow link: it reads the fresh mention table.
 run "$PKG" decay
 
-# Bee suggested-facts two-way sync: pull unconfirmed → review queue, push
-# accept/reject verdicts back to Bee (saves triaging in their app).
-run "$PKG" bee-facts
+# Bee suggested-facts two-way sync. The PULL is retired by default: the
+# lane produced six live facts ever out of ~1,700 processed, at a 38%
+# human accept rate, with a known misattribution bias toward the owner —
+# the queue's single worst cost-per-kept-fact. The PUSH always runs, so
+# verdicts on anything already staged still clean Bee's app. Opt the pull
+# back in with BEE_PULL_LIMIT in nightly.env. The archive of everything
+# the lane ever staged: ~/.mecha-graph/archive/bee-facts-2026-08-28.jsonl.gz.
+BEE_PULL_LIMIT="${BEE_PULL_LIMIT:-0}"
+run "$PKG" bee-facts --pull-limit "$BEE_PULL_LIMIT"
 
 # D3 corrections backfill: kg_upsert processes meta.corrections inline;
 # this drains anything that arrived another way or failed mid-flight.
@@ -149,7 +179,9 @@ done
 
 if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     run "$PKG" embed
-    run "$PKG" extract --limit "$EXTRACT_LIMIT" --model "$EXTRACT_MODEL"
+    EXTRACT_ARGS=(--limit "$EXTRACT_LIMIT" --model "$EXTRACT_MODEL")
+    for src in $EXTRACT_EXCLUDE; do EXTRACT_ARGS+=(--exclude-source "$src"); done
+    run "$PKG" extract "${EXTRACT_ARGS[@]}"
     # Auto-triage the fresh candidates: duplicates die, contradictions get
     # flagged, and (opt-in) clean novel facts accept themselves.
     if [ "$PRECHECK_AUTO_ACCEPT" = "1" ]; then
@@ -160,6 +192,28 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     run "$PKG" summarize --limit "$SUMMARIZE_LIMIT" --model "$EXTRACT_MODEL"
 else
     log "GPU still busy (${GPU_UTIL}%) after ${GPU_WAIT_MINUTES}m: skipping embed/extract tonight"
+fi
+
+# ── Entity maintenance (cheap, CPU-only, no model) ───────────────────────────
+# The entity-layer counterpart of extract+precheck: six detectors file
+# proposals for a person to decide. It runs OUTSIDE the GPU gate because it is
+# pure SQL — 1.5s over 14k nodes — and a night when the GPU stayed busy is
+# exactly a night when the cheap checks should still happen.
+#
+# It repairs nothing. The repair direction is usually not derivable from the
+# data, and a decided proposal is never re-filed, so this is idempotent and
+# silent once the queue is drained.
+run "$PKG" audit
+
+# ── The utility loop (review-on-use §3, CPU-only) ────────────────────────────
+# One loud line per night: which classes the query stream is voting against,
+# what the precision gate blocks from extraction, and — once UTILITY_FLOOR is
+# set in nightly.env (leave unset until fact_usage has weeks of tenure) —
+# applied ladder demotions.
+if [ -n "${UTILITY_FLOOR:-}" ]; then
+    run "$PKG" utility --floor "$UTILITY_FLOOR" --apply
+else
+    run "$PKG" utility
 fi
 
 # ── Boot context + health ────────────────────────────────────────────────────
@@ -179,6 +233,13 @@ for s in h['ingest_state']:
     if s['stale']: alerts.append(f\"{s['source']} stale\")
 print('; '.join(alerts))
 ")"
+# A precheck run whose embedding died mid-way prints its blindness marker
+# into this very log; surface it as an alert rather than leaving zeros
+# that read like a clean queue (grep target kept in step with main.rs).
+if grep -q "SEMANTIC TIERS SKIPPED" "$LOG"; then
+    STALE="${STALE:+$STALE; }precheck ran blind: embedding failed mid-run"
+fi
+
 if [ -n "$STALE" ]; then
     log "ALERTS: $STALE"
 else

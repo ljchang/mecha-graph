@@ -250,8 +250,7 @@ mod tests {
     #[test]
     fn a_probe_read_is_logged_but_bumps_no_demand() {
         let conn = open_memory().unwrap();
-        crate::graph::upsert_node(&conn, &crate::graph::Node::new("w", "person", "Nadia"))
-            .unwrap();
+        crate::graph::upsert_node(&conn, &crate::graph::Node::new("w", "person", "Nadia")).unwrap();
 
         router::query(
             &conn,

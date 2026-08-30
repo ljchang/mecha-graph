@@ -22,7 +22,7 @@ use crate::embed::Embedder;
 use crate::error::Result;
 use crate::fact::{self, FactCandidate};
 use crate::graph;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -180,6 +180,9 @@ pub struct PrecheckReport {
     pub contradiction_flagged: usize,
     pub similar_flagged: usize,
     pub auto_accepted: usize,
+    /// Clean, novel, resolvable, nothing earned an accept: minted live at
+    /// tier 'shadow' (review-on-use) — retrievable, discounted, unreviewed.
+    pub shadow_minted: usize,
     pub left_for_review: usize,
     pub subject_backfilled: usize,
     pub predicate_canonicalized: usize,
@@ -188,9 +191,25 @@ pub struct PrecheckReport {
     pub subjects_minted: usize,
     pub subject_implied: usize,
     pub rejected_dup: usize,
+    /// Paraphrase of a human-rejected claim, caught by the embedded
+    /// rejection memory (review-on-use §5).
+    pub rejected_semantic: usize,
+    pub commitment_dup: usize,
+    pub commitment_stale: usize,
+    /// The embedding call failed mid-run and every semantic tier silently
+    /// became a no-op. Carried in the report because a run where the guard
+    /// could not work must SAY so — the nightly logged `semantic-dup 0`
+    /// for a week and it read exactly like a clean queue.
+    pub semantic_skipped: bool,
 }
 
-fn normalize(s: &str) -> String {
+/// How long an unreviewed commitment stays proposable. A commitment is a
+/// claim on the owner's attention *now*; one extracted from an episode this
+/// old that nobody accepted is a dead task waiting to be rejected by hand —
+/// which is what the 19%-accept, 730-deep commitment backlog was made of.
+pub const COMMITMENT_STALE_DAYS: i64 = 30;
+
+pub(crate) fn normalize(s: &str) -> String {
     s.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
@@ -200,7 +219,16 @@ fn normalize(s: &str) -> String {
         .join(" ")
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
+/// The closest human-rejected statement to a candidate vector, if any —
+/// pure so the memory's judgement is testable without an embedding
+/// server behind it.
+fn nearest_rejected<'a>(cv: &[f32], pool: &'a [(String, Vec<f32>)]) -> Option<(f64, &'a str)> {
+    pool.iter()
+        .map(|(what, v)| (cosine(cv, v), what.as_str()))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+}
+
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
     for (x, y) in a.iter().zip(b) {
         dot += (*x as f64) * (*y as f64);
@@ -343,7 +371,18 @@ pub fn precheck_pending_opts(
     dry_run: bool,
 ) -> Result<PrecheckReport> {
     let mut report = PrecheckReport::default();
-    let candidates = fact::pending_candidates(conn, 10_000)?;
+    // Ordered confidence DESC, so the items past the cap — the ones that
+    // never get triaged — would be precisely the lowest-confidence tail
+    // (the hardcoded-0.5 bee class). Truncation must be loud: a silently
+    // shrunken scan reads exactly like a drained queue.
+    const SCAN_CAP: i64 = 10_000;
+    let candidates = fact::pending_candidates(conn, SCAN_CAP)?;
+    if candidates.len() as i64 == SCAN_CAP {
+        eprintln!(
+            "precheck: queue at or past the {SCAN_CAP}-item scan cap — \
+             the lowest-confidence tail is NOT being triaged"
+        );
+    }
     report.scanned = candidates.len();
     if candidates.is_empty() {
         return Ok(report);
@@ -416,6 +455,39 @@ pub fn precheck_pending_opts(
         .collect();
     drop(rejected_stmt);
 
+    // Semantic rejection memory (review-on-use §5): vectors of HUMAN-
+    // rejected statements, built incrementally by `pkg embed`. The exact
+    // set above catches re-proposals verbatim; this catches the paraphrase
+    // — same claim, different words — at the same 0.97 threshold the
+    // live-fact dedup earned. Human rejects only, enforced at index build.
+    let mut rejected_vecs: Vec<(String, Vec<f32>)> = Vec::new();
+    if embedder.is_some() {
+        crate::embed::ensure_vec_rejected(conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(json_extract(c.payload, '$.statement'), ''), v.embedding
+             FROM vec_rejected v JOIN fact_candidate c ON c.id = v.candidate_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let stmt_text: String = r.get(0)?;
+            let v = match r.get_ref(1)? {
+                rusqlite::types::ValueRef::Text(t) => serde_json::from_slice::<Vec<f32>>(t).ok(),
+                rusqlite::types::ValueRef::Blob(b) => Some(
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                ),
+                _ => None,
+            };
+            Ok((stmt_text, v))
+        })?;
+        for row in rows {
+            let (t, v) = row?;
+            if let Some(v) = v {
+                rejected_vecs.push((t, v));
+            }
+        }
+    }
+
     // Stored fact embeddings (statement vectors, search_document space).
     // LIVE facts only: `vec_fact` keeps a row for every fact ever embedded,
     // so an unconstrained load lets a RETRACTED belief block its own
@@ -462,11 +534,38 @@ pub fn precheck_pending_opts(
                 .unwrap_or_default()
         })
         .collect();
+    // Chunked, because one request carrying the whole queue is how the
+    // semantic tier silently died: a single 8,000-statement batch, and
+    // `Embedder::embed` splits only on context overflow — a timeout or a
+    // 5xx was swallowed into `vec![None]` and the run printed
+    // `semantic-dup 0 · dup-in-queue 0` for a week, indistinguishable from
+    // a clean queue. A failed chunk now announces itself, marks the report,
+    // and stops asking (one timeout, not one per remaining chunk).
+    const EMBED_CHUNK: usize = 256;
     let cand_vecs: Vec<Option<Vec<f32>>> = match embedder {
-        Some(e) if !fact_vecs.is_empty() || auto_accept => match e.embed(&statements, crate::embed::EmbedTask::Document) {
-            Ok(vs) => vs.into_iter().map(Some).collect(),
-            Err(_) => vec![None; candidates.len()],
-        },
+        Some(e) if !fact_vecs.is_empty() || auto_accept => {
+            let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(statements.len());
+            for chunk in statements.chunks(EMBED_CHUNK) {
+                if report.semantic_skipped {
+                    out.extend(std::iter::repeat_with(|| None).take(chunk.len()));
+                    continue;
+                }
+                match e.embed(chunk, crate::embed::EmbedTask::Document) {
+                    Ok(vs) => out.extend(vs.into_iter().map(Some)),
+                    Err(err) => {
+                        eprintln!(
+                            "precheck: embedding failed after {} of {} statements ({err}) — \
+                             SEMANTIC TIERS OFF for the rest of this run",
+                            out.len(),
+                            statements.len()
+                        );
+                        report.semantic_skipped = true;
+                        out.extend(std::iter::repeat_with(|| None).take(chunk.len()));
+                    }
+                }
+            }
+            out
+        }
         _ => vec![None; candidates.len()],
     };
 
@@ -475,9 +574,103 @@ pub fn precheck_pending_opts(
     let mut seen_norm: HashSet<(String, String)> = HashSet::new();
     let mut kept_vecs: HashMap<String, Vec<(i64, Vec<f32>)>> = HashMap::new(); // subject → kept candidate vectors
 
+    // Commitment triage state. Commitments used to `continue` past every
+    // tier — no dedup, no rejection memory, no staleness — so the queue
+    // grew monotonically and a PROMPT_VERSION bump re-proposed the whole
+    // history (730 pending at 19% accept, 49 exact duplicates). They still
+    // never auto-ACCEPT (a wrong task on the GTD board costs attention
+    // daily), but repeats and dead deadlines are machine-disposable.
+    // Machine rejects are excluded for the same reason `rejected_norms`
+    // excludes them: this sweep's own duplicate-rejections would otherwise
+    // enter the judged set on the NEXT sweep and kill the surviving twin —
+    // reject one copy as "duplicate of X", then reject X itself as
+    // "already reviewed". Only a human's verdict is asked-and-answered.
+    let judged_commitments: HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(json_extract(payload, '$.what'), '') FROM fact_candidate
+             WHERE json_extract(payload, '$.kind') = 'commitment' AND status != 'proposed'
+               AND COALESCE(reject_reason, '') NOT LIKE 'precheck:%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|w| w.ok())
+            .map(|w| normalize(&w))
+            .filter(|w| !w.is_empty())
+            .collect()
+    };
+    let mut seen_commitments: HashSet<String> = HashSet::new();
+    let today: String = conn.query_row("SELECT date('now')", [], |r| r.get(0))?;
+    let stale_floor: String = conn.query_row(
+        "SELECT datetime('now', ?1)",
+        params![format!("-{COMMITMENT_STALE_DAYS} days")],
+        |r| r.get(0),
+    )?;
+
     for (ci, c) in candidates.iter().enumerate() {
         let is_commitment = c.payload.get("kind").and_then(|k| k.as_str()) == Some("commitment");
         if is_commitment {
+            let what_norm = normalize(&statements[ci]);
+            let reject = |reason: &str| -> Result<()> {
+                if !dry_run {
+                    fact::reject_candidate_opts(conn, c.id, reason, false)?;
+                }
+                Ok(())
+            };
+            if !what_norm.is_empty() && judged_commitments.contains(&what_norm) {
+                reject("precheck: commitment already reviewed — asked and answered")?;
+                report.commitment_dup += 1;
+                continue;
+            }
+            if !what_norm.is_empty() && !seen_commitments.insert(what_norm) {
+                reject("precheck: duplicate commitment within the queue")?;
+                report.commitment_dup += 1;
+                continue;
+            }
+            // Stale: the due date passed, or the source episode is older
+            // than COMMITMENT_STALE_DAYS and nobody accepted it — but a
+            // commitment carrying a live FUTURE due date is not stale
+            // however old its episode: "submit the grant by December"
+            // extracted six weeks ago is exactly the reminder worth
+            // keeping. The due date is read char-safely (`get`, not a
+            // byte slice — model-supplied text can put a multibyte char
+            // anywhere) and only when it leads with a year; a `when` like
+            // "next week" never marks anything stale.
+            let due_date = candidate_str(c, "when").and_then(|w| {
+                let d = w.get(..10)?.to_string();
+                d.as_bytes()[..4]
+                    .iter()
+                    .all(u8::is_ascii_digit)
+                    .then_some(d)
+            });
+            let due_passed = due_date
+                .as_deref()
+                .map(|d| d < &today[..10])
+                .unwrap_or(false);
+            let due_future = due_date
+                .as_deref()
+                .map(|d| d >= &today[..10])
+                .unwrap_or(false);
+            let episode_old = !due_future
+                && match c.episode_id {
+                    Some(eid) => conn
+                        .query_row(
+                            "SELECT occurred_at FROM episode WHERE id = ?1",
+                            params![eid],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .map(|at| at < stale_floor)
+                        .unwrap_or(false),
+                    None => false,
+                };
+            if due_passed || episode_old {
+                reject(if due_passed {
+                    "precheck: stale commitment — its due date passed unaccepted"
+                } else {
+                    "precheck: stale commitment — episode past the staleness window, never accepted"
+                })?;
+                report.commitment_stale += 1;
+                continue;
+            }
             report.left_for_review += 1;
             continue;
         }
@@ -528,6 +721,24 @@ pub fn precheck_pending_opts(
             }
             report.rejected_dup += 1;
             continue;
+        }
+        if let Some(cv) = &cand_vecs[ci] {
+            if let Some((sim, what)) = nearest_rejected(cv, &rejected_vecs) {
+                if sim >= SEMANTIC_DUP_THRESHOLD {
+                    if !dry_run {
+                        fact::reject_candidate_opts(
+                            conn,
+                            c.id,
+                            &format!(
+                                "precheck: paraphrase of a claim the review already                                  rejected (cosine {sim:.2} to '{what}')"
+                            ),
+                            false,
+                        )?;
+                    }
+                    report.rejected_semantic += 1;
+                    continue;
+                }
+            }
         }
         if EPHEMERAL_PREDICATES.contains(&predicate.as_str()) {
             if !dry_run {
@@ -785,6 +996,19 @@ pub fn precheck_pending_opts(
             }
             fact::update_candidate_payload(conn, c.id, &live_payload)?;
         }
+        // Flagged and contradicted candidates stay in the queue, so they
+        // must join the kept-vector pool like every other survivor — these
+        // two exits used to skip the push, which made everything they held
+        // invisible to the intra-queue semantic dedup for the rest of the
+        // sweep: the near-duplicate of a near-duplicate sailed through.
+        if contradiction.is_some() || flagged_similar.is_some() {
+            if let Some(cv) = &cand_vecs[ci] {
+                kept_vecs
+                    .entry(subject_key.clone())
+                    .or_default()
+                    .push((c.id, cv.clone()));
+            }
+        }
         if contradiction.is_some() {
             report.contradiction_flagged += 1;
             report.left_for_review += 1;
@@ -858,8 +1082,25 @@ pub fn precheck_pending_opts(
                     report.left_for_review += 1; // e.g. unknown predicate — human path
                 }
             }
-        } else {
+        } else if is_commitment {
+            // Commitments stay a queue: a claim on the owner's attention
+            // is reviewed as a task, deliberately — not discovered
+            // mid-retrieval after the due date passed.
             report.left_for_review += 1;
+        } else if dry_run {
+            report.shadow_minted += 1; // resolvable would mint
+        } else {
+            // Review-on-use (docs/REVIEW-ON-USE.md): clean, novel, and
+            // nothing earned an accept — the fact goes live as SHADOW
+            // (rank-discounted, labeled unreviewed) and earns its human
+            // verdict when a query pulls it, not while it sits here.
+            // A mint refusal means the subject would not resolve; binding
+            // a name the graph does not know is human work, so the
+            // candidate stays queued.
+            match fact::mint_shadow_candidate(conn, c.id) {
+                Ok(_) => report.shadow_minted += 1,
+                Err(_) => report.left_for_review += 1,
+            }
         }
         if let Some(cv) = &cand_vecs[ci] {
             kept_vecs
@@ -1005,6 +1246,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.9),
             tags: None,
+            ..Default::default()
         };
         fact::propose_fact(conn, &p, proposer, None).unwrap()
     }
@@ -1025,6 +1267,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.9),
             tags: None,
+            ..Default::default()
         };
         fact::propose_fact(conn, &p, "test", None).unwrap()
     }
@@ -1041,6 +1284,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.9),
             tags: None,
+            ..Default::default()
         };
         let id = fact::propose_fact(conn, &p, proposer, None).unwrap();
         conn.execute(
@@ -1143,6 +1387,7 @@ mod tests {
             valid_from: None,
             confidence: Some(0.5),
             tags: None,
+            ..Default::default()
         };
         let bee = fact::propose_fact(&conn, &p, "bee:suggested", None).unwrap();
         let llm = fact::propose_fact(&conn, &p, "llm", None).unwrap();
@@ -1217,13 +1462,7 @@ mod tests {
             "The Toyota Sienna seats seven.",
         );
         // Recurring but KNOWN — never re-minted.
-        stage(
-            &conn,
-            "Nadia",
-            "related_to",
-            None,
-            "Nadia runs the pilot.",
-        );
+        stage(&conn, "Nadia", "related_to", None, "Nadia runs the pilot.");
         stage(
             &conn,
             "Nadia",
@@ -1406,7 +1645,7 @@ mod tests {
             None,
             "Tess was in a particularly silly mood that day.",
         );
-        // Present-tense property claim: stays for the human.
+        // Present-tense property claim: clean and novel — mints shadow.
         let property = stage(&conn, "Tess", "is", None, "Tess is the younger twin.");
         // The same past-anchored wording under an EVENT predicate is fine —
         // attended is supposed to hold moments.
@@ -1429,8 +1668,8 @@ mod tests {
             .unwrap()
         };
         assert_eq!(status(eventive), "rejected");
-        assert_eq!(status(property), "proposed");
-        assert_eq!(status(event_pred), "proposed");
+        assert_eq!(status(property), "shadow");
+        assert_eq!(status(event_pred), "shadow");
     }
 
     #[test]
@@ -1529,16 +1768,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(v["subject"], "Ada B Lovelace");
         assert_eq!(v["subject_backfilled"], true);
-        // Healing binds; it never decides. related_to is not a durable
-        // predicate, so the candidate still waits for review.
-        let status: String = conn
+        // Healing binds; it never decides. The bound candidate mints as a
+        // SHADOW fact (review-on-use) — retrievable but unreviewed, which
+        // is still not a verdict: reviewed_by stays NULL.
+        let (status, reviewed_by): (String, Option<String>) = conn
             .query_row(
-                "SELECT status FROM fact_candidate WHERE id = ?1",
+                "SELECT status, reviewed_by FROM fact_candidate WHERE id = ?1",
                 params![cid],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status, "proposed");
+        assert_eq!(status, "shadow");
+        assert_eq!(reviewed_by, None);
     }
 
     #[test]
@@ -1600,7 +1841,8 @@ mod tests {
         assert_eq!(report.dup_of_fact, 1);
         assert_eq!(report.dup_in_queue, 1);
         assert_eq!(report.contradiction_flagged, 1);
-        assert_eq!(report.left_for_review, 2); // the survivor + the contradiction
+        assert_eq!(report.shadow_minted, 1); // the clean survivor goes live as shadow
+        assert_eq!(report.left_for_review, 1); // the contradiction holds for a human
 
         // Re-observation strengthened the existing fact.
         let obs: i64 = conn.query_row(
@@ -1641,7 +1883,8 @@ mod tests {
         .unwrap();
         fact::supersede_fact(&conn, &uid, None).unwrap();
 
-        // The same claim arrives again — it must reach review, not die.
+        // The same claim arrives again — it must reach the graph (as a
+        // shadow fact under review-on-use), not die.
         stage(
             &conn,
             "Nadia",
@@ -1654,7 +1897,7 @@ mod tests {
             report.dup_of_fact, 0,
             "a retracted belief is not a live duplicate"
         );
-        assert_eq!(report.left_for_review, 1);
+        assert_eq!(report.shadow_minted, 1);
     }
 
     #[test]
@@ -1690,7 +1933,11 @@ mod tests {
             r.dup_in_queue, 1,
             "normalized-identical statements dedupe without resolution"
         );
-        assert_eq!(r.left_for_review, 2);
+        // Three sightings of the same unknown subject cross the
+        // recurring-subject bar, so a node is minted, the survivors
+        // resolve, and both go live as shadow facts.
+        assert_eq!(r.shadow_minted, 2);
+        assert_eq!(r.left_for_review, 0);
     }
 
     #[test]
@@ -1738,7 +1985,7 @@ mod tests {
             None,
             "Nadia leads the Aim 2 outreach effort.",
         );
-        // Valid but non-durable predicate: stays for review even in auto mode.
+        // Valid but non-durable predicate: no accept earned — mints shadow.
         stage(
             &conn,
             "Nadia",
@@ -1750,7 +1997,10 @@ mod tests {
         let r = precheck_pending(&conn, None, true).unwrap();
         assert_eq!(r.ephemeral_rejected, 1);
         assert_eq!(r.auto_accepted, 1);
-        assert_eq!(r.left_for_review, 2);
+        // The unvetted-durable and the non-durable both go live as shadow
+        // rather than queueing — that is the review-on-use inversion.
+        assert_eq!(r.shadow_minted, 2);
+        assert_eq!(r.left_for_review, 0);
     }
 
     #[test]
@@ -1804,6 +2054,111 @@ mod tests {
         assert_eq!(clusters[1].predicate, "has_role");
     }
 
+    /// A class's displayed rate must count the OWNER's verdicts and nothing
+    /// else.
+    ///
+    /// The contaminated form counted precheck's own dedup rejects, and the
+    /// cluster view is read immediately before verdicting a whole class —
+    /// so a class that merely produces duplicates argued the reviewer into
+    /// rejecting a class they in fact accept. On the live graph this
+    /// displayed `llm/has` as 18% against a true 67%, and showed three
+    /// classes at 0% on which no human had ever voted.
+    ///
+    /// Fails on the old behaviour: without the filter the rate reads 1/5
+    /// (20%) rather than 1/1 (100%).
+    #[test]
+    fn a_class_rate_counts_human_verdicts_and_never_our_own_dedup() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("aim2", "project", "Aim 2")).unwrap();
+
+        // Something left pending, so the class appears in the view at all.
+        stage(&conn, "Nadia", "works_on", Some("Aim 2"), "pending one");
+
+        // One human accept — the entire human record for this class.
+        let human = stage(&conn, "Nadia", "works_on", Some("Aim 2"), "human said yes");
+        fact::accept_candidate(&conn, human).unwrap();
+
+        // Four rejects the pipeline made itself. `by_user: false` is what a
+        // machine lane passes, and the reason carries the `precheck:` prefix
+        // the filter keys on.
+        for i in 0..4 {
+            let id = stage(
+                &conn,
+                "Nadia",
+                "works_on",
+                Some("Aim 2"),
+                &format!("dup {i}"),
+            );
+            fact::reject_candidate_opts(&conn, id, "precheck: duplicate of fact", false).unwrap();
+        }
+
+        let cl = review_clusters(&conn, 0)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.predicate == "works_on")
+            .expect("the class is in the view");
+
+        assert_eq!(
+            (cl.accepted_hist, cl.rejected_hist),
+            (1, 0),
+            "only the human verdict counts toward the rate"
+        );
+        assert_eq!(
+            cl.machine_rejected, 4,
+            "the pipeline's own rejects are reported, beside the rate and never inside it"
+        );
+
+        // And the rollup inherits both properties, because it is built from
+        // these rows rather than from a second query that could drift.
+        let p = proposer_stats(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.proposer == "test")
+            .expect("the staging helper proposes as `test`");
+        assert_eq!(p.accept_rate(), Some(1.0));
+        assert_eq!(p.machine_rejected, 4);
+    }
+
+    /// An unjudged class has no rate — not a rate of zero.
+    ///
+    /// "Never reviewed" and "always rejected" are opposite findings, and
+    /// rendering them alike is what made an untouched mechanism holding 17%
+    /// of the queue read as a demonstrably bad one.
+    #[test]
+    fn a_proposer_with_no_human_verdicts_has_no_rate_rather_than_zero() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("aim2", "project", "Aim 2")).unwrap();
+        let id = stage_by(
+            &conn,
+            "bee:suggested",
+            "Nadia",
+            "related_to",
+            Some("Aim 2"),
+            "never judged",
+        );
+        fact::reject_candidate_opts(&conn, id, "precheck: ephemeral", false).unwrap();
+        stage_by(
+            &conn,
+            "bee:suggested",
+            "Nadia",
+            "related_to",
+            Some("Aim 2"),
+            "still pending",
+        );
+
+        let p = proposer_stats(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.proposer == "bee:suggested")
+            .expect("proposer present");
+        assert_eq!(p.judged(), 0);
+        assert_eq!(p.accept_rate(), None, "no denominator, no rate");
+        assert_eq!(p.accept_lb, None, "and no confidence bound to quote");
+        assert_eq!(p.machine_rejected, 1);
+    }
+
     #[test]
     fn test_precheck_auto_accept_leaves_conflicts() {
         let conn = open_memory().unwrap();
@@ -1843,13 +2198,35 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
+    /// The paraphrase memory judges by nearest neighbour: the same claim
+    /// in different words clears the bar, an unrelated claim does not,
+    /// and an empty pool judges nothing.
+    #[test]
+    fn nearest_rejected_finds_the_paraphrase_not_the_stranger() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let almost_a = vec![0.999f32, 0.04, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        let pool = vec![
+            ("Vera works at the annex".to_string(), almost_a),
+            ("Vera plays the oboe".to_string(), b),
+        ];
+        let (sim, what) = nearest_rejected(&a, &pool).unwrap();
+        assert!(sim >= SEMANTIC_DUP_THRESHOLD);
+        assert_eq!(what, "Vera works at the annex");
+        let far = vec![0.0f32, 0.0, 1.0];
+        let (sim, _) = nearest_rejected(&far, &pool).unwrap();
+        assert!(sim < SEMANTIC_DUP_THRESHOLD);
+        assert!(nearest_rejected(&a, &[]).is_none());
+    }
+
     #[test]
     fn test_ladder_rung_extends_auto_accept() {
         let conn = open_memory().unwrap();
         upsert_node(&conn, &Node::new("aim2", "project", "Aim 2")).unwrap();
         upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
 
-        // 'about' is NOT in DURABLE_PREDICATES — staged, it queues.
+        // 'about' is NOT in DURABLE_PREDICATES — staged class, no accept:
+        // the candidate mints shadow instead.
         stage(
             &conn,
             "Nadia",
@@ -1858,7 +2235,8 @@ mod tests {
             "Nadia note about Aim 2.",
         );
         let report = precheck_pending(&conn, None, true).unwrap();
-        assert_eq!(report.auto_accepted, 0, "staged class must queue");
+        assert_eq!(report.auto_accepted, 0, "staged class must not accept");
+        assert_eq!(report.shadow_minted, 1);
 
         // Promote the (test, about) class to trusted, then a fresh
         // candidate in the same class auto-accepts.
@@ -1867,12 +2245,14 @@ mod tests {
             [],
         )
         .unwrap();
+        // A fresh triple — the first candidate's shadow fact is live, so
+        // re-proposing ITS triple would corroborate, not accept.
         stage(
             &conn,
             "Nadia",
             "about",
-            Some("Aim 2"),
-            "Nadia talked about Aim 2 plans.",
+            None,
+            "Nadia talked about future plans.",
         );
         let report = precheck_pending(&conn, None, true).unwrap();
         assert_eq!(
@@ -1890,6 +2270,165 @@ mod tests {
             .unwrap();
         assert_eq!(streak, 0, "auto-lane must not move the ladder it feeds");
     }
+
+    fn stage_commitment(conn: &Connection, what: &str, when: Option<&str>, status: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, proposed_by, status, confidence)
+             VALUES (?1, 'llm:commitment', ?2, 0.8)",
+            params![
+                serde_json::json!({
+                    "kind": "commitment", "who": "Nadia", "what": what,
+                    "when": when, "direction": "owed_to_me", "confidence": 0.8
+                })
+                .to_string(),
+                status
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn commitments_are_triaged_not_exempt() {
+        let conn = open_memory().unwrap();
+        // Already judged (either way) → asked and answered.
+        stage_commitment(&conn, "Send the pilot data", None, "rejected");
+        stage_commitment(&conn, "send the pilot data", None, "proposed");
+        // Twice in the queue → one survives.
+        stage_commitment(&conn, "Review the draft", None, "proposed");
+        stage_commitment(&conn, "review the draft", None, "proposed");
+        // Due date long past → dead task, machine-disposable.
+        stage_commitment(
+            &conn,
+            "Book the scanner slot",
+            Some("2020-01-01"),
+            "proposed",
+        );
+        // Fresh, undated, unjudged → still the human's call.
+        stage_commitment(&conn, "Draft the white paper", None, "proposed");
+
+        let report = precheck_pending(&conn, None, false).unwrap();
+        assert_eq!(
+            report.commitment_dup, 2,
+            "one judged repeat + one in-queue twin"
+        );
+        assert_eq!(report.commitment_stale, 1);
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_candidate
+                 WHERE status = 'proposed' AND json_extract(payload,'$.kind') = 'commitment'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 2,
+            "the surviving twin and the fresh commitment stay for review"
+        );
+        // And never auto-ACCEPT, even with the flag on: a wrong task on the
+        // GTD board costs attention daily.
+        assert_eq!(report.auto_accepted, 0);
+    }
+
+    #[test]
+    fn a_machine_rejected_twin_never_kills_the_survivor() {
+        let conn = open_memory().unwrap();
+        stage_commitment(&conn, "Review the draft", None, "proposed");
+        stage_commitment(&conn, "review the draft", None, "proposed");
+        // Sweep 1: one twin is machine-rejected as an in-queue duplicate.
+        let r1 = precheck_pending(&conn, None, false).unwrap();
+        assert_eq!(r1.commitment_dup, 1);
+        // Sweep 2: the survivor must NOT match the judged set through its
+        // twin's precheck rejection — only a human verdict is
+        // asked-and-answered.
+        let r2 = precheck_pending(&conn, None, false).unwrap();
+        assert_eq!(
+            r2.commitment_dup, 0,
+            "the machine's own reject is not a verdict"
+        );
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_candidate WHERE status = 'proposed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "the surviving twin outlives repeated sweeps");
+    }
+
+    #[test]
+    fn a_future_due_date_outranks_an_old_episode() {
+        let conn = open_memory().unwrap();
+        let (ep_id, _) = crate::episode::upsert_episode(
+            &conn,
+            &crate::episode::Episode {
+                id: 0,
+                uid: String::new(),
+                source: "bee.conversation".into(),
+                source_id: "old".into(),
+                source_ref: None,
+                body: "grant planning".into(),
+                occurred_at: "2020-01-01 10:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: "personal".into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, proposed_by, episode_id, confidence)
+             VALUES (?1, 'llm:commitment', ?2, 0.8)",
+            params![
+                serde_json::json!({
+                    "kind": "commitment", "who": "Nadia",
+                    "what": "Submit the grant renewal",
+                    "when": "2999-12-01", "direction": "owed_by_me", "confidence": 0.8
+                })
+                .to_string(),
+                ep_id
+            ],
+        )
+        .unwrap();
+        // And a `when` that panics a byte slice: digit-led so the guard
+        // admits it, with a multibyte char straddling byte 10 — `w[..10]`
+        // on this string is a panic, `get(..10)` is a None.
+        stage_commitment(
+            &conn,
+            "Fix the encoding",
+            Some("2026-08-3übermorgen"),
+            "proposed",
+        );
+
+        let report = precheck_pending(&conn, None, false).unwrap();
+        assert_eq!(
+            report.commitment_stale, 0,
+            "a live future due date is a reminder worth keeping, however old its episode"
+        );
+        assert_eq!(report.left_for_review, 2);
+    }
+
+    #[test]
+    fn commitment_triage_dry_run_touches_nothing() {
+        let conn = open_memory().unwrap();
+        stage_commitment(&conn, "Send the pilot data", None, "rejected");
+        stage_commitment(&conn, "send the pilot data", Some("2020-01-01"), "proposed");
+        let report = precheck_pending_opts(&conn, None, false, true).unwrap();
+        assert_eq!(report.commitment_dup, 1);
+        let untouched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_candidate WHERE status = 'proposed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 1, "a dry run counts and changes nothing");
+    }
 }
 
 // ─── Cluster review (PLAN.md Wave 1d) ────────────────────────────────────────
@@ -1906,10 +2445,25 @@ pub struct ReviewCluster {
     pub pending: usize,
     pub conf_min: f64,
     pub conf_max: f64,
-    /// Historical verdicts on this same (proposer, predicate) key —
+    /// Historical HUMAN verdicts on this same (proposer, predicate) key —
     /// the free precision prior mined from past review decisions.
+    ///
+    /// Machine rejects (`reject_reason LIKE 'precheck:%'`) are excluded — the
+    /// filter `ladder::human_record` already applies, here for a sharper
+    /// reason. This is the number a person reads immediately before
+    /// verdicting a whole class, so counting our own dedup passes as their
+    /// rejections argues them into rejecting classes they in fact accept.
+    /// Measured 2026-08-22 on the contaminated form: `llm/has` displayed 18%
+    /// against a true 67% over 48 human verdicts, `llm/has_role` 7% against
+    /// 53%, and three classes displayed a 0% accept rate on which no human
+    /// had ever voted at all.
     pub accepted_hist: i64,
     pub rejected_hist: i64,
+    /// Rejections this pipeline made itself — dups, ephemerals. Reported
+    /// beside the human record rather than folded into it: a duplicate-heavy
+    /// class is worth seeing as duplicate-heavy, which is an argument about
+    /// the extractor rather than about the predicate.
+    pub machine_rejected: i64,
     /// Commitments materialize tasks — never bulk-verdict them.
     pub commitment: bool,
     /// Autonomy-ladder rung (V012): staged | sampled | trusted.
@@ -1948,21 +2502,31 @@ fn candidate_text(payload: &serde_json::Value) -> String {
 /// history and spread samples. Sorted by pending count, largest first —
 /// the order in which one interaction resolves the most items.
 pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewCluster>> {
-    // Verdict history per key (the whole table, not just pending).
-    let mut hist: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    // Verdict history per key (the whole table, not just pending). Human
+    // accepts and rejects are counted apart from the pipeline's own rejects
+    // — see `ReviewCluster::accepted_hist` for what folding them together
+    // cost.
+    let mut hist: HashMap<(String, String), (i64, i64, i64)> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
+        // The human predicate is the ladder's, shared so the rate a person
+        // reads before verdicting a class is the rate promotion runs on —
+        // machine accepts (auto lanes, cascades) excluded beside the
+        // machine rejects that were already out.
+        let human = crate::ladder::HUMAN_VERDICT_SQL;
+        let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(proposed_by,'?'),
                     COALESCE(json_extract(payload,'$.predicate'),
                              '(' || COALESCE(json_extract(payload,'$.kind'),'none') || ')'),
-                    SUM(status='accepted'), SUM(status='rejected')
+                    SUM(status='accepted' AND {human}),
+                    SUM(status='rejected' AND {human}),
+                    SUM(NOT {human})
              FROM fact_candidate WHERE status IN ('accepted','rejected')
-             GROUP BY 1, 2",
-        )?;
+             GROUP BY 1, 2"
+        ))?;
         for row in stmt.query_map([], |r| {
             Ok((
                 (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
-                (r.get(2)?, r.get(3)?),
+                (r.get(2)?, r.get(3)?, r.get(4)?),
             ))
         })? {
             let (k, v) = row?;
@@ -1999,10 +2563,10 @@ pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewC
             .take(sample_n)
             .map(|c| candidate_text(&c.payload))
             .collect();
-        let (a, r) = hist
+        let (a, r, mach) = hist
             .get(&(pb.clone(), pred.clone()))
             .copied()
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
         let (rung, streak) = rungs
             .get(&(pb.clone(), pred.clone()))
             .cloned()
@@ -2015,6 +2579,7 @@ pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewC
             conf_max: confs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
             accepted_hist: a,
             rejected_hist: r,
+            machine_rejected: mach,
             commitment,
             rung,
             streak,
@@ -2023,4 +2588,108 @@ pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewC
     }
     clusters.sort_by(|a, b| b.pending.cmp(&a.pending));
     Ok(clusters)
+}
+
+/// One proposing mechanism's record — the gossip harness, a linker, the LLM
+/// extractor, Bee's suggestions, a rule.
+///
+/// The layer above `ReviewCluster`, and it answers a question the cluster
+/// view structurally cannot: *is this mechanism worth running?* A proposer
+/// spreads across many predicates (the extractor alone holds ~90), so its
+/// own hit rate is invisible in a list of 733 (proposer, predicate) rows —
+/// and the mechanisms are what get switched on, tuned, and switched off.
+///
+/// Rates here are HUMAN verdicts only, for the reason in
+/// [`ReviewCluster::accepted_hist`]. A mechanism whose output is mostly
+/// duplicates is a different problem from one whose output is mostly wrong,
+/// so `machine_rejected` is reported beside the record and never inside it.
+#[derive(Debug, Serialize)]
+pub struct ProposerStat {
+    pub proposer: String,
+    pub pending: usize,
+    /// Distinct (proposer, predicate) classes with something pending.
+    pub classes: usize,
+    pub accepted_hist: i64,
+    pub rejected_hist: i64,
+    pub machine_rejected: i64,
+    /// Wilson lower bound on the human accept rate — the same statistic the
+    /// autonomy ladder promotes on, so a proposer's headline number and the
+    /// gate its classes face are read off one scale. `None` when no human
+    /// has voted: an unknown rate must not render as zero, which is the
+    /// distinction that made the whole queue look like junk.
+    pub accept_lb: Option<f64>,
+    /// When the oldest thing still pending arrived. Depth says how much is
+    /// waiting; this says how long — and a queue that reached 6,434 items
+    /// unnoticed is a story about the second number, not the first.
+    /// `None` when nothing is pending.
+    pub oldest: Option<String>,
+}
+
+impl ProposerStat {
+    /// Human verdicts recorded, accepts and rejects together.
+    pub fn judged(&self) -> i64 {
+        self.accepted_hist + self.rejected_hist
+    }
+    /// Raw human accept rate. `None` over an empty denominator — "nothing
+    /// went wrong" and "nothing happened" are different answers.
+    pub fn accept_rate(&self) -> Option<f64> {
+        match self.judged() {
+            0 => None,
+            n => Some(self.accepted_hist as f64 / n as f64),
+        }
+    }
+}
+
+/// Roll the pending queue up by proposing mechanism.
+///
+/// Built from [`review_clusters`] rather than from its own query, so the two
+/// views can never disagree about what a class is or what its record says —
+/// the cluster key and the human-only filter are defined once.
+pub fn proposer_stats(conn: &Connection) -> Result<Vec<ProposerStat>> {
+    let clusters = review_clusters(conn, 0)?;
+    let mut by: std::collections::BTreeMap<String, ProposerStat> =
+        std::collections::BTreeMap::new();
+    for cl in &clusters {
+        let e = by
+            .entry(cl.proposed_by.clone())
+            .or_insert_with(|| ProposerStat {
+                proposer: cl.proposed_by.clone(),
+                pending: 0,
+                classes: 0,
+                accepted_hist: 0,
+                rejected_hist: 0,
+                machine_rejected: 0,
+                accept_lb: None,
+                oldest: None,
+            });
+        e.pending += cl.pending;
+        e.classes += 1;
+        e.accepted_hist += cl.accepted_hist;
+        e.rejected_hist += cl.rejected_hist;
+        e.machine_rejected += cl.machine_rejected;
+    }
+    let mut out: Vec<ProposerStat> = by.into_values().collect();
+    for s in &mut out {
+        s.accept_lb = match s.judged() {
+            0 => None,
+            n => Some(crate::ladder::wilson_lower_bound(s.accepted_hist, n)),
+        };
+    }
+    // One query for the ages rather than threading a timestamp through the
+    // cluster rollup: the clusters are grouped for a different purpose and
+    // carrying a min through them would make every caller pay for it.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT proposed_by, MIN(created_at) FROM fact_candidate
+             WHERE status = 'proposed' GROUP BY proposed_by",
+        )?;
+        let ages: std::collections::HashMap<String, String> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for s in &mut out {
+            s.oldest = ages.get(&s.proposer).cloned();
+        }
+    }
+    out.sort_by(|a, b| b.pending.cmp(&a.pending));
+    Ok(out)
 }

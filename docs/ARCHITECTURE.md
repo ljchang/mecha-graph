@@ -338,7 +338,9 @@ A Reflect note titled `Iris Calder` with `Type: #person`,
    creating a duplicate; `Company: Westfield` becomes a **fact**
    (`works_at`, extractor `reflect`, pointing at this episode); the
    episode gets a **mention** of Iris.
-3. `pkg link --auto` scans every episode for known names → more mentions;
+3. `pkg link` scans every episode for known names → more mentions
+   (its candidate-staging tiers — kNN, structural, rules — run only with
+   `--propose`, off in the nightly by default);
    NPMI notices who co-occurs with Iris unusually often → `related_to`
    facts; kNN and Adamic-Adar stage speculative candidates for review.
 4. A query for "iris westfield" detects the entity, collapses to episodes

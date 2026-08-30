@@ -104,11 +104,19 @@ pub fn render_pack(pack: &ContextPack, style: &Style) -> String {
                 out.push_str(&format!("\n{} {}\n", style.accent("→"), item.text));
             }
             "fact" => {
+                // An unreviewed (shadow) fact never renders unlabeled —
+                // the reader is the review trigger, so the label is load-
+                // bearing, not decoration.
+                let label = if item.tier.is_some() {
+                    "[fact · unreviewed]"
+                } else {
+                    "[fact]"
+                };
                 out.push_str(&format!(
                     "\n{}. {} {}\n",
                     i + 1,
                     item.text,
-                    style.dim("[fact]")
+                    style.dim(label)
                 ));
             }
             _ => {
@@ -187,6 +195,26 @@ pub fn render_stats(h: &HealthStats, style: &Style) -> String {
         "  decayed beliefs {} (valid time closed, never invalidated)\n",
         h.decayed_beliefs
     ));
+
+    // The graph's only ground truth of usefulness: accept rate says a fact
+    // isn't wrong, retrieval says it was worth having. A class accepted
+    // politely and never served is clutter with a good review record —
+    // this is the number that decides what to stop generating.
+    out.push_str(&format!(
+        "\nshadow (unreviewed): {} live · {} ever served · {} surfaced for verdict\n",
+        h.shadow_live, h.shadow_served, h.shadow_surfaced
+    ));
+    out.push_str(&style.bold("\nfact usage (ever retrieved, by extractor)\n"));
+    for u in &h.fact_usage {
+        let pct = match u.retrieved_pct {
+            Some(p) => format!("{p:.0}%"),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:<32} {:>6} live · {:>5} retrieved ({:>4}) · {:>6} serves\n",
+            u.extractor, u.live, u.retrieved, pct, u.touches
+        ));
+    }
 
     out.push_str(&style.bold("\nsources\n"));
     for s in &h.ingest_state {

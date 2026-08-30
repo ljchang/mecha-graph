@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-22
+
+### Fixed
+
+- **A class's displayed accept rate counted this pipeline's own rejections as
+  the owner's.** `precheck::review_clusters` summed every `status='rejected'`
+  row, including the dedup and ephemeral rejects `precheck` writes itself —
+  in the one view a person reads *immediately before verdicting a whole
+  class*. Measured on a live store: `llm/has` displayed 18% against a true
+  67% over 48 human verdicts, `llm/has_role` 7% against 53%, `llm/attended`
+  39% against 81%, and three classes displayed a 0% accept rate on which no
+  human had ever voted at all. `ladder::human_record` had carried the correct
+  filter (`reject_reason NOT LIKE 'precheck:%'`) since it was written; the
+  cluster view never did. Machine rejects are now reported beside the rate as
+  `machine_rejected` and never inside it — a class that mostly repeats itself
+  is a different problem from one that is mostly wrong.
+
+- **`review --json` no longer prints prose ahead of the array.** An empty
+  result emitted `no pending candidates` and then `[]`, so the whole of stdout
+  failed to parse and a caller asking for an empty set got a JSON error
+  instead of `[]`.
+
+### Added
+
+- **`review --proposers` — the queue rolled up by proposing mechanism**, with
+  each one's *human* accept rate and Wilson lower bound, and `p` in the TUI
+  for the same view. A proposer spreads across many predicates (the extractor
+  alone holds ~90), so its own hit rate is invisible in a list of 733
+  `(proposer, predicate)` rows — and mechanisms are what get switched on,
+  tuned, and switched off. An unjudged mechanism shows a dash, never 0%:
+  "never reviewed" and "always rejected" are opposite findings.
+
+- **`review --sample N [--seed S]` — a uniform random draw** from what
+  `--proposer` / `--predicate` left. The queue is ordered, every order it
+  could have is correlated with something, and judging the first N then
+  reading the result as a class's accept rate measures the ordering. The seed
+  is printed when not supplied, because a sample nobody can redraw is a sample
+  nobody can check. Partial Fisher–Yates over a four-line splitmix64, with a
+  uniformity test over 4,000 draws that fails on `truncate(k)`.
+
+- **`review --proposer` / `--predicate`** filter the item view, matching on
+  `precheck::cluster_key` so a drill-down can never show a different set than
+  the cluster row it came from.
+
+
 ## [0.1.2] - 2026-08-22
 
 ### Fixed

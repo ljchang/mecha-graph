@@ -59,6 +59,12 @@ pub struct PackItem {
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// V021 review-on-use: Some(tier) for an UNREVIEWED (shadow) fact —
+    /// the label consumers must carry beside the extractor. None for
+    /// reviewed facts and every non-fact item, keeping their serialized
+    /// shape byte-identical to pre-V021 packs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     pub text: String,
 }
 
@@ -761,6 +767,7 @@ pub fn query_lens(
                         valid_from: None,
                         source: Some("person_interaction".into()),
                         tags: vec![],
+                        tier: None,
                         text,
                     });
                     graph::increment_node_access(conn, &e.node_id)?;
@@ -970,6 +977,10 @@ fn recall_into(
                 None => f.statement.clone(),
             };
             let nudge = touch_nudge(conn, "fact", &f.uid);
+            // Provenance labeling (review-on-use): a shadow fact is served,
+            // but never silently — the consumer sees `unreviewed` beside
+            // the extractor it already gets.
+            let tier = f.is_shadow().then(|| f.tier.clone());
             pack.items.push(PackItem {
                 kind: "fact".into(),
                 id: f.uid,
@@ -978,6 +989,7 @@ fn recall_into(
                 valid_from: f.valid_from,
                 source: f.extractor,
                 tags: vec![],
+                tier,
                 text,
             });
         }
@@ -1024,6 +1036,7 @@ fn recall_into(
             valid_from: None,
             source: Some(ep.source),
             tags: episode::tags_for(conn, hit.id)?,
+            tier: None,
             text: preview,
         });
     }
@@ -1113,6 +1126,7 @@ fn anchored_fallback(
             valid_from: None,
             source: Some(ep.source),
             tags: episode::tags_for(conn, ep.id)?,
+            tier: None,
             text: preview,
         });
     }
@@ -1184,6 +1198,7 @@ fn aggregate_into(
                 valid_from: None,
                 source: Some(source.clone()),
                 tags: vec![],
+                tier: None,
                 text: format!("{}: {} episodes via {}", e.name, count, source),
             });
         }
@@ -1232,6 +1247,7 @@ fn aggregate_into(
                 valid_from: None,
                 source: Some("person_interaction".into()),
                 tags: vec![],
+                tier: None,
                 text: format!("{name} — {count} interactions{last}"),
             });
         }
@@ -1254,6 +1270,7 @@ fn aggregate_into(
                 valid_from: None,
                 source: Some(source.clone()),
                 tags: vec![],
+                tier: None,
                 text: format!("{count} episodes from {source}"),
             });
         }
@@ -2033,22 +2050,13 @@ mod tests {
                 Some("2026-01-01 00:00:00".into()),
                 Some("2027-01-01 00:00:00".into()),
             );
-            query_lens(
-                &conn,
-                None,
-                "Rosa Marin pilot",
-                10,
-                4000,
-                true,
-                None,
-                lens,
-            )
-            .unwrap()
-            .items
-            .iter()
-            .filter(|i| i.kind == "episode")
-            .filter_map(|i| i.occurred_at.clone())
-            .collect()
+            query_lens(&conn, None, "Rosa Marin pilot", 10, 4000, true, None, lens)
+                .unwrap()
+                .items
+                .iter()
+                .filter(|i| i.kind == "episode")
+                .filter_map(|i| i.occurred_at.clone())
+                .collect()
         };
 
         // Same era on both sides — the precondition for a meaningful diff.

@@ -461,10 +461,7 @@ mod tests {
         assert_eq!(ev.dtstart.as_deref(), Some("2026-07-30 14:00:00"));
         assert_eq!(ev.attendees.len(), 2);
         // Folded ATTENDEE line must still parse.
-        assert_eq!(
-            ev.attendees[1].0.as_deref(),
-            Some("june.chen@example.edu")
-        );
+        assert_eq!(ev.attendees[1].0.as_deref(), Some("june.chen@example.edu"));
         assert_eq!(ev.attendees[1].1, "June Chen");
         assert_eq!(ev.description, "Pilot data review, then Aim 2 planning.");
     }
