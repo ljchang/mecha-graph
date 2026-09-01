@@ -2,6 +2,26 @@
 //! Gold queries live in `eval/gold.jsonl`; `run` reports recall@10 and MRR
 //! per job so a change that helps one job and hurts another is visible.
 
+/// Default gold-set path: `~/.mecha-graph/eval/gold.jsonl`, overridable via
+/// `MECHA_GRAPH_GOLD`.
+///
+/// **Outside the repository, because the gold set is not code.** Its queries
+/// are mined from real episodes, so it was one of ten files an export script
+/// stripped before this repo could be published — and keeping it in-tree was
+/// the reason a second, private checkout had to exist at all. Same shape as
+/// [`crate::db::default_db_path`]: the data lives in `~/.mecha-graph/`, the
+/// code lives here, and nothing has to be stripped on the way out.
+pub fn default_gold_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("MECHA_GRAPH_GOLD") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home)
+        .join(".mecha-graph")
+        .join("eval")
+        .join("gold.jsonl")
+}
+
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::router;

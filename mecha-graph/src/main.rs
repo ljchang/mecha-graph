@@ -458,8 +458,11 @@ enum Command {
     },
     /// Run the gold-set eval
     Eval {
-        #[arg(long, default_value = "eval/gold.jsonl")]
-        gold: PathBuf,
+        /// Gold queries. Defaults to `~/.mecha-graph/eval/gold.jsonl` —
+        /// outside the repo, because the set is mined from real episodes.
+        /// Override with `--gold` or `MECHA_GRAPH_GOLD`.
+        #[arg(long)]
+        gold: Option<PathBuf>,
     },
     /// Tier-7 LLM extraction over pending episodes → fact candidates
     Extract {
@@ -651,6 +654,24 @@ enum Command {
         /// worth reading. Do not put it in the nightly.
         #[arg(long)]
         include_cold: bool,
+        /// Drop targets witnessed by fewer than N distinct sources.
+        ///
+        /// Gossip is two readers over independent sources, so `2` is its
+        /// precondition: below that the probe is refused ("one witness
+        /// cannot gossip"), exits 0 and produces nothing — while the node's
+        /// slot-gaps stay open, so it scores just as highly tomorrow. One
+        /// node was picked on five consecutive nights that way
+        /// (2026-08-28 → 2026-09-01), a third of the nightly budget spent
+        /// on a probe that could not run.
+        ///
+        /// **Necessary, not sufficient**, and off by default: gossip also
+        /// wants `min_coverage` episodes per source inside its own window,
+        /// which is measured at probe time and is not knowable from SQL.
+        /// This removes only what no window could rescue. Default 0 keeps
+        /// experiments (and `--include-cold`, whose nodes are often
+        /// single-source) seeing the unfiltered ranking.
+        #[arg(long, default_value_t = 0)]
+        min_sources: i64,
     },
     /// Process unhandled `meta.corrections` arrays from agent episodes
     /// (D3): supersede the wrong fact, stage the replacement, demote the
@@ -2786,12 +2807,56 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         }
 
         Command::BeeFacts { pull_limit } => {
+            use mecha_graph_core::sources::bee::BEE_PUSH_STUCK_ATTEMPTS;
             let r = mecha_graph_core::sources::bee::sync_bee_facts(&conn, pull_limit)?;
+            let stuck = r
+                .push_failures
+                .iter()
+                .filter(|f| f.attempts >= BEE_PUSH_STUCK_ATTEMPTS)
+                .count();
             println!(
                 "bee facts: {} staged for review · {} confirmed in Bee · {} deleted in Bee{}",
-                r.staged, r.confirmed, r.deleted,
-                if r.push_errors > 0 { format!(" · {} push errors (will retry)", r.push_errors) } else { String::new() }
+                r.staged,
+                r.confirmed,
+                r.deleted,
+                // **"will retry" only while that is still a forecast.** Past
+                // the stuck threshold the retry has been tried and has not
+                // worked, and saying "will retry" there is what let one
+                // verdict fail for eight nights while reading as routine.
+                if r.push_errors == 0 {
+                    String::new()
+                } else if stuck > 0 {
+                    format!(
+                        " · {} push error(s), {stuck} STUCK (see below)",
+                        r.push_errors
+                    )
+                } else {
+                    format!(" · {} push error(s) (will retry)", r.push_errors)
+                }
             );
+            // The reason, on stderr beside the summary. A count that names
+            // no cause cannot be acted on, which is the whole finding here.
+            // Capped like the decay alarm printer in this same binary. If
+            // the `bee` CLI is unreachable — a documented failure mode; the
+            // nightly's own header describes the D-Bus/keyring outage that
+            // broke ingestion — EVERY pending verdict fails in one sweep,
+            // and an uncapped loop turns one outage into a page of stderr.
+            for f in r.push_failures.iter().take(10) {
+                let verb = if f.accepted { "confirm" } else { "delete" };
+                let stuck_marker = if f.attempts >= BEE_PUSH_STUCK_ATTEMPTS {
+                    " ⚑ STUCK"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "  bee push failed{stuck_marker}: {verb} fact {} (candidate {}) — \
+                     attempt {}, failing since {} — {}",
+                    f.bee_fact_id, f.candidate_id, f.attempts, f.first_failed_at, f.error
+                );
+            }
+            if r.push_failures.len() > 10 {
+                eprintln!("  … and {} more", r.push_failures.len() - 10);
+            }
         }
 
         Command::Precheck { auto_accept, no_semantic, dry_run } => {
@@ -3259,8 +3324,21 @@ reject: it was never true (retracted; the class learns)"
             }
         }
 
-        Command::ProbeTargets { limit, include_cold } => {
-            let targets = mecha_graph_core::probe::probe_targets_opts(&conn, limit, include_cold)?;
+        Command::ProbeTargets { limit, include_cold, min_sources } => {
+            // Filter before truncating to `limit`, or a run asking for 25
+            // gets 25-minus-the-rejects and the caller silently sees fewer
+            // targets than it asked for. Ask deep, filter, then cut.
+            // `> 0`, not `> 1`: `retain` runs for any positive floor, and
+            // `sources == 0` is reachable — a node with retrieval touches
+            // but no mention rows ranks and reports zero. At `--min-sources
+            // 1` the old guard skipped the deep fetch and then filtered
+            // anyway, which is exactly what the comment below says must not
+            // happen. The condition was one off from its own comment.
+            let deep = if min_sources > 0 { limit.saturating_mul(4).max(50) } else { limit };
+            let mut targets =
+                mecha_graph_core::probe::probe_targets_opts(&conn, deep, include_cold)?;
+            targets.retain(|t| t.sources >= min_sources);
+            targets.truncate(limit);
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&targets)?);
             } else {
@@ -3609,6 +3687,16 @@ reject: it was never true (retracted; the class learns)"
         }
 
         Command::Eval { gold } => {
+            let gold = gold.unwrap_or_else(eval::default_gold_path);
+            // Named, because "no such file" on a path the user never typed is
+            // the confusing half of moving a default out of the repo.
+            if !gold.exists() {
+                return Err(mecha_graph_core::error::Error::Other(format!(
+                    "no gold set at {} — it lives outside the repo, because it is mined \
+                     from real episodes. Pass --gold, or set MECHA_GRAPH_GOLD.",
+                    gold.display()
+                )));
+            }
             let queries = eval::load_gold(&gold)?;
             let embedder = embed::Embedder::default();
             let emb = embedder.available().then_some(&embedder);

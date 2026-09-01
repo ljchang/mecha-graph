@@ -40,6 +40,14 @@ pub struct ProbeTarget {
     pub node_type: String,
     /// Demand: times this node was served or resolved (retrieval_touch).
     pub touches: i64,
+    /// How many distinct episode sources hold a mention of this node.
+    ///
+    /// Gossip is two readers over *independent sources*, so a node every
+    /// witness to which is one source cannot be gossiped at all — the run
+    /// refuses with "one witness cannot gossip", exits 0 and produces
+    /// nothing. Carried so a caller can see the precondition rather than
+    /// discover it a probe later.
+    pub sources: i64,
     /// Required predicate slots with no live positive fact.
     pub missing_slots: Vec<String>,
     /// Live facts past their predicate's half-life: (predicate, statement).
@@ -195,6 +203,25 @@ pub fn probe_targets_opts(
             continue; // complete and current — nothing to probe
         }
 
+        // How many distinct sources witness this node.
+        //
+        // **Reported, never enforced here.** This module ranks and the
+        // caller disposes — gossip's two-source rule is gossip's, and a
+        // fork experiment measuring single-source behaviour is a legitimate
+        // caller that a filter in the ranker would silently starve. The
+        // production filter is `--min-sources`, applied by the one consumer
+        // that has the precondition.
+        // `prepare_cached` like the three sibling queries in this loop —
+        // it was the only statement here re-prepared per node.
+        let sources: i64 = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COUNT(DISTINCT e.source)
+                 FROM mention m JOIN episode e ON e.id = m.episode_id
+                 WHERE m.node_id = ?1",
+            )?;
+            stmt.query_row(params![node_id], |r| r.get(0))?
+        };
+
         // Fresh λ>0 facts, minus the stale set — verification candidates.
         let verify_facts: Vec<(String, String)> = {
             let mut stmt = conn.prepare_cached(
@@ -220,6 +247,7 @@ pub fn probe_targets_opts(
             aliases,
             node_type,
             touches,
+            sources,
             missing_slots,
             stale_facts,
             verify_facts,

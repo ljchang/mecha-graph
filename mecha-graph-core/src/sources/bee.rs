@@ -556,7 +556,40 @@ pub struct BeeFactsReport {
     pub confirmed: usize,
     pub deleted: usize,
     pub push_errors: usize,
+    /// One entry per verdict that failed to push, with the reason and how
+    /// long it has been failing.
+    ///
+    /// **A count alone cannot tell a first failure from a permanent one.**
+    /// `Err(_) => report.push_errors += 1` discarded the reason and wrote
+    /// nothing to the row, so the candidate came back on the next sync
+    /// looking exactly like a fresh failure — and one verdict retried every
+    /// night from 2026-08-24 to 2026-09-01 under the label "will retry",
+    /// with no record anywhere of what was wrong. "Will retry" is a label,
+    /// not a mechanism: the retry needs somewhere to accumulate.
+    pub push_failures: Vec<BeePushFailure>,
 }
+
+/// A verdict that could not be pushed back to Bee, and its history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BeePushFailure {
+    pub candidate_id: i64,
+    pub bee_fact_id: i64,
+    /// Whether the verdict was accept (`confirm`) or reject (`delete`).
+    pub accepted: bool,
+    /// Consecutive failed attempts, this one included.
+    pub attempts: u32,
+    /// RFC 3339, when this verdict first failed to push.
+    pub first_failed_at: String,
+    /// The error from the last attempt, as `bee_json` reported it.
+    pub error: String,
+}
+
+/// Attempts after which a push is reported as stuck rather than retrying.
+///
+/// A permanent failure and a transient one are indistinguishable on the
+/// first night and obvious by the eighth; this is where the report stops
+/// saying "will retry" and starts naming it as something to look at.
+pub const BEE_PUSH_STUCK_ATTEMPTS: u32 = 3;
 
 fn bee_json(args: &[&str]) -> Result<serde_json::Value> {
     let output = std::process::Command::new("bee")
@@ -648,11 +681,32 @@ pub fn stage_bee_fact(conn: &Connection, id: i64, text: &str, tags: &[String]) -
     Ok(cid)
 }
 
-/// Reviewed-but-unpushed Bee candidates: (candidate id, bee fact id, accepted?).
-/// Public for tests.
-pub fn pending_bee_pushes(conn: &Connection) -> Result<Vec<(i64, i64, bool)>> {
+/// One pending verdict: the candidate, its Bee id, the verdict, and what
+/// the previous attempts did.
+///
+/// The last two fields are why this is a struct rather than the tuple it
+/// was: a retry that cannot see its own history reports every attempt as
+/// the first one.
+#[derive(Debug, Clone)]
+pub struct PendingBeePush {
+    pub candidate_id: i64,
+    pub bee_fact_id: i64,
+    pub accepted: bool,
+    /// Failed attempts so far. Zero on a verdict that has never been tried.
+    pub attempts: u32,
+    /// RFC 3339 of the first failure, if there has been one.
+    pub first_failed_at: Option<String>,
+}
+
+/// Reviewed-but-unpushed Bee candidates, with whatever their earlier push
+/// attempts recorded. Public for tests.
+pub fn pending_bee_pushes(conn: &Connection) -> Result<Vec<PendingBeePush>> {
     let mut stmt = conn.prepare(
-        "SELECT id, json_extract(payload, '$.bee_fact_id'), status
+        "SELECT id,
+                json_extract(payload, '$.bee_fact_id'),
+                status,
+                json_extract(payload, '$.bee_push_attempts'),
+                json_extract(payload, '$.bee_push_first_failed_at')
          FROM fact_candidate
          WHERE json_extract(payload, '$.bee_fact_id') IS NOT NULL
            AND json_extract(payload, '$.bee_pushed') IS NULL
@@ -660,14 +714,44 @@ pub fn pending_bee_pushes(conn: &Connection) -> Result<Vec<(i64, i64, bool)>> {
     )?;
     let rows = stmt
         .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)? == "accepted",
-            ))
+            Ok(PendingBeePush {
+                candidate_id: r.get::<_, i64>(0)?,
+                bee_fact_id: r.get::<_, i64>(1)?,
+                accepted: r.get::<_, String>(2)? == "accepted",
+                // A payload written before this column existed reads as
+                // zero attempts, which is the honest answer: nothing was
+                // recorded, so nothing is known to have failed.
+                attempts: r.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u32,
+                first_failed_at: r.get::<_, Option<String>>(4)?,
+            })
         })?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
+}
+
+/// Record a failed push on the candidate so the next sync can see it.
+///
+/// Increments the attempt count and stamps the first failure once. The
+/// error text is stored too: it is the thing that was missing when one
+/// verdict failed silently for eight consecutive nights.
+fn record_bee_push_error(
+    conn: &Connection,
+    candidate_id: i64,
+    attempts: u32,
+    first_failed_at: &str,
+    message: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE fact_candidate
+         SET payload = json_set(
+                 payload,
+                 '$.bee_push_attempts', ?2,
+                 '$.bee_push_first_failed_at', ?3,
+                 '$.bee_push_error', ?4)
+         WHERE id = ?1",
+        rusqlite::params![candidate_id, attempts, first_failed_at, message],
+    )?;
+    Ok(())
 }
 
 fn mark_bee_pushed(conn: &Connection, candidate_id: i64) -> Result<()> {
@@ -684,8 +768,10 @@ fn mark_bee_pushed(conn: &Connection, candidate_id: i64) -> Result<()> {
 /// `pull_limit` per sync so a 1000-fact backlog drains gradually instead of
 /// swamping the review queue), push reviewed verdicts back. Pages continue
 /// past already-staged items, so repeated runs reach deeper into the
-/// backlog. CLI failures on push are counted, not fatal — the candidate
-/// stays unpushed and retries next sync.
+/// backlog. CLI failures on push are recorded, not fatal — the candidate
+/// stays unpushed and retries next sync, carrying its attempt count, the
+/// time it first failed and the last error, so a push that will never
+/// succeed stops looking like one that just started failing.
 pub fn sync_bee_facts(conn: &Connection, pull_limit: usize) -> Result<BeeFactsReport> {
     let mut report = BeeFactsReport::default();
     let already = staged_bee_ids(conn)?;
@@ -753,18 +839,59 @@ pub fn sync_bee_facts(conn: &Connection, pull_limit: usize) -> Result<BeeFactsRe
     }
 
     // Push verdicts.
-    for (cid, bee_id, accepted) in pending_bee_pushes(conn)? {
-        let sub = if accepted { "confirm" } else { "delete" };
-        match bee_json(&["facts", sub, &bee_id.to_string()]) {
+    for pending in pending_bee_pushes(conn)? {
+        let sub = if pending.accepted {
+            "confirm"
+        } else {
+            "delete"
+        };
+        match bee_json(&["facts", sub, &pending.bee_fact_id.to_string()]) {
             Ok(_) => {
-                mark_bee_pushed(conn, cid)?;
-                if accepted {
+                mark_bee_pushed(conn, pending.candidate_id)?;
+                if pending.accepted {
                     report.confirmed += 1;
                 } else {
                     report.deleted += 1;
                 }
             }
-            Err(_) => report.push_errors += 1,
+            // **Bind the error.** It was `Err(_)`, which threw away the one
+            // thing a reader needed: the row was never marked, so it came
+            // back every night looking new, and the reason it failed existed
+            // nowhere — not in the log, not on the candidate, not in the
+            // report. Eight nights of "1 push errors (will retry)" and no
+            // way to learn what was wrong without changing the code first.
+            Err(e) => {
+                let message = format!("{e}");
+                let attempts = pending.attempts.saturating_add(1);
+                let first_failed_at = pending
+                    .first_failed_at
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                // Best-effort, like every other write in this sweep: failing
+                // the whole sync because the *bookkeeping* about a failure
+                // could not be written would turn one stuck verdict into a
+                // stuck pipeline.
+                if let Err(write_err) = record_bee_push_error(
+                    conn,
+                    pending.candidate_id,
+                    attempts,
+                    &first_failed_at,
+                    &message,
+                ) {
+                    eprintln!(
+                        "bee: could not record push failure for candidate {}: {write_err}",
+                        pending.candidate_id
+                    );
+                }
+                report.push_errors += 1;
+                report.push_failures.push(BeePushFailure {
+                    candidate_id: pending.candidate_id,
+                    bee_fact_id: pending.bee_fact_id,
+                    accepted: pending.accepted,
+                    attempts,
+                    first_failed_at,
+                    error: message,
+                });
+            }
         }
     }
     Ok(report)
@@ -909,7 +1036,101 @@ You spent time planning the spring planting.
         // Reject → queued as a delete push; marking clears it.
         crate::fact::reject_candidate(&conn, cid, "noise").unwrap();
         let pushes = pending_bee_pushes(&conn).unwrap();
-        assert_eq!(pushes, vec![(cid, 42, false)]);
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].candidate_id, cid);
+        assert_eq!(pushes[0].bee_fact_id, 42);
+        assert!(!pushes[0].accepted);
+        // Never tried, so no failure history — the state the old tuple
+        // could not express and the retry therefore could not see.
+        assert_eq!(pushes[0].attempts, 0);
+        assert!(pushes[0].first_failed_at.is_none());
+        mark_bee_pushed(&conn, cid).unwrap();
+        assert!(pending_bee_pushes(&conn).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod push_failure_tests {
+    use super::*;
+
+    fn pending_candidate(conn: &Connection, bee_fact_id: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, status) VALUES (?1, 'accepted')",
+            rusqlite::params![format!(r#"{{"bee_fact_id":{bee_fact_id}}}"#)],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// **The regression, stated as a test.** The push arm was
+    /// `Err(_) => report.push_errors += 1`: nothing was written to the row,
+    /// so the next sync re-read the candidate with no history and every
+    /// attempt looked like the first one. One verdict retried nightly from
+    /// 2026-08-24 to 2026-09-01 under "will retry", and the reason it failed
+    /// was recorded nowhere.
+    ///
+    /// Fails on the old behaviour at the second assertion: `attempts` stayed
+    /// 0 forever, so nothing could ever cross [`BEE_PUSH_STUCK_ATTEMPTS`].
+    #[test]
+    fn a_failed_push_accumulates_attempts_across_syncs() {
+        let conn = crate::db::open_memory().unwrap();
+        let cid = pending_candidate(&conn, 4242);
+
+        // First sync: never tried, so no history.
+        let first = pending_bee_pushes(&conn).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].attempts, 0);
+        assert!(first[0].first_failed_at.is_none());
+
+        record_bee_push_error(
+            &conn,
+            cid,
+            1,
+            "2026-08-24T01:38:00Z",
+            "bee facts confirm failed",
+        )
+        .unwrap();
+
+        // Second sync sees the first failure rather than a clean slate.
+        let second = pending_bee_pushes(&conn).unwrap();
+        assert_eq!(second[0].attempts, 1, "the attempt must survive the sync");
+        assert_eq!(
+            second[0].first_failed_at.as_deref(),
+            Some("2026-08-24T01:38:00Z")
+        );
+
+        // And the first failure's timestamp is what ages it: later attempts
+        // increment the count and leave the origin alone, so "failing since"
+        // means since the first failure, not since the last one.
+        record_bee_push_error(&conn, cid, 2, "2026-08-24T01:38:00Z", "still failing").unwrap();
+        let third = pending_bee_pushes(&conn).unwrap();
+        assert_eq!(third[0].attempts, 2);
+        assert_eq!(
+            third[0].first_failed_at.as_deref(),
+            Some("2026-08-24T01:38:00Z"),
+            "first_failed_at is stamped once, not refreshed"
+        );
+    }
+
+    /// A payload written before this branch has no attempt fields, and must
+    /// read as "nothing known to have failed" rather than failing the query.
+    /// The append-only-store rule: an unknown field degrades to a default.
+    #[test]
+    fn a_payload_predating_the_attempt_fields_reads_as_zero() {
+        let conn = crate::db::open_memory().unwrap();
+        pending_candidate(&conn, 7);
+        let rows = pending_bee_pushes(&conn).unwrap();
+        assert_eq!(rows[0].attempts, 0);
+        assert!(rows[0].first_failed_at.is_none());
+    }
+
+    /// A pushed verdict leaves the queue — the idempotence the sync relies
+    /// on, and the negative that makes the test above non-vacuous.
+    #[test]
+    fn a_pushed_verdict_stops_being_pending() {
+        let conn = crate::db::open_memory().unwrap();
+        let cid = pending_candidate(&conn, 99);
+        assert_eq!(pending_bee_pushes(&conn).unwrap().len(), 1);
         mark_bee_pushed(&conn, cid).unwrap();
         assert!(pending_bee_pushes(&conn).unwrap().is_empty());
     }
