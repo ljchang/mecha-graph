@@ -1,0 +1,101 @@
+name: Claude PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: review
+    runs-on: ubuntu-latest
+    # Two exclusions, both for the same reason: a red X that means "no
+    # credential" is worse than no check at all.
+    #
+    # A pull request from a fork gets no access to repository secrets, so the
+    # action cannot authenticate and would fail on every external contribution.
+    #
+    # A Dependabot pull request reads Dependabot's own secret store rather than
+    # the repository's, so it cannot authenticate either — and an LLM review of
+    # a version bump is not worth the tokens even when it can.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot'
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # A subscription credential, not a metered API key: Pro/Max plans
+          # authenticate the action through OAuth, so a review costs plan
+          # usage rather than API credits. Generate with `claude setup-token`
+          # and store as CLAUDE_CODE_OAUTH_TOKEN.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. The PR branch is already checked out.
+            Read CLAUDE.md and docs/ARCHITECTURE.md before judging the diff —
+            this codebase records why each decision was made beside the code
+            that implements it, and most real defects here undo one of those
+            rather than being ordinary bugs.
+
+            Weight your attention in this order:
+
+            1. **The public denylist.** This repository is public and holds a
+               personal knowledge graph's code. A real name, address, place or
+               identifier in a comment, fixture, test or doc is the most
+               expensive defect this repo can ship, and it cannot be taken
+               back once pushed. The roster itself is deliberately not in the
+               repository — do NOT try to reconstruct it or guess its contents,
+               and never quote a suspected term in your review. Flag the FILE
+               and say that a human must check it. `.github/workflows/
+               denylist.yml` runs the real gate; if it is red, say so plainly
+               and treat everything else as secondary.
+
+            2. **Migrations are append-only and numbered.** A new migration
+               must take the next free version — a duplicate silently SKIPS
+               the real migration of that number, which on 2026-09-01 meant
+               `reviewed_by` was never created and nine unrelated tests failed
+               with "no such column". Check the number is unique and that the
+               array is appended to, not inserted into.
+
+            3. **A new table must join `db.rs`'s `COPY_TABLES`,** or `decrypt`,
+               `encrypt_in_place` and `fork_db` silently drop it from every
+               snapshot. And the copy must tolerate a source that predates the
+               migration: `src` is attached as-is and never migrated, so an
+               unconditional INSERT breaks every archived `.bak`.
+
+            4. **Guards fail closed, and unknown is never clean.** A check that
+               cannot run must stop the run rather than pass. A rate over an
+               empty denominator is `None`, not zero; an unreadable store is a
+               finding, not an empty queue. Look for a `dry_run` path that
+               writes — on 2026-09-01 an alarm's bookkeeping ignored `dry_run`,
+               so the preview CONSUMED the finding and the real run reported
+               nothing.
+
+            5. **An outcome that leaves no record cannot be aged.** A retry
+               driven by a store only successes write to repeats forever. Look
+               for `Err(_)` that discards a reason, and for cooldowns or
+               backoffs keyed on output rather than on the attempt.
+
+            6. **A closed enum in an append-only store is a wire format.**
+               Unknown variants must degrade to a default on load rather than
+               failing the record.
+
+            Report findings as `file:line — summary` with a concrete failure
+            scenario: specific inputs or state leading to a wrong outcome.
+            Rank most severe first, and label each MAJOR / MEDIUM / MINOR —
+            the owner's rule is that major and medium get fixed before merge
+            and the rest are theirs to weigh. If nothing survives scrutiny,
+            say so plainly rather than inventing findings.
