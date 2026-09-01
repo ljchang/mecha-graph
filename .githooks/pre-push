@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# The gate, before anything leaves this machine.
+#
+# CI runs the same roster, but CI runs *after* the push — and a push to a
+# public repository is already public. GitHub keeps unreachable objects
+# reachable by SHA for a long time, so "force-push over it" is not a delete.
+# This hook is the only check that happens while a mistake is still local.
+#
+# Install: git config core.hooksPath .githooks
+set -uo pipefail
+
+# The roster lives outside this repository on purpose — it is a list of what
+# must never appear here, which makes it the most sensitive file in the set.
+ROSTER="${MECHA_GRAPH_DENYLIST:-$HOME/.mecha-graph/denylist.txt}"
+
+# **Fail closed.** A missing roster means the check cannot run, and a check
+# that cannot run must stop the push rather than wave it through. This is the
+# silently-degrading-guard rule; the whole point is that the failure mode is
+# loud.
+if [ ! -r "$ROSTER" ]; then
+    cat >&2 <<MSG
+pre-push REFUSED: no denylist roster at $ROSTER
+
+  The roster is deliberately not in this repository. Restore it, or point
+  MECHA_GRAPH_DENYLIST at it, before pushing.
+
+  This is not a warning you can push past: an unchecked push to a public
+  repository cannot be taken back.
+MSG
+    exit 1
+fi
+
+fail=0
+terms=0
+while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    kind=${line%% *}; term=${line#* }
+    case "$kind" in
+        # Word boundary for short terms, substring for phrases. Losing this
+        # distinction is not a near-miss: on the first run it reported
+        # "remedies" and "sugar" as leaks and refused a clean tree.
+        w) flags="-Iliw" ;;
+        p) flags="-IliF" ;;
+        *) echo "roster line $((terms+1)): unknown kind '$kind'" >&2; exit 1 ;;
+    esac
+    terms=$((terms+1))
+    # LICENSE carries the copyright holder's name by definition, and always
+    # will. Excluded here exactly as the original export gate excluded it.
+    if hits=$(git grep $flags -- "$term" -- ':!LICENSE' 2>/dev/null); then
+        # Local-only output, so naming the term is safe here and is what
+        # makes the finding actionable — the CI job deliberately cannot.
+        echo "DENYLIST HIT [$term]:" >&2
+        printf '%s\n' "$hits" | sed 's/^/  /' >&2
+        fail=1
+    fi
+done < "$ROSTER"
+
+if [ "$terms" -eq 0 ]; then
+    echo "pre-push REFUSED: roster at $ROSTER parsed to zero terms" >&2
+    exit 1
+fi
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "pre-push REFUSED: $terms term(s) checked, see hits above." >&2
+    exit 1
+fi
+echo "denylist: clean ($terms terms)"

@@ -1,0 +1,97 @@
+name: Public denylist
+
+# The gate that used to run at export time.
+#
+# Until 2026-09-01 this repository was a published artifact: work happened in
+# a private checkout and `scripts/export-public.sh` ran the roster over the
+# tree before anything left. Working here directly removes the export, and
+# with it the only place the roster was ever checked — so the gate has to run
+# on the repository itself or it does not run at all.
+#
+# **The roster is not in this repository, and must never be.** It is a list of
+# the names and places that must not appear here, which makes the list itself
+# the most sensitive file in the set. It lives in the `PUBLIC_DENYLIST` secret
+# and is written to a temp file for the length of one job.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  denylist:
+    name: denylist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Check the tree against the roster
+        env:
+          ROSTER: ${{ secrets.PUBLIC_DENYLIST }}
+        run: |
+          set -uo pipefail
+
+          # **Fail closed.** A gate that cannot run must stop the run rather
+          # than pass — the same rule the sandbox preflight and the pre_tool
+          # hooks follow. Two ways to get here and both are failures, not
+          # skips: the secret is unset, or this is a fork PR, which gets no
+          # access to repository secrets at all. A green check that means
+          # "nothing was checked" is worse than no check.
+          if [ -z "${ROSTER:-}" ]; then
+            echo "::error::PUBLIC_DENYLIST is empty or unavailable — the gate cannot run."
+            echo "On a fork PR this is expected: secrets are withheld, so this check"
+            echo "cannot pass and the pull request needs an owner-run gate before merge."
+            exit 1
+          fi
+
+          printf '%s\n' "$ROSTER" > /tmp/roster.txt
+          fail=0
+          n=0
+          while IFS= read -r line; do
+            # Blank lines and `#` comments so the roster can carry its own
+            # notes about why a term is on it.
+            case "$line" in ''|'#'*) continue ;; esac
+            kind=${line%% *}; term=${line#* }
+            # Two kinds, and the distinction is load-bearing. A `w` term is
+            # short enough to live inside an ordinary English word, so it
+            # matches at word boundaries; a `p` term is multiword or
+            # address-shaped and matches as a substring. A first draft
+            # flattened them and refused a clean tree over two common words
+            # that happened to contain a roster term.
+            case "$kind" in
+              w) flags="-rIliw" ;;
+              p) flags="-rIliF" ;;
+              *) echo "::error::roster line $((n+1)): unknown kind"; exit 1 ;;
+            esac
+            n=$((n+1))
+            # **Never print the term.** GitHub masks a secret's whole value
+            # in logs, not its individual lines, so echoing a matched term
+            # would publish the roster one finding at a time, in a public
+            # repository's build log. The file and a stable line index are
+            # enough to find it locally; the term stays in the secret.
+            #
+            # LICENSE carries the copyright holder's name by definition.
+            if hits=$(grep $flags --exclude-dir=.git --exclude-dir=target \
+                        --exclude-dir=.githooks --exclude=denylist.yml \
+                        --exclude=LICENSE -- "$term" . 2>/dev/null); then
+              echo "::error::DENYLIST HIT (roster line $n) in:"
+              printf '%s\n' "$hits" | sed 's/^/  /'
+              fail=1
+            fi
+          done < /tmp/roster.txt
+          rm -f /tmp/roster.txt
+
+          if [ "$n" -eq 0 ]; then
+            echo "::error::the roster parsed to zero terms — refusing to call that clean"
+            exit 1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "Run scripts/check-public-denylist.sh locally to see which term hit."
+            exit 1
+          fi
+          echo "clean: $n roster term(s), no hits"
