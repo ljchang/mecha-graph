@@ -170,8 +170,14 @@ pub fn groups_for_class(
     if pending.is_empty() {
         return Ok(Vec::new());
     }
+    // Through the candidate cache rather than the embedder directly. A class
+    // is re-grouped every time somebody opens it, steps the threshold, or
+    // leaves a group they were reading, and the statements have not changed
+    // between any two of those. The vectors are identical either way — the
+    // cache is keyed on what produced them — so the clustering is untouched.
+    let ids: Vec<i64> = pending.iter().map(|(id, _)| *id).collect();
     let texts: Vec<String> = pending.iter().map(|(_, s)| s.clone()).collect();
-    let vecs = embedder.embed(&texts, EmbedTask::Document)?;
+    let vecs = crate::embed::embed_candidates(conn, embedder, &ids, &texts, EmbedTask::Document)?;
     let mut out: Vec<SimilarGroup> = cluster(&vecs, threshold)
         .into_iter()
         .map(|(leader, members)| SimilarGroup {
@@ -310,8 +316,20 @@ pub fn groups_across_classes(
     if rows.is_empty() {
         return Ok((Vec::new(), 0));
     }
+    // The layer this cache exists for. Embedding every pending statement was
+    // measured at 40 s on the real queue and budgeted at 360 s by the web
+    // route, and it was paid again for every threshold the stepper visited
+    // and every group a reviewer stepped out of. After the first run only
+    // candidates that arrived since reach the embedding server.
+    //
+    // Pruned here rather than from a maintenance verb: this is the call that
+    // walks the whole queue, so it is the one place that knows the whole
+    // queue, and the people who empty the queue are not the people who run
+    // maintenance. One delete against tens of seconds of embedding.
+    let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
     let texts: Vec<String> = rows.iter().map(|(_, s, _)| s.clone()).collect();
-    let vecs = embedder.embed(&texts, EmbedTask::Document)?;
+    let vecs = crate::embed::embed_candidates(conn, embedder, &ids, &texts, EmbedTask::Document)?;
+    crate::embed::prune_candidate_embeddings(conn);
     Ok((assemble_global_groups(&rows, &vecs, threshold), rows.len()))
 }
 

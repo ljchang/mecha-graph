@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-31
+
+Large for a patch, and numbered one anyway to stay in step with this
+project's 0.1.x cadence: three schema migrations (V021 `fact_tier`, V022
+`vec_rejected`, V023 `candidate_embedding`) and the review model's phase 2.
+
+### Added
+
+- **The review queue's vectors persist between runs** (V023
+  `candidate_embedding`). Grouping the pending queue by similarity
+  re-embedded every pending statement on every call — ~7,000 of them, ~40s
+  measured — and the vectors went out with the process, so the same
+  statements were embedded again for the next threshold the stepper visited,
+  for the class listing after the global one, and for the TUI after the
+  phone. A pending statement's text does not change while it waits, so its
+  vector is immutable and re-deriving it is waste.
+
+  A plain table rather than a `vec0` virtual one, unlike its three siblings:
+  those exist to be *searched* and pay an index for it, while nothing
+  searches this — the grouping fetches vectors for a known set of ids and
+  clusters them in process. `text_hash` covers the model, the embed task's
+  instruction and the exact text, so a model swap, an instruction change or
+  an edited statement all invalidate by construction rather than by anyone
+  remembering an invalidation rule. Stored as little-endian `f32` rather than
+  the JSON the vec0 tables are fed: ~20MB across this queue instead of ~60MB.
+  Falls through to a plain embed on any storage trouble — the cache is
+  derivable and this is a read path, so a store that cannot be read must give
+  a slow grouping, never a failed one.
+
+  Measured on a copy of a live store: cross-class grouping 41.0s → 4.3s, a
+  threshold step 36.9s → 4.0s, and cold and warm output byte-identical.
+
+- **Review-on-use (phase 2).** Extraction output goes live unreviewed as a
+  *shadow* fact — retrievable, rank-discounted, labeled — instead of queueing
+  for review at birth, and earns a human verdict when it is about to matter.
+  The loop closes: retrieval feeds the ladder and gates the extractor.
+  Rejection memory survives a paraphrase (V022), so the same wrong claim
+  re-extracted in different words no longer re-claims the owner's attention.
+
+- **The entity arc.** `relink-aliases` judges the mentions already on file,
+  the owner can file a merge proposal so every merge leaves a record, and
+  `kg_entity` surfaces the identifiers rather than only the aliases.
+  `kg_upsert kind=alias` learns the other direction.
+
+- **`kg_notes`** — the notebook view, handing back the key that can write to
+  a note.
+
+- **Task provenance**: a task remembers what asked for it and the
+  conversation that worked it, `@owner` so a harness need not know your name,
+  and the board can say who holds a task rather than only that it waits.
+
+### Fixed
+
+- **Every group verdict re-grouped the class twice, on the UI thread.**
+  `reload_review` re-groups on its own when `group_view` is set, and the
+  accept and reject keys are only reachable while it is — so the explicit
+  `reload_groups` preceding it ran the class's grouping a second time after
+  every verdict. Both passes embedded the class before V023 and both read the
+  cache after it; either way the terminal was frozen for two where one was
+  needed.
+
+- **A test fixture wore a real name**, in a repo whose export gate exists for
+  exactly that. The fixtures move to the fictional cast — tracked source is
+  one export away from public.
+
+- **The queue's depth is the count before the page cut**, so a listing that
+  shows less than the queue says how much less.
+
+- **Precheck could go blind without saying so**, and commitments were exempt
+  from it.
+
 ## [0.1.3] - 2026-08-22
 
 ### Fixed
