@@ -158,6 +158,13 @@ const COPY_TABLES: &[&str] = &[
     // missing-entity detector reads: a fork that dropped them would forget
     // which names keep appearing with nobody to attach them to.
     "unlinked_mention", // V019
+    // The review queue's vectors. Derivable, and copied for the same reason
+    // `vec_rejected` is: rebuilding it is a run of the embedding server over
+    // the whole pending queue, and an encrypt or a decrypt is a bad moment to
+    // hand someone that bill. Copying is correct rather than merely kind —
+    // the candidate ids and their statements cross unchanged, so every row
+    // still keys to exactly what it was computed from.
+    "candidate_embedding", // V023
 ];
 /// Copied with `INSERT OR IGNORE`, because a freshly migrated target already
 /// holds rows the source is about to send.

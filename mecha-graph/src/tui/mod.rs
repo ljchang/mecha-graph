@@ -1362,7 +1362,12 @@ fn accept_selected_group(app: &mut App) -> mecha_graph_core::Result<()> {
         0 => format!("group accepted: you + {done} cascaded (one human verdict)"),
         f => format!("group accepted: you + {done} cascaded, {f} left pending"),
     };
-    app.reload_groups()?;
+    // `reload_review` re-groups on its own when `group_view` is set, and this
+    // key is only reachable while it is — so the explicit call that used to
+    // sit here ran the class's grouping a second time, on the UI thread,
+    // after every single group verdict. Both passes embedded the class before
+    // V023 and both read the cache after it; either way the terminal was
+    // frozen for two of them where one was needed.
     app.reload_review()
 }
 
@@ -1385,7 +1390,8 @@ fn reject_selected_group(app: &mut App, reason: &str) -> mecha_graph_core::Resul
         }
     }
     app.status = format!("group rejected: you + {done} cascaded (one human verdict)");
-    app.reload_groups()?;
+    // Same double pass as the accept path above, and removed for the same
+    // reason: `reload_review` owns the re-group whenever the group view is up.
     app.reload_review()
 }
 

@@ -122,6 +122,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "vec_rejected",
         sql: V022_VEC_REJECTED,
     },
+    Migration {
+        version: 23,
+        name: "candidate_embedding",
+        sql: V023_CANDIDATE_EMBEDDING,
+    },
 ];
 
 /// Semantic rejection memory (review-on-use §5): the embedded index of
@@ -144,6 +149,62 @@ const MIGRATIONS: &[Migration] = &[
 /// `pkg embed` cannot restore.
 const V022_VEC_REJECTED: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[768]);
+"#;
+
+/// The review queue's vectors, kept between runs.
+///
+/// Grouping the pending queue by similarity re-embedded every pending
+/// statement on every call: ~7,000 statements, measured at 40 s for the
+/// cross-class layer and budgeted at 360 s by the web route. The vectors
+/// were thrown away when the process exited, so the same statements were
+/// embedded again on the next call — for the next threshold the stepper
+/// visited, for the class listing after the global one, for the TUI after
+/// the phone. The reported cost was not the wait itself but what it did to
+/// a sitting: entering a group to judge its members individually and
+/// stepping back out re-ran the whole thing, so the ordinary loop of
+/// curation was the expensive one and the queue stopped getting cleared.
+///
+/// A pending statement's text does not change while it waits, so its vector
+/// is immutable and re-deriving it is pure waste. Only genuinely new
+/// candidates need the embedding server.
+///
+/// **A plain table, not a `vec0` virtual one**, unlike its three siblings.
+/// Those exist to be *searched* — kNN over the whole store — and pay a
+/// vec0 index for it. Nothing searches this one: the grouping fetches the
+/// vectors for a known set of ids and does its own in-process greedy
+/// clustering, so this is a lookup by primary key and a plain table is both
+/// the simpler and the faster answer. It also lets the row carry its own
+/// identity, which is the part that makes it safe.
+///
+/// `text_hash` is over the model, the embed task's instruction identity and
+/// the exact text embedded — everything that decides what the numbers mean.
+/// A row whose hash does not match what is about to be embedded is a miss,
+/// so swapping the embedding model, changing an instruction, or editing a
+/// statement all invalidate by construction rather than by remembering to
+/// write an invalidation rule. That is the same reasoning `embed_meta`
+/// records for the searchable tables, moved into the key so nothing has to
+/// consult it. `dims` rides along so a mismatch is legible in the table
+/// rather than only inside sqlite-vec's error text.
+///
+/// `embedding` is a BLOB of little-endian `f32`, not the JSON text the vec0
+/// tables are fed. Nothing here parses as a vector on sqlite's behalf, so the
+/// format is this table's own choice, and the queue is large enough for the
+/// choice to matter: 768 floats are ~3 KB raw and ~9 KB as JSON, which across
+/// a seven-thousand-candidate queue is the difference between about twenty
+/// megabytes and about sixty. `dims` makes a truncated row legible without
+/// reading it.
+///
+/// Derivable, like `vec_rejected`: dropping it costs one slow grouping and
+/// nothing else, which is why it carries no foreign key and is pruned of
+/// candidates that have left the queue rather than migrated with them.
+const V023_CANDIDATE_EMBEDDING: &str = r#"
+CREATE TABLE IF NOT EXISTS candidate_embedding (
+    candidate_id INTEGER PRIMARY KEY,
+    text_hash    TEXT NOT NULL,
+    dims         INTEGER NOT NULL,
+    embedding    BLOB NOT NULL,
+    written_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 /// Review-on-use (docs/REVIEW-ON-USE.md): facts get a `tier`.

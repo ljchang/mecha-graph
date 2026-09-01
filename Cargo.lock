@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "mecha-graph"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "crossterm",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "mecha-graph-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "mailparse",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "mecha-graph-mcp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "mecha-graph-core",

@@ -33,6 +33,7 @@
 
 use crate::error::{Error, Result};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// Where the embedding server listens. Deliberately NOT :8080 — that is the
@@ -380,6 +381,154 @@ pub fn embed_pending_rejects(
     Ok(total)
 }
 
+/// What a cached candidate vector is keyed on: everything that decides what
+/// the numbers mean. The text, the model that produced it, and the task —
+/// via its instruction rather than its name, because the instruction is what
+/// the server actually saw, and two tasks that share one are interchangeable.
+///
+/// Hashed rather than spread across columns so a miss is one comparison and
+/// no reader has to know the list. Adding a dimension to the identity later
+/// means adding it here, and every existing row becomes a miss on its own —
+/// which is the correct behaviour, and needs no migration to get it.
+fn candidate_key(model: &str, task: EmbedTask, text: &str) -> String {
+    let mut hasher = Sha256::new();
+    // Length-prefixed: a statement is arbitrary text and may contain whatever
+    // byte a delimiter would use, so fields are framed rather than joined.
+    for part in [model, task.default_instruction().unwrap_or(""), text] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Embed candidate statements, reusing vectors already stored for them.
+///
+/// The review queue's grouping calls this instead of [`Embedder::embed`].
+/// One vector per input, in input order, exactly as `embed` returns — the
+/// caller cannot tell a hit from a miss, which is the point: the clustering
+/// downstream is unchanged and its output is identical either way.
+///
+/// A pending statement's text is fixed while it waits, so its vector is too,
+/// and the queue turns over slowly — one sweep's new candidates against
+/// thousands already sitting there. That is the difference between embedding
+/// the whole queue every time somebody looks at it and embedding only what
+/// arrived since.
+///
+/// **Falls through to a plain embed on any storage trouble.** The cache is
+/// derivable and this is a read path: a store that cannot be read or written
+/// — opened read-only, mid-migration, locked by another writer — must give a
+/// slow grouping, never a failed one. The one thing it must not do is answer
+/// with vectors it is not sure about, which is what the key is for.
+pub fn embed_candidates(
+    conn: &Connection,
+    embedder: &Embedder,
+    ids: &[i64],
+    texts: &[String],
+    task: EmbedTask,
+) -> Result<Vec<Vec<f32>>> {
+    if ids.len() != texts.len() {
+        // The caller zipped two lists that disagree. Position is the only
+        // thing tying a vector to its candidate, so this cannot be guessed at.
+        return Err(Error::Embed(format!(
+            "embed_candidates got {} ids for {} texts",
+            ids.len(),
+            texts.len()
+        )));
+    }
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+    let keys: Vec<String> = texts
+        .iter()
+        .map(|t| candidate_key(&embedder.model, task, t))
+        .collect();
+
+    // Hits, by position. A row whose key has moved on is simply absent here,
+    // gets re-embedded below, and overwrites itself on the way out.
+    let mut cached: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT embedding FROM candidate_embedding
+         WHERE candidate_id = ?1 AND text_hash = ?2 AND dims = ?3",
+    ) {
+        for (i, id) in ids.iter().enumerate() {
+            let row: std::result::Result<Vec<u8>, _> =
+                stmt.query_row(params![id, &keys[i], embedder.dims as i64], |r| r.get(0));
+            // A stored vector of the wrong width is a corrupt row, not a hit.
+            // Dropping it costs one embed and keeps a malformed cache out of
+            // the clustering, where a short vector would quietly change every
+            // cosine it touched.
+            if let Ok(bytes) = row {
+                cached[i] = vec_from_bytes(&bytes, embedder.dims);
+            }
+        }
+    }
+
+    let misses: Vec<usize> = (0..texts.len()).filter(|i| cached[*i].is_none()).collect();
+    if !misses.is_empty() {
+        let batch: Vec<String> = misses.iter().map(|i| texts[*i].clone()).collect();
+        // `embed` already bisects a batch that overflows the server's context,
+        // so the misses go through it whole rather than being re-chunked here.
+        let fresh = embedder.embed(&batch, task)?;
+        for (slot, vec) in misses.iter().zip(fresh) {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO candidate_embedding
+                     (candidate_id, text_hash, dims, embedding, written_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                params![
+                    ids[*slot],
+                    &keys[*slot],
+                    embedder.dims as i64,
+                    vec_to_bytes(&vec)
+                ],
+            );
+            cached[*slot] = Some(vec);
+        }
+    }
+
+    // Every slot is filled: a miss was either embedded or the `?` above
+    // returned. `unwrap_or_default` is unreachable, and an empty vector would
+    // be dropped by the clustering's own width check rather than scored.
+    Ok(cached.into_iter().map(Option::unwrap_or_default).collect())
+}
+
+/// Drop cached vectors for candidates that have left the queue.
+///
+/// A verdict is what makes a row dead: the grouping only ever asks about
+/// `proposed` candidates, so anything else is weight that will never be asked
+/// for again. Run from the grouping itself rather than from a maintenance
+/// verb, because the queue is emptied by people who will not run one, and
+/// this is a single delete against work measured in tens of seconds.
+///
+/// Best-effort by construction: a store that cannot be written still groups.
+pub fn prune_candidate_embeddings(conn: &Connection) -> usize {
+    conn.execute(
+        "DELETE FROM candidate_embedding
+         WHERE candidate_id NOT IN (SELECT id FROM fact_candidate WHERE status = 'proposed')",
+        [],
+    )
+    .unwrap_or(0)
+}
+
+/// Little-endian `f32`s, the storage format of `candidate_embedding`. Not
+/// `vec_to_json`: nothing parses this table's vectors on sqlite's behalf, so
+/// it holds them raw at a third of the size. Fixed-endian rather than native
+/// because a store is a file people move between machines.
+fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// A stored vector, if it is intact and the width the caller expects. A
+/// partial write, a truncated blob, or a row left by another embedding model
+/// all land here as `None`, which is a miss and re-embeds.
+fn vec_from_bytes(bytes: &[u8], dims: usize) -> Option<Vec<f32>> {
+    (bytes.len() == dims * 4).then(|| {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    })
+}
+
 /// Record what produced the vectors currently in the store.
 ///
 /// Without this, swapping a model leaves a table of numbers that look fine,
@@ -489,6 +638,200 @@ pub fn embed_pending_facts(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// An embedder that cannot reach anything. Any call that actually needs
+    /// the server fails, which is what makes "did not embed" an assertion
+    /// rather than a hope — the alternative, counting requests against a live
+    /// llama-server, is the kind of test that passes when it is skipped.
+    fn unreachable_embedder() -> Embedder {
+        Embedder {
+            // Port 0 is never listening.
+            base_url: "http://127.0.0.1:0".into(),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_millis(200),
+        }
+    }
+
+    fn store(conn: &Connection, e: &Embedder, id: i64, text: &str, v: &[f32]) {
+        conn.execute(
+            "INSERT OR REPLACE INTO candidate_embedding
+                 (candidate_id, text_hash, dims, embedding, written_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![
+                id,
+                candidate_key(&e.model, EmbedTask::Document, text),
+                e.dims as i64,
+                vec_to_bytes(v)
+            ],
+        )
+        .unwrap();
+    }
+
+    /// **The queue is embedded once, not once per look.**
+    ///
+    /// Grouping the review queue re-embedded every pending statement on every
+    /// call — the whole queue, measured in tens of seconds, paid again for
+    /// each threshold the stepper visited and each group a reviewer stepped
+    /// out of. A pending statement's text does not change while it waits, so
+    /// the second call has nothing to ask the server.
+    ///
+    /// Proven by making the server unreachable: before the cache this call
+    /// could only fail.
+    #[test]
+    fn a_cached_candidate_is_never_embedded_again() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        store(&conn, &e, 1, "Sage plays the cello", &[1.0, 0.0, 0.0, 0.0]);
+        store(&conn, &e, 2, "Sage plays cello", &[0.0, 1.0, 0.0, 0.0]);
+
+        let got = embed_candidates(
+            &conn,
+            &e,
+            &[1, 2],
+            &["Sage plays the cello".into(), "Sage plays cello".into()],
+            EmbedTask::Document,
+        )
+        .expect("a fully cached batch must not reach the embedding server");
+        assert_eq!(
+            got,
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]
+        );
+    }
+
+    /// A hit is keyed on the text, not the id. A candidate whose statement
+    /// was edited must be re-embedded rather than answered with the vector of
+    /// what it used to say — a wrong vector does not fail, it silently
+    /// regroups the queue around a statement nobody wrote.
+    #[test]
+    fn an_edited_statement_is_a_miss() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        store(&conn, &e, 1, "Sage plays the cello", &[1.0, 0.0, 0.0, 0.0]);
+
+        let err = embed_candidates(
+            &conn,
+            &e,
+            &[1],
+            &["Sage plays the viola".into()],
+            EmbedTask::Document,
+        );
+        assert!(err.is_err(), "an edited statement must not hit the cache");
+    }
+
+    /// Same for the model and the task's instruction: the vectors of two
+    /// models are not comparable, and nothing about a stored row reveals
+    /// which one wrote it. Both ride in the key, so a swap invalidates by
+    /// construction instead of by anyone remembering to clear a table.
+    #[test]
+    fn another_model_or_task_does_not_read_this_cache() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        store(&conn, &e, 1, "Sage plays the cello", &[1.0, 0.0, 0.0, 0.0]);
+
+        let mut swapped = unreachable_embedder();
+        swapped.model = "some-other-embed".into();
+        assert!(
+            embed_candidates(
+                &conn,
+                &swapped,
+                &[1],
+                &["Sage plays the cello".into()],
+                EmbedTask::Document
+            )
+            .is_err(),
+            "a different model must not read another model's vectors"
+        );
+
+        // Document carries no instruction and Dedup does, so the two ask the
+        // server different questions about the same text.
+        assert!(
+            embed_candidates(
+                &conn,
+                &e,
+                &[1],
+                &["Sage plays the cello".into()],
+                EmbedTask::Dedup
+            )
+            .is_err(),
+            "a different embed task must not read Document's vectors"
+        );
+    }
+
+    /// A row of the wrong width is corrupt, not a hit. Letting it through
+    /// would put a short vector into the clustering, where it changes every
+    /// cosine it touches without failing anything.
+    #[test]
+    fn a_vector_of_the_wrong_width_is_not_a_hit() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        conn.execute(
+            "INSERT INTO candidate_embedding (candidate_id, text_hash, dims, embedding)
+             VALUES (1, ?1, 4, ?2)",
+            params![
+                candidate_key(&e.model, EmbedTask::Document, "Sage plays the cello"),
+                // Two floats where the row claims four — a truncated write.
+                vec_to_bytes(&[1.0, 0.0])
+            ],
+        )
+        .unwrap();
+        assert!(
+            embed_candidates(
+                &conn,
+                &e,
+                &[1],
+                &["Sage plays the cello".into()],
+                EmbedTask::Document
+            )
+            .is_err(),
+            "a stored vector that is not `dims` wide must be re-embedded"
+        );
+    }
+
+    /// The cache does not outlive the queue: a candidate that has been
+    /// judged will never be grouped again, so its vector is weight.
+    #[test]
+    fn a_judged_candidate_loses_its_cached_vector() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        for (id, status) in [(1, "proposed"), (2, "accepted"), (3, "rejected")] {
+            conn.execute(
+                "INSERT INTO fact_candidate (id, payload, status, created_at)
+                 VALUES (?1, json_object('statement', 'x'), ?2, datetime('now'))",
+                params![id, status],
+            )
+            .unwrap();
+            store(&conn, &e, id, "x", &[1.0, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(prune_candidate_embeddings(&conn), 2);
+        let left: i64 = conn
+            .query_row("SELECT candidate_id FROM candidate_embedding", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 1, "the pending candidate keeps its vector");
+    }
+
+    /// Position is the only thing tying a vector to its candidate, so two
+    /// lists that disagree is a caller bug and cannot be guessed at.
+    #[test]
+    fn mismatched_ids_and_texts_are_refused() {
+        let conn = crate::db::open_memory().unwrap();
+        assert!(embed_candidates(
+            &conn,
+            &unreachable_embedder(),
+            &[1, 2],
+            &["only one".into()],
+            EmbedTask::Document
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]
