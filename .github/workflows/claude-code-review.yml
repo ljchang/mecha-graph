@@ -29,6 +29,26 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      # **A review that cannot authenticate must say so, not pass.**
+      # On 2026-09-01 this job reported success on PR #1 and posted zero
+      # comments: `CLAUDE_CODE_OAUTH_TOKEN` was never set on this repo, and
+      # a green tick that means "nothing was reviewed" is exactly the
+      # failure the denylist job beside it is written to avoid. It was then
+      # merged partly on the strength of that tick. The next PR failed
+      # loudly for the same missing secret, which is the behaviour both
+      # should have had.
+      - name: Refuse to review without a credential
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not set on this repository."
+            echo "Generate one with \`claude setup-token\` and add it as a repository"
+            echo "secret. Until then this job fails rather than reporting a review"
+            echo "that did not happen."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
