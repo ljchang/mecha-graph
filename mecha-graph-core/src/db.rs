@@ -210,6 +210,35 @@ const SEEDED_TABLES: &[&str] = &["predicate", "predicate_alias", "node_slot", "n
 /// Read off `src`'s own schema rather than off config, because **a copy must
 /// reproduce the database it is a copy of**, even when config has since moved
 /// on to a different model.
+/// Columns a table has in BOTH databases, comma-joined for a SELECT list.
+///
+/// **`SELECT *` takes the SOURCE's column list**, so a source whose table is
+/// narrower than `main`'s fails the whole copy with "table … has N columns
+/// but M values were supplied" — the same class as a missing table, one step
+/// in. V025's `ADD COLUMN` creates a fresh instance of it for
+/// `cooccurrence_alarm` against any snapshot taken between V024 and V025,
+/// and the same break is latent for every table a later migration widened.
+///
+/// Naming the intersection copies what both sides agree on and leaves the
+/// destination's default in the columns the source never had, which is the
+/// same answer "copied as empty" gives one level up.
+fn shared_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    // Asked of each side directly rather than via `pragma_table_info`,
+    // whose schema argument is not available in every SQLite build.
+    let main_cols: Vec<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM main.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let src_cols: std::collections::HashSet<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM src.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    Ok(main_cols
+        .into_iter()
+        .filter(|c| src_cols.contains(c))
+        .collect())
+}
+
 fn copy_all_tables(conn: &Connection) -> Result<()> {
     if let Some(dims) = crate::embed::declared_vec_dims_in(conn, "src")? {
         crate::embed::ensure_vec_dims(conn, dims)?;
@@ -232,11 +261,16 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
     // to SEEDED_TABLES is the same shape landing again.
     for t in SEEDED_TABLES {
         if !present.contains(*t) {
-            eprintln!("note: source has no `{t}` (older schema) — copied as empty");
+            // Not "copied as empty" — this loop's tables are SEEDED, so the
+            // destination keeps the rows `run_migrations` gave it. Saying
+            // "empty" here would tell the operator the opposite of what
+            // happened, and the test one file down asserts the seed survives.
+            eprintln!("note: source has no `{t}` (older schema) — kept this database's own seed");
             continue;
         }
+        let cols = shared_columns(conn, t)?.join(", ");
         conn.execute_batch(&format!(
-            "INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t};"
+            "INSERT OR IGNORE INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
         ))?;
     }
     // **A table the SOURCE does not have is an empty copy, not a failure.**
@@ -259,7 +293,10 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             eprintln!("note: source has no `{t}` (older schema) — copied as empty");
             continue;
         }
-        conn.execute_batch(&format!("INSERT INTO main.{t} SELECT * FROM src.{t};"))?;
+        let cols = shared_columns(conn, t)?.join(", ");
+        conn.execute_batch(&format!(
+            "INSERT INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
+        ))?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
@@ -771,11 +808,22 @@ mod older_source_tests {
                 .unwrap();
         }
         let src = Connection::open(&src_path).unwrap();
-        src.execute_batch("DROP TABLE cooccurrence_alarm; DROP TABLE node_slot;")
+        // Missing from COPY_TABLES, and missing from SEEDED_TABLES: the
+        // two halves of the missing-table class.
+        src.execute_batch("DROP TABLE embed_meta; DROP TABLE node_slot;")
             .unwrap();
-        // Assert the fixture is actually the case under test, or this
-        // passes for the wrong reason.
-        for t in ["cooccurrence_alarm", "node_slot"] {
+        // And the NARROWER-table half, which is a different failure:
+        // `SELECT *` takes the source's column list, so a source missing a
+        // column a later migration added fails with "table has N columns but
+        // M values were supplied". This is V025's own scenario — a snapshot
+        // taken after V024 created the table and before V025 widened it.
+        src.execute_batch("ALTER TABLE cooccurrence_alarm DROP COLUMN first_observed_co;")
+            .expect("the narrower-table case must actually be constructed");
+
+        // Assert every part of the fixture is real, or the halves pass
+        // vacuously. An earlier draft used `.ok()` on the ALTER and was
+        // silently testing nothing: the drop had failed on an index.
+        for t in ["embed_meta", "node_slot"] {
             let n: i64 = src
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -785,6 +833,18 @@ mod older_source_tests {
                 .unwrap();
             assert_eq!(n, 0, "{t} must be absent for this test to mean anything");
         }
+        let narrowed: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cooccurrence_alarm') \
+                 WHERE name = 'first_observed_co'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            narrowed, 0,
+            "src.cooccurrence_alarm must really be narrower"
+        );
         drop(src);
 
         // Destination has the current schema; copy from the older source.
@@ -802,9 +862,7 @@ mod older_source_tests {
         // A COPY_TABLES entry the source lacks contributes nothing, so the
         // destination keeps the zero rows `run_migrations` left it.
         let n: i64 = dest
-            .query_row("SELECT COUNT(*) FROM main.cooccurrence_alarm", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM main.embed_meta", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "an absent COPY_TABLES source contributes nothing");
 
@@ -819,5 +877,19 @@ mod older_source_tests {
             n > 0,
             "an absent SEEDED_TABLES source must leave the destination's own seed intact, got {n}"
         );
+
+        // The narrower table copied what both sides share and left the
+        // destination's own column at its default, rather than failing the
+        // whole copy on an arity mismatch. `copy_all_tables` returning Ok
+        // above is the assertion; this confirms the column survived.
+        let has_col: i64 = dest
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cooccurrence_alarm') \
+                 WHERE name = 'first_observed_co'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1, "the destination keeps its wider schema");
     }
 }

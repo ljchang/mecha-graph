@@ -215,6 +215,15 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
                      ON CONFLICT(fact_uid) DO UPDATE SET
                          observed_co = excluded.observed_co,
                          stated_co = excluded.stated_co,
+                         -- Backfill, or V025 never reaches the rows it was
+                         -- written for: a V024-era row has NULL here, and a
+                         -- persistently-collapsed pair never hits the reap,
+                         -- so it is never re-INSERTed and stays NULL for the
+                         -- life of the belief. The COALESCE in the reader
+                         -- would then resolve the first sighting to last
+                         -- night, on precisely the rows that motivated V025.
+                         first_observed_co =
+                             COALESCE(first_observed_co, excluded.observed_co),
                          last_seen_at = datetime('now')",
                     rusqlite::params![uid, stated_co, now_co],
                 )?;
