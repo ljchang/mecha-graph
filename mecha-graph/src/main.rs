@@ -3334,9 +3334,17 @@ reject: it was never true (retracted; the class learns)"
         }
 
         Command::ProbeTargets { limit, include_cold, min_sources } => {
-            // Filter before truncating to `limit`, or a run asking for 25
-            // gets 25-minus-the-rejects and the caller silently sees fewer
-            // targets than it asked for. Ask deep, filter, then cut.
+            // Filter before truncating to `limit`, so the filter does not
+            // eat the caller's quota: without the deep fetch, a run asking
+            // for 25 gets 25-minus-the-rejects.
+            //
+            // **It raises the ceiling; it does not guarantee `limit`.**
+            // `probe_targets_opts` truncates to `deep` itself and draws from
+            // a fixed top-200 demanded pool, so on a graph where most
+            // demanded nodes are single-source, `--limit 25 --min-sources 2`
+            // can still return fewer than 25 with no signal saying so. Not a
+            // live concern at the nightly's 3, and stated because the
+            // earlier wording promised more than the code delivers.
             // `> 0`, not `> 1`: `retain` runs for any positive floor, and
             // `sources == 0` is reachable — a node with retrieval touches
             // but no mention rows ranks and reports zero. At `--min-sources

@@ -16,4 +16,27 @@ __pycache__/
 config.toml
 docs/OPERATIONS.md
 docs/EMBEDDING-EXAMPLES.md
+
+# The gold eval sets: queries mined from real episodes. They live at
+# ~/.mecha-graph/eval/ now, and this is the belt to that braces.
+#
+# **The export used to be what stood between these and the world**, and it
+# stripped them by name. Working in this repo directly removes it, so a
+# stale private working copy carried forward — or a re-run of
+# build-semantic-gold.py — puts them back inside the checkout where
+# `git add -A` will stage them. Neither gate would object: a query like
+# "when did I last meet <someone>" contains no roster term, so the hook and
+# CI both pass clean, and a force-push is not a delete.
+#
+# eval/synthetic/gold.jsonl is the fictional set and is deliberately
+# tracked; neither pattern below matches it.
+eval/gold.jsonl
+eval/gold-semantic.jsonl
+
+# The tooling that produces and reads those sets, which docs still name by
+# repo-relative path. Same reasoning: the files themselves are clean, but a
+# path that resolves inside the checkout is a path something will stage.
+scripts/build-semantic-gold.py
+scripts/score-semantic.py
+scripts/diagnose-failures.py
 /.claude/

@@ -214,7 +214,8 @@ attempt 2 established this corpus cannot supply.
   anything quoting an episode lives there instead of diverging into two copies.
 - `eval/gold-semantic.jsonl` — the 80 queries, and `scripts/build-semantic-gold.py`
   / `score-semantic.py` / `diagnose-failures.py` that produce and read them.
-  **Outside the repository**, like the gold set beside it: generated from one person's
+  **In the private repo, not this one** — unlike the gold sets beside them,
+  which now live at `~/.mecha-graph/eval/`. Generated from one person's
   episodes, so the queries are personal data even though the aggregate scores
   are not. This document keeps the method and the numbers; the examples above
   are generalised for the same reason `MAIL-CORPUS-RESEARCH.md` is gitignored —

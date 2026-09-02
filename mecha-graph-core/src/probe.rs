@@ -211,8 +211,12 @@ pub fn probe_targets_opts(
         // caller that a filter in the ranker would silently starve. The
         // production filter is `--min-sources`, applied by the one consumer
         // that has the precondition.
-        // `prepare_cached` like the three sibling queries in this loop —
-        // it was the only statement here re-prepared per node.
+        // `prepare_cached`, like the three slot/fact queries below it.
+        // An earlier comment here claimed this had been "the only statement
+        // re-prepared per node"; it was not — the `nodes` lookup at the top
+        // of this loop uses `conn.query_row` and re-prepares too. Left as
+        // it is rather than swept in, since it predates this change and is
+        // not what this branch is about, but the claim had to go.
         let sources: i64 = {
             let mut stmt = conn.prepare_cached(
                 "SELECT COUNT(DISTINCT e.source)

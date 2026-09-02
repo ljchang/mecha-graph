@@ -263,8 +263,32 @@ except Exception:
 # what `gossip --entity` takes.
 pairs = [((r.get("display") or r.get("name")), r.get("node_id") or "") for r in rows]
 pairs = [(n, i) for n, i in pairs if n]
-names = [n for n, _ in pairs]
-ids = dict(pairs)
+# **Two nodes can share one display label**, and ARCHITECTURE says that
+# state is real ("two Victors"). That collapsed twice over: the label
+# appeared in `names` once per node, and `dict(pairs)` kept only the last
+# id — so one label could take two of the three nightly slots while the
+# other node never aged, and both attempts would be recorded under
+# whichever id the dict happened to keep.
+#
+# Deduplicated on the LABEL, keeping the highest-ranked node, because the
+# label is the address: `gossip --entity` takes a name, so a second node
+# sharing one is not reachable from here whatever we do. One label, one
+# slot. The node that loses is not probed tonight and keeps its rank for
+# tomorrow, which is the honest outcome — the alternative is spending a
+# slot on a probe that would resolve to the other node anyway.
+#
+# Disambiguating them is upstream work (gossip already refuses an ambiguous
+# entity and prints the candidates); this only stops one label consuming
+# the night.
+seen_label = set()
+uniq = []
+for n, i in pairs:
+    if n in seen_label:
+        continue
+    seen_label.add(n)
+    uniq.append((n, i))
+names = [n for n, _ in uniq]
+ids = dict(uniq)
 
 # **Look the id up first.** The ledger records `node_id` precisely because
 # `display` is derived — `best_label` prefers a multi-word human alias, so
