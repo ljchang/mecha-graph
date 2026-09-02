@@ -121,35 +121,94 @@ pub fn render_statement(statement: &str, co: i64, npmi: f64) -> Option<String> {
 /// refresh drifted numbers, alarm on input collapse.
 pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
     // **The alarm bookkeeping must not outlive a sweep that never
-    // reported.** Each upsert autocommits on its own, while `rep` only
-    // reaches the operator if the whole loop returns `Ok` — so a sweep that
-    // dies at fact 400 of 1,200 (a SQLITE_BUSY from a concurrent MCP
+    // reported.** Each upsert used to autocommit on its own, while `rep`
+    // only reaches the operator if the whole loop returns `Ok` — so a sweep
+    // that died at fact 400 of 1,200 (a SQLITE_BUSY from a concurrent MCP
     // writer, or the process killed; `nightly.sh` logs FAILED and carries
-    // on) prints nothing, yet the first sightings it already recorded are
-    // "continuing" from then on and are never shown again.
+    // on) printed nothing, yet the first sightings it had already recorded
+    // were "continuing" from then on and never shown again. That is the
+    // dry-run bug reached through an abort instead of a preview.
     //
-    // That is the dry-run bug reached through an abort instead of a
-    // preview: a first sighting consumed by something that displayed it to
-    // nobody. One transaction around the body ties the record to the run
-    // actually finishing.
-    let tx = if dry_run {
-        None
-    } else {
-        Some(conn.unchecked_transaction()?)
-    };
-    let out = sweep_npmi_inner(conn, dry_run);
-    match (&out, tx) {
-        (Ok(_), Some(tx)) => tx.commit()?,
-        // Rollback is the default on drop, but say it: an abort must undo
-        // the bookkeeping, or the next run calls a never-reported collapse
-        // "already reported".
-        (Err(_), Some(tx)) => drop(tx),
-        _ => {}
+    // **Buffered and flushed, NOT one transaction around the scan.** The
+    // first fix wrapped the whole body, which took the write lock on the
+    // first fact and held it across ~1,200 `rederive_npmi` /
+    // `shared_episodes` iterations — with `busy_timeout` at 5s, a
+    // concurrent MCP write during the nightly then fails `database is
+    // locked` where it used to interleave, and an abort would discard the
+    // night's decay closes as well as the alarm rows. The guarantee only
+    // ever needed the bookkeeping to land or not land together, so it is
+    // collected in memory and written in one short transaction after the
+    // scan. A sweep that dies before that point wrote nothing.
+    let mut pending = AlarmWrites::default();
+    let out = sweep_npmi_inner(conn, dry_run, &mut pending);
+    if out.is_ok() && !dry_run {
+        let tx = conn.unchecked_transaction()?;
+        pending.flush(conn)?;
+        tx.commit()?;
     }
     out
 }
 
-fn sweep_npmi_inner(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
+/// Alarm bookkeeping a sweep decided on, held until the sweep finishes.
+///
+/// Nothing here touches the database during the scan — see the note in
+/// [`sweep_npmi`] on why the first version's single long transaction was
+/// worse than the problem it solved.
+#[derive(Default)]
+struct AlarmWrites {
+    /// `(fact_uid, stated_co, observed_co)` to upsert.
+    seen: Vec<(String, i64, i64)>,
+    /// Beliefs no longer collapsed; their row goes.
+    resolved: Vec<String>,
+}
+
+impl AlarmWrites {
+    fn flush(&self, conn: &Connection) -> Result<()> {
+        for (uid, stated, observed) in &self.seen {
+            conn.execute(
+                "INSERT INTO cooccurrence_alarm
+                     (fact_uid, stated_co, observed_co, first_observed_co)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(fact_uid) DO UPDATE SET
+                     observed_co = excluded.observed_co,
+                     stated_co = excluded.stated_co,
+                     -- Unqualified `observed_co` is the row's PRE-update
+                     -- value, strictly closer to the first sighting than
+                     -- tonight's count.
+                     first_observed_co = COALESCE(first_observed_co, observed_co),
+                     last_seen_at = datetime('now')",
+                rusqlite::params![uid, stated, observed],
+            )?;
+        }
+        for uid in &self.resolved {
+            conn.execute(
+                "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                rusqlite::params![uid],
+            )?;
+        }
+        // Rows whose belief has left the sweep entirely — retracted by
+        // `invalidate-phantoms`, which runs immediately before `decay` over
+        // exactly this alarm's zero-support subset, or superseded. No wrong
+        // report (uids are v4), but the table would grow monotonically and
+        // `COPY_TABLES` carries the dead rows into every fork.
+        conn.execute(
+            "DELETE FROM cooccurrence_alarm
+             WHERE fact_uid NOT IN (
+                 SELECT uid FROM fact
+                 WHERE extractor = 'npmi' AND object_id IS NOT NULL
+                   AND polarity = 'positive'
+                   AND valid_to IS NULL AND invalidated_at IS NULL)",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+fn sweep_npmi_inner(
+    conn: &Connection,
+    dry_run: bool,
+    pending: &mut AlarmWrites,
+) -> Result<DecayReport> {
     let mut rep = DecayReport::default();
     let rows: Vec<(i64, String, String, String, String)> = {
         let mut stmt = conn.prepare(
@@ -238,30 +297,7 @@ fn sweep_npmi_inner(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
             // The exact suppression this branch exists to prevent, reachable
             // through the command that promises to change nothing.
             if !dry_run {
-                conn.execute(
-                    "INSERT INTO cooccurrence_alarm
-                         (fact_uid, stated_co, observed_co, first_observed_co)
-                     VALUES (?1, ?2, ?3, ?3)
-                     ON CONFLICT(fact_uid) DO UPDATE SET
-                         observed_co = excluded.observed_co,
-                         stated_co = excluded.stated_co,
-                         -- Backfill, or V025 never reaches the rows it was
-                         -- written for: a V024-era row has NULL here, and a
-                         -- persistently-collapsed pair never hits the reap,
-                         -- so it is never re-INSERTed and stays NULL for the
-                         -- life of the belief. The COALESCE in the reader
-                         -- would then resolve the first sighting to last
-                         -- night, on precisely the rows that motivated V025.
-                         -- Unqualified `observed_co` is the row's PRE-update
-                         -- value, which is strictly closer to the first
-                         -- sighting than tonight's count. Reachable well
-                         -- beyond the V024 window: copying a V024-era
-                         -- snapshot lands every forked row with NULL here.
-                         first_observed_co =
-                             COALESCE(first_observed_co, observed_co),
-                         last_seen_at = datetime('now')",
-                    rusqlite::params![uid, stated_co, now_co],
-                )?;
+                pending.seen.push((uid.clone(), stated_co, now_co));
             }
             if news {
                 let how = match prior {
@@ -297,10 +333,7 @@ fn sweep_npmi_inner(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
         // the healthy path also reaps rows for facts this sweep later
         // closes.
         if !dry_run {
-            conn.execute(
-                "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
-                rusqlite::params![uid],
-            )?;
+            pending.resolved.push(uid.clone());
         }
 
         // Not collapsed, but NPMI may still be uncomputable — a pair that
@@ -479,25 +512,6 @@ pub fn invalidate_phantoms(conn: &Connection, dry_run: bool) -> Result<PhantomRe
         rep.invalidated += 1;
     }
     rep.affected_nodes = nodes.len();
-    // **Rows whose belief has left the sweep entirely.** The per-fact reap
-    // above only reaches beliefs still in the scan set, and
-    // `invalidate-phantoms` runs immediately before `decay` in the nightly
-    // over exactly this alarm's zero-support subset — so a retracted or
-    // superseded belief strands its alarm row forever. No wrong report (uids
-    // are v4 and never reused), but the table grows monotonically and
-    // `COPY_TABLES` now carries the dead rows into every fork.
-    if !dry_run {
-        conn.execute(
-            "DELETE FROM cooccurrence_alarm
-             WHERE fact_uid NOT IN (
-                 SELECT uid FROM fact
-                 WHERE extractor = 'npmi' AND object_id IS NOT NULL
-                   AND polarity = 'positive'
-                   AND valid_to IS NULL AND invalidated_at IS NULL)",
-            [],
-        )?;
-    }
-
     Ok(rep)
 }
 
@@ -834,40 +848,86 @@ mod tests {
     }
 
     /// **Review finding: the record must not outlive an unreported run.**
-    /// Each alarm upsert autocommits, while the report only reaches the
-    /// operator if the sweep returns `Ok` — so a sweep that aborts partway
-    /// had already recorded first sightings that would be "continuing"
-    /// forever and never shown. The dry-run bug through a different door.
+    /// Each alarm write used to autocommit, while the report only reaches
+    /// the operator if the sweep returns `Ok` — so a sweep that aborted
+    /// partway had already recorded first sightings that would read as
+    /// "continuing" forever and never be shown. The dry-run bug through a
+    /// different door.
     ///
-    /// Simulated by aborting after the sweep has written: the transaction
-    /// rolls back, so the next run still has news.
+    /// **This drives `sweep_npmi`, not `sweep_npmi_inner`.** An earlier
+    /// version opened its own transaction around the inner function and
+    /// asserted that SQLite rolls back on drop — which left it green with
+    /// the wrapper deleted, testing the database rather than this code.
+    /// Same gap the copy-path guard had in round one.
     #[test]
-    fn an_aborted_sweep_leaves_no_already_reported_rows() {
+    fn the_bookkeeping_lands_only_when_the_sweep_reports() {
         let conn = open_memory().unwrap();
         graph(&conn, 3, 0);
         co_fact(&conn, 297, 0.82);
 
-        // A sweep that writes and is then rolled back, which is what the
-        // wrapper does on an `Err` return.
-        {
-            let tx = conn.unchecked_transaction().unwrap();
-            let rep = sweep_npmi_inner(&conn, false).unwrap();
-            assert_eq!(rep.integrity_alarms.len(), 1, "it did record a sighting");
-            drop(tx); // rollback, as an aborted sweep would
-        }
-
+        // A dry run reports and writes nothing — the same guarantee from
+        // the preview side, driven through the real entry point.
+        let preview = sweep_npmi(&conn, true).unwrap();
+        assert_eq!(preview.integrity_alarms.len(), 1);
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(rows, 0, "an aborted sweep must leave no bookkeeping behind");
+        assert_eq!(rows, 0, "a preview must leave no bookkeeping");
 
-        // And the news survives for the run that actually reports it.
+        // A real run reports AND writes, in that order.
         let real = sweep_npmi(&conn, false).unwrap();
         assert_eq!(
             real.integrity_alarms.len(),
             1,
-            "the abort must not have consumed the first sighting"
+            "the preview must not have consumed the first sighting"
         );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a reported run records what it reported");
+
+        // And the second real run is quiet, which is the whole point.
+        let again = sweep_npmi(&conn, false).unwrap();
+        assert!(again.integrity_alarms.is_empty());
+        assert_eq!(again.integrity_alarms_continuing, 1);
+    }
+
+    /// **The mechanism the abort guarantee rests on: nothing reaches the
+    /// database until `flush`.** The test above pins the observable
+    /// contract (a preview writes nothing, a reported run records, the next
+    /// is quiet) but I could not make it fail under two mutations I tried —
+    /// each is masked by an independent gate, which is defence in depth
+    /// rather than a hole in the contract. This one is sensitive: it drives
+    /// `AlarmWrites` directly, so deleting the buffering and writing inline
+    /// during the scan is exactly what it catches.
+    ///
+    /// The abort path itself (a sweep returning `Err` partway) has no test:
+    /// triggering it needs a failure seam inside `sweep_npmi_inner` that
+    /// does not exist, and adding one to test it would be a larger change
+    /// than the guarantee is worth. Saying so rather than implying coverage.
+    #[test]
+    fn buffered_alarm_writes_touch_nothing_until_flushed() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        let uid = co_fact(&conn, 297, 0.82);
+
+        let mut pending = super::AlarmWrites::default();
+        pending.seen.push((uid.clone(), 297, 3));
+
+        let rows = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&conn), 0, "holding the write must not perform it");
+
+        pending.flush(&conn).unwrap();
+        assert_eq!(rows(&conn), 1, "flush is what performs it");
+
+        // And the resolved list removes, so a recovery is not left behind.
+        let mut undo = super::AlarmWrites::default();
+        undo.resolved.push(uid);
+        undo.flush(&conn).unwrap();
+        assert_eq!(rows(&conn), 0, "a resolved collapse leaves no row");
     }
 
     /// A collapse that DEEPENS is news again — the suppression must not

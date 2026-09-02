@@ -241,11 +241,14 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
         }
         let (cols, src_only) = shared_columns(conn, t)?;
         if !src_only.is_empty() {
-            eprintln!(
-                "WARNING: source `{t}` has column(s) this build does not know ({}) \
-                 — their data is NOT copied.",
+            // Same refusal as the copy loop below: a newer source is a
+            // downgrade, and a downgrade that drops data quietly is worse
+            // than one that stops.
+            return Err(crate::error::Error::Other(format!(
+                "source `{t}` has column(s) this build does not know ({}) — refusing \
+                 to copy. This database was written by a NEWER build.",
                 src_only.join(", ")
-            );
+            )));
         }
         let cols = cols.join(", ");
         conn.execute_batch(&format!(
@@ -282,13 +285,21 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
         // `src` is attached raw and never migrated, no `user_version` is
         // compared, and `quick_counts` checks four row counts.
         if !src_only.is_empty() {
-            eprintln!(
-                "WARNING: source `{t}` has column(s) this build does not know \
-                 ({}) — their data is NOT copied. This database was probably \
-                 written by a newer build; copying under an older one loses \
-                 whatever those columns held.",
+            // **Refuse, do not warn.** Replacing `SELECT *` with a column
+            // intersection removed the only thing that noticed a source
+            // column this build does not know: arity. A warning plus exit 0
+            // means `decrypt` produces a verified-looking copy that is
+            // missing a column's data — `quick_counts` compares four row
+            // counts and would pass it. A check that cannot faithfully run
+            // stops the run; the earlier draft diagnosed this precisely and
+            // then chose a log line anyway.
+            return Err(crate::error::Error::Other(format!(
+                "source `{t}` has column(s) this build does not know ({}) — refusing \
+                 to copy, because doing so would silently drop their data. This \
+                 database was written by a NEWER build; use that build, or upgrade \
+                 this one.",
                 src_only.join(", ")
-            );
+            )));
         }
         let cols = cols.join(", ");
         conn.execute_batch(&format!(
@@ -365,7 +376,7 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
         ));
     }
     if !db_path.exists() {
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "{} does not exist",
             db_path.display()
         )));
@@ -412,7 +423,7 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
         let dst_counts = quick_counts(&conn, "main")?;
         if src_counts != dst_counts {
             let _ = conn.execute_batch("ROLLBACK;");
-            return Err(Error::Other(format!(
+            return Err(crate::error::Error::Other(format!(
                 "verification failed: src {src_counts:?} != encrypted {dst_counts:?}"
             )));
         }
@@ -457,7 +468,7 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
     let dst_counts = quick_counts(&conn, "main")?;
     if src_counts != dst_counts {
         let _ = conn.execute_batch("ROLLBACK;");
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "verification failed: src {src_counts:?} != snapshot {dst_counts:?}"
         )));
     }
@@ -485,13 +496,13 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
     register_vec_extension();
 
     if !db_path.exists() {
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "{} does not exist",
             db_path.display()
         )));
     }
     if out.exists() {
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "{} already exists — deleting a fork is a deliberate act, do it yourself",
             out.display()
         )));
@@ -515,7 +526,7 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
     // at the LIVE key and must never name where a fork's fresh key lands.
     let dest_key = out.with_file_name("db.key");
     if dest_key.exists() {
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "{} already exists — refusing to overwrite a key",
             dest_key.display()
         )));
@@ -561,7 +572,7 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
     if src_counts != dst_counts {
         let _ = conn.execute_batch("ROLLBACK;");
         let _ = std::fs::remove_file(&dest_key);
-        return Err(Error::Other(format!(
+        return Err(crate::error::Error::Other(format!(
             "verification failed: src {src_counts:?} != fork {dst_counts:?}"
         )));
     }
