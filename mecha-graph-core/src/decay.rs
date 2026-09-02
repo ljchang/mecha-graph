@@ -169,12 +169,18 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
             // collapse looked like the last time it was reported; a
             // collapse that has not deepened since then is counted and not
             // re-narrated.
-            let prior: Option<(i64, i64)> = conn
+            // `first_observed_co` as well as the latest: the message says
+            // "when first reported", and the upsert overwrites `observed_co`
+            // on every non-dry run — so a pair eroding 50 → 40 → 30 across
+            // three nights reported "(was 40 when first reported)" on the
+            // third. The first number was unrecoverable from the row.
+            let prior: Option<(i64, i64, i64)> = conn
                 .query_row(
-                    "SELECT stated_co, observed_co FROM cooccurrence_alarm \
-                     WHERE fact_uid = ?1",
+                    "SELECT stated_co, observed_co, \
+                            COALESCE(first_observed_co, observed_co) \
+                     FROM cooccurrence_alarm WHERE fact_uid = ?1",
                     rusqlite::params![uid],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
             let news = match prior {
@@ -189,7 +195,7 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
                 // today 20 — an 80-episode loss reported as nothing,
                 // because 20 < 3 is false. A moved baseline means the
                 // remembered observation is not comparable, so it is news.
-                Some((before_stated, before_observed)) => {
+                Some((before_stated, before_observed, _)) => {
                     now_co < before_observed || stated_co != before_stated
                 }
             };
@@ -203,8 +209,9 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
             // through the command that promises to change nothing.
             if !dry_run {
                 conn.execute(
-                    "INSERT INTO cooccurrence_alarm (fact_uid, stated_co, observed_co)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO cooccurrence_alarm
+                         (fact_uid, stated_co, observed_co, first_observed_co)
+                     VALUES (?1, ?2, ?3, ?3)
                      ON CONFLICT(fact_uid) DO UPDATE SET
                          observed_co = excluded.observed_co,
                          stated_co = excluded.stated_co,
@@ -215,7 +222,11 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
             if news {
                 let how = match prior {
                     None => String::new(),
-                    Some((_, before)) => format!(" (was {before} when first reported)"),
+                    // The FIRST observation, which is what the sentence
+                    // claims. Naming the previous sweep's number instead
+                    // also narrated a "worsening" for a pair that had
+                    // partially recovered since its first sighting.
+                    Some((_, _, first)) => format!(" (was {first} when first reported)"),
                 };
                 rep.integrity_alarms.push((
                     statement.chars().take(90).collect(),
@@ -232,6 +243,22 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
             }
             continue;
         }
+
+        // **Not collapsed: reap the row.** Without this the table means
+        // "was collapsed once", not "is collapsed" — and the consequence is
+        // not just tidiness. A pair that recovers to exactly its stated
+        // count does not trip the refresh, so the baseline never moves, and
+        // an undone-then-redone re-partition files a genuinely fresh
+        // collapse as "already reported and no worse since". Deleting on
+        // the healthy path also reaps rows for facts this sweep later
+        // closes.
+        if !dry_run {
+            conn.execute(
+                "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                rusqlite::params![uid],
+            )?;
+        }
+
         // Not collapsed, but NPMI may still be uncomputable — a pair that
         // slid just under NPMI_MIN_COOCCUR without crossing the collapse
         // ratio lands exactly here. That used to be impossible, because

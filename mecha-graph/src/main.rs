@@ -3323,10 +3323,19 @@ reject: it was never true (retracted; the class learns)"
             // Still true, still unresolved, and not news. Reported as a
             // number so it cannot be mistaken for either zero or a fresh
             // finding — a dash is never zero, and neither is a backlog.
+            // Self-naming, because in the steady state this change is built
+            // to produce — 0 new, N continuing — the `⚑` header above never
+            // prints, and an indented parenthetical then dangles under the
+            // scan counts with nothing saying what the number counts.
             if r.integrity_alarms_continuing > 0 {
+                let lead = if r.integrity_alarms.is_empty() {
+                    "\ninput-set collapses: "
+                } else {
+                    "  "
+                };
                 println!(
-                    "  ({} collapse(s) already reported and no worse since — \
-                     unchanged, not resolved)",
+                    "{lead}{} already reported and no worse since — unchanged, \
+                     not resolved (beliefs left untouched)",
                     r.integrity_alarms_continuing
                 );
             }

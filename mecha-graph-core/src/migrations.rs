@@ -132,6 +132,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "cooccurrence_alarm",
         sql: V024_COOCCURRENCE_ALARM,
     },
+    Migration {
+        version: 25,
+        name: "cooccurrence_alarm_first_observed",
+        sql: V025_COOCCURRENCE_ALARM_FIRST_OBSERVED,
+    },
 ];
 
 /// Semantic rejection memory (review-on-use §5): the embedded index of
@@ -1171,4 +1176,23 @@ CREATE TABLE IF NOT EXISTS cooccurrence_alarm (
     first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"#;
+
+/// The observation at a collapse's FIRST sighting, never overwritten.
+///
+/// `observed_co` is rewritten on every non-dry sweep, so the
+/// "(was N when first reported)" message named the *previous* night — a pair
+/// eroding 50 → 40 → 30 reported "was 40" on the third. `COALESCE` in the
+/// reader keeps rows written before this migration meaningful: they degrade
+/// to their latest observation, which is the best that row can honestly say.
+///
+/// **A separate migration rather than an edit to V024, because V024 has
+/// already run.** Editing a migration in place works only on a database that
+/// has never applied it: `run_migrations` skips a version already recorded,
+/// so a store that took V024 last night would never gain the column and
+/// every read of it fails with `no such column`. Found exactly that way —
+/// the in-memory tests all build from a fresh `run_migrations` and passed,
+/// and a sweep against a copy of the live store did not.
+const V025_COOCCURRENCE_ALARM_FIRST_OBSERVED: &str = r#"
+ALTER TABLE cooccurrence_alarm ADD COLUMN first_observed_co INTEGER;
 "#;

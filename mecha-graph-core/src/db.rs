@@ -215,7 +215,26 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
         crate::embed::ensure_vec_dims(conn, dims)?;
     }
     conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let present: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM src.sqlite_master WHERE type = 'table'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    // **Both loops, not just the copy one.** The guard below started on
+    // `COPY_TABLES` alone, which left this loop reading `src` exactly as
+    // unconditionally — and `node_slot` is created by V013, so a snapshot
+    // archived before that still took `decrypt`, `encrypt_in_place` and
+    // `fork_db` down here, *before* the guarded loop ran. That also dates
+    // the class earlier than the note below first claimed: it is not
+    // "latent since embed_meta (V016)", it has been reachable since the
+    // first migration that created a seeded table, and V020 adding `nodes`
+    // to SEEDED_TABLES is the same shape landing again.
     for t in SEEDED_TABLES {
+        if !present.contains(*t) {
+            eprintln!("note: source has no `{t}` (older schema) — copied as empty");
+            continue;
+        }
         conn.execute_batch(&format!(
             "INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t};"
         ))?;
@@ -228,15 +247,11 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
     // `decrypt`, `encrypt_in_place` and `fork_db` for exactly the archived
     // `graph.db.pre-*.bak` snapshots those commands exist to open.
     //
-    // Latent since `embed_meta` (V016) and reachable for every migration
-    // after it; `cooccurrence_alarm` would have been the second instance.
+    // Reachable since the first migration that added a table to either
+    // list — `node_slot` (V013) is the oldest instance, not `embed_meta`
+    // (V016) as an earlier draft of this comment said.
     // Fixed for the class rather than for this table, because the next one
     // would land the same way.
-    let present: std::collections::HashSet<String> = {
-        let mut stmt = conn.prepare("SELECT name FROM src.sqlite_master WHERE type = 'table'")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
     for t in COPY_TABLES {
         if !present.contains(*t) {
             // Said, not swallowed: an empty copy is the right outcome and a
@@ -726,5 +741,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM episode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+}
+
+#[cfg(test)]
+mod older_source_tests {
+    use rusqlite::Connection;
+
+    /// **The guard, proved.** Review found it untested and was right: every
+    /// other copy-path test builds `src` from `run_migrations`, so `src`
+    /// always has every table and deleting the guard left all 338 green.
+    ///
+    /// This drops one table from each list — `cooccurrence_alarm` from
+    /// `COPY_TABLES` and `node_slot` from `SEEDED_TABLES` — which is what a
+    /// `graph.db.pre-*.bak` archived before V013 or V024 actually looks
+    /// like. `src` is attached as-is and never migrated, so an
+    /// unconditional `INSERT … SELECT * FROM src.<t>` fails the whole copy
+    /// with `no such table`, taking `decrypt`, `encrypt_in_place` and
+    /// `fork_db` down on exactly the snapshots those commands exist to open.
+    #[test]
+    fn a_source_older_than_a_migration_copies_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("old.db");
+
+        // An "older" source: full schema, minus one table from each list.
+        {
+            let src = crate::db::open_memory().unwrap();
+            src.execute_batch(&format!("VACUUM INTO '{}';", src_path.to_string_lossy()))
+                .unwrap();
+        }
+        let src = Connection::open(&src_path).unwrap();
+        src.execute_batch("DROP TABLE cooccurrence_alarm; DROP TABLE node_slot;")
+            .unwrap();
+        // Assert the fixture is actually the case under test, or this
+        // passes for the wrong reason.
+        for t in ["cooccurrence_alarm", "node_slot"] {
+            let n: i64 = src
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{t} must be absent for this test to mean anything");
+        }
+        drop(src);
+
+        // Destination has the current schema; copy from the older source.
+        let dest = crate::db::open_memory().unwrap();
+        dest.execute(
+            "ATTACH DATABASE ?1 AS src",
+            rusqlite::params![src_path.to_string_lossy()],
+        )
+        .unwrap();
+        super::copy_all_tables(&dest).expect("an older source must copy, not fail");
+
+        // The copy completed; what "as empty" means differs by list, and
+        // the difference is the point of the two lists existing.
+        //
+        // A COPY_TABLES entry the source lacks contributes nothing, so the
+        // destination keeps the zero rows `run_migrations` left it.
+        let n: i64 = dest
+            .query_row("SELECT COUNT(*) FROM main.cooccurrence_alarm", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "an absent COPY_TABLES source contributes nothing");
+
+        // A SEEDED_TABLES entry keeps the DESTINATION's own seed — which is
+        // why that loop is `INSERT OR IGNORE` and not a plain INSERT. An
+        // earlier draft of this test asserted 0 here and failed against 22,
+        // which was the assertion being wrong rather than the code.
+        let n: i64 = dest
+            .query_row("SELECT COUNT(*) FROM main.node_slot", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            n > 0,
+            "an absent SEEDED_TABLES source must leave the destination's own seed intact, got {n}"
+        );
     }
 }
