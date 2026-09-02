@@ -120,6 +120,36 @@ pub fn render_statement(statement: &str, co: i64, npmi: f64) -> Option<String> {
 /// Sweep live co-occurrence facts: re-derive each, close the decayed,
 /// refresh drifted numbers, alarm on input collapse.
 pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
+    // **The alarm bookkeeping must not outlive a sweep that never
+    // reported.** Each upsert autocommits on its own, while `rep` only
+    // reaches the operator if the whole loop returns `Ok` — so a sweep that
+    // dies at fact 400 of 1,200 (a SQLITE_BUSY from a concurrent MCP
+    // writer, or the process killed; `nightly.sh` logs FAILED and carries
+    // on) prints nothing, yet the first sightings it already recorded are
+    // "continuing" from then on and are never shown again.
+    //
+    // That is the dry-run bug reached through an abort instead of a
+    // preview: a first sighting consumed by something that displayed it to
+    // nobody. One transaction around the body ties the record to the run
+    // actually finishing.
+    let tx = if dry_run {
+        None
+    } else {
+        Some(conn.unchecked_transaction()?)
+    };
+    let out = sweep_npmi_inner(conn, dry_run);
+    match (&out, tx) {
+        (Ok(_), Some(tx)) => tx.commit()?,
+        // Rollback is the default on drop, but say it: an abort must undo
+        // the bookkeeping, or the next run calls a never-reported collapse
+        // "already reported".
+        (Err(_), Some(tx)) => drop(tx),
+        _ => {}
+    }
+    out
+}
+
+fn sweep_npmi_inner(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
     let mut rep = DecayReport::default();
     let rows: Vec<(i64, String, String, String, String)> = {
         let mut stmt = conn.prepare(
@@ -222,8 +252,13 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
                          -- life of the belief. The COALESCE in the reader
                          -- would then resolve the first sighting to last
                          -- night, on precisely the rows that motivated V025.
+                         -- Unqualified `observed_co` is the row's PRE-update
+                         -- value, which is strictly closer to the first
+                         -- sighting than tonight's count. Reachable well
+                         -- beyond the V024 window: copying a V024-era
+                         -- snapshot lands every forked row with NULL here.
                          first_observed_co =
-                             COALESCE(first_observed_co, excluded.observed_co),
+                             COALESCE(first_observed_co, observed_co),
                          last_seen_at = datetime('now')",
                     rusqlite::params![uid, stated_co, now_co],
                 )?;
@@ -444,6 +479,25 @@ pub fn invalidate_phantoms(conn: &Connection, dry_run: bool) -> Result<PhantomRe
         rep.invalidated += 1;
     }
     rep.affected_nodes = nodes.len();
+    // **Rows whose belief has left the sweep entirely.** The per-fact reap
+    // above only reaches beliefs still in the scan set, and
+    // `invalidate-phantoms` runs immediately before `decay` in the nightly
+    // over exactly this alarm's zero-support subset — so a retracted or
+    // superseded belief strands its alarm row forever. No wrong report (uids
+    // are v4 and never reused), but the table grows monotonically and
+    // `COPY_TABLES` now carries the dead rows into every fork.
+    if !dry_run {
+        conn.execute(
+            "DELETE FROM cooccurrence_alarm
+             WHERE fact_uid NOT IN (
+                 SELECT uid FROM fact
+                 WHERE extractor = 'npmi' AND object_id IS NOT NULL
+                   AND polarity = 'positive'
+                   AND valid_to IS NULL AND invalidated_at IS NULL)",
+            [],
+        )?;
+    }
+
     Ok(rep)
 }
 
@@ -776,6 +830,43 @@ mod tests {
             after.integrity_alarms.len(),
             1,
             "the baseline moved, so the remembered observation cannot silence this"
+        );
+    }
+
+    /// **Review finding: the record must not outlive an unreported run.**
+    /// Each alarm upsert autocommits, while the report only reaches the
+    /// operator if the sweep returns `Ok` — so a sweep that aborts partway
+    /// had already recorded first sightings that would be "continuing"
+    /// forever and never shown. The dry-run bug through a different door.
+    ///
+    /// Simulated by aborting after the sweep has written: the transaction
+    /// rolls back, so the next run still has news.
+    #[test]
+    fn an_aborted_sweep_leaves_no_already_reported_rows() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        co_fact(&conn, 297, 0.82);
+
+        // A sweep that writes and is then rolled back, which is what the
+        // wrapper does on an `Err` return.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let rep = sweep_npmi_inner(&conn, false).unwrap();
+            assert_eq!(rep.integrity_alarms.len(), 1, "it did record a sighting");
+            drop(tx); // rollback, as an aborted sweep would
+        }
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "an aborted sweep must leave no bookkeeping behind");
+
+        // And the news survives for the run that actually reports it.
+        let real = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(
+            real.integrity_alarms.len(),
+            1,
+            "the abort must not have consumed the first sighting"
         );
     }
 

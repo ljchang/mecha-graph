@@ -210,35 +210,6 @@ const SEEDED_TABLES: &[&str] = &["predicate", "predicate_alias", "node_slot", "n
 /// Read off `src`'s own schema rather than off config, because **a copy must
 /// reproduce the database it is a copy of**, even when config has since moved
 /// on to a different model.
-/// Columns a table has in BOTH databases, comma-joined for a SELECT list.
-///
-/// **`SELECT *` takes the SOURCE's column list**, so a source whose table is
-/// narrower than `main`'s fails the whole copy with "table … has N columns
-/// but M values were supplied" — the same class as a missing table, one step
-/// in. V025's `ADD COLUMN` creates a fresh instance of it for
-/// `cooccurrence_alarm` against any snapshot taken between V024 and V025,
-/// and the same break is latent for every table a later migration widened.
-///
-/// Naming the intersection copies what both sides agree on and leaves the
-/// destination's default in the columns the source never had, which is the
-/// same answer "copied as empty" gives one level up.
-fn shared_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    // Asked of each side directly rather than via `pragma_table_info`,
-    // whose schema argument is not available in every SQLite build.
-    let main_cols: Vec<String> = {
-        let stmt = conn.prepare(&format!("SELECT * FROM main.{table} LIMIT 0"))?;
-        stmt.column_names().into_iter().map(String::from).collect()
-    };
-    let src_cols: std::collections::HashSet<String> = {
-        let stmt = conn.prepare(&format!("SELECT * FROM src.{table} LIMIT 0"))?;
-        stmt.column_names().into_iter().map(String::from).collect()
-    };
-    Ok(main_cols
-        .into_iter()
-        .filter(|c| src_cols.contains(c))
-        .collect())
-}
-
 fn copy_all_tables(conn: &Connection) -> Result<()> {
     if let Some(dims) = crate::embed::declared_vec_dims_in(conn, "src")? {
         crate::embed::ensure_vec_dims(conn, dims)?;
@@ -268,7 +239,15 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             eprintln!("note: source has no `{t}` (older schema) — kept this database's own seed");
             continue;
         }
-        let cols = shared_columns(conn, t)?.join(", ");
+        let (cols, src_only) = shared_columns(conn, t)?;
+        if !src_only.is_empty() {
+            eprintln!(
+                "WARNING: source `{t}` has column(s) this build does not know ({}) \
+                 — their data is NOT copied.",
+                src_only.join(", ")
+            );
+        }
+        let cols = cols.join(", ");
         conn.execute_batch(&format!(
             "INSERT OR IGNORE INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
         ))?;
@@ -293,13 +272,72 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             eprintln!("note: source has no `{t}` (older schema) — copied as empty");
             continue;
         }
-        let cols = shared_columns(conn, t)?.join(", ");
+        let (cols, src_only) = shared_columns(conn, t)?;
+        // **A source WIDER than main is a downgrade, and must not be
+        // silent.** Dropping columns `src` lacks is announced above.
+        // Dropping columns `src` HAS and `main` lacks is the opposite
+        // direction — a snapshot written by a newer build, copied under an
+        // older one — and `SELECT *` at least failed loudly on arity before
+        // the intersection made it quiet. Nothing else would catch it:
+        // `src` is attached raw and never migrated, no `user_version` is
+        // compared, and `quick_counts` checks four row counts.
+        if !src_only.is_empty() {
+            eprintln!(
+                "WARNING: source `{t}` has column(s) this build does not know \
+                 ({}) — their data is NOT copied. This database was probably \
+                 written by a newer build; copying under an older one loses \
+                 whatever those columns held.",
+                src_only.join(", ")
+            );
+        }
+        let cols = cols.join(", ");
         conn.execute_batch(&format!(
             "INSERT INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
         ))?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// Columns a table has in BOTH databases, comma-joined for a SELECT list.
+///
+/// **`SELECT *` takes the SOURCE's column list**, so a source whose table is
+/// narrower than `main`'s fails the whole copy with "table … has N columns
+/// but M values were supplied" — the same class as a missing table, one step
+/// in. V025's `ADD COLUMN` creates a fresh instance of it for
+/// `cooccurrence_alarm` against any snapshot taken between V024 and V025,
+/// and the same break is latent for every table a later migration widened.
+///
+/// Naming the intersection copies what both sides agree on and leaves the
+/// destination's default in the columns the source never had, which is the
+/// same answer "copied as empty" gives one level up.
+fn shared_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<String>)> {
+    // Asked of each side directly rather than via `pragma_table_info`,
+    // whose schema argument is not available in every SQLite build.
+    let main_cols: Vec<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM main.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let src_cols: std::collections::HashSet<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM src.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let shared: Vec<String> = main_cols
+        .iter()
+        .filter(|c| src_cols.contains(*c))
+        .cloned()
+        .collect();
+    // Columns the SOURCE has that this build does not — the downgrade
+    // direction, returned so the caller can say so rather than lose it
+    // quietly. `SELECT *` at least failed loudly on arity here.
+    let main_set: std::collections::HashSet<&String> = main_cols.iter().collect();
+    let mut src_only: Vec<String> = src_cols
+        .iter()
+        .filter(|c| !main_set.contains(c))
+        .cloned()
+        .collect();
+    src_only.sort();
+    Ok((shared, src_only))
 }
 
 fn quick_counts(conn: &Connection, schema: &str) -> Result<(i64, i64, i64, i64)> {
