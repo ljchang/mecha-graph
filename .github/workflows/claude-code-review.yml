@@ -118,4 +118,22 @@ jobs:
             Rank most severe first, and label each MAJOR / MEDIUM / MINOR —
             the owner's rule is that major and medium get fixed before merge
             and the rest are theirs to weigh. If nothing survives scrutiny,
-            say so plainly rather than inventing findings.
+            say so plainly rather than inventing findings: a review that
+            always finds something teaches maintainers to ignore it.
+
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` (with
+            `confirmed: true`) for specific code issues.
+            Only post GitHub comments — do not return review text as a
+            message. **A review that is not posted did not happen**: the
+            first real run on this repo spent 39 turns and $0.84 producing
+            one, then took 14 permission denials trying to post it, because
+            neither the instruction nor the tool grant below existed. The
+            job reported success.
+
+          # Pinned rather than left to the action's default, which is
+          # `claude-sonnet-5` — verified in this repo's own run-log init
+          # event before pinning.
+          claude_args: |
+            --model claude-opus-5
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cargo check:*),Bash(cargo clippy:*),Bash(cargo test:*)"
