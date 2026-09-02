@@ -34,7 +34,7 @@
 //! of hundreds of "co-occurrence decayed" cards would be exactly the
 //! O(facts) oversight D1 exists to eliminate.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::error::Result;
@@ -71,8 +71,29 @@ pub struct DecayReport {
     pub held_band: usize,
     /// Human-verified: recomputation never overrides a person.
     pub held_user: usize,
-    /// Input-set collapses: `(statement, detail)`. Data-integrity alarms.
+    /// Input-set collapses seen for the FIRST time, or that got worse since
+    /// they were last seen: `(statement, detail)`. Data-integrity alarms.
+    ///
+    /// New and worsened only, on purpose. This list ran at 44-56 entries
+    /// every night for eighteen days without one night differing from the
+    /// last, because the check had no memory — and an alarm that repeats
+    /// identically forever is one a reader learns to skip, which is the
+    /// state a real collapse would have to arrive into. See
+    /// `migrations::V024_COOCCURRENCE_ALARM` for what the counts turned out
+    /// to track.
     pub integrity_alarms: Vec<(String, String)>,
+    /// Collapses already reported and no worse than when they were first
+    /// seen. A number, not a list: they are still true and still unresolved,
+    /// and dropping them entirely would be the opposite error.
+    pub integrity_alarms_continuing: usize,
+    /// When the OLDEST still-standing collapse was first seen, RFC-3339-ish
+    /// (`datetime('now')` shape). `None` when nothing is continuing.
+    ///
+    /// Age is the one thing that separates standing residue from something
+    /// that arrived this week, and `first_seen_at` was written and never
+    /// read — a backlog with no age reads the same on night two and night
+    /// two hundred.
+    pub integrity_alarms_oldest: Option<String>,
     /// Unparseable statements — left alone rather than guessed at.
     pub unparsed: usize,
 }
@@ -107,6 +128,95 @@ pub fn render_statement(statement: &str, co: i64, npmi: f64) -> Option<String> {
 /// Sweep live co-occurrence facts: re-derive each, close the decayed,
 /// refresh drifted numbers, alarm on input collapse.
 pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
+    // **The alarm bookkeeping must not outlive a sweep that never
+    // reported.** Each upsert used to autocommit on its own, while `rep`
+    // only reaches the operator if the whole loop returns `Ok` — so a sweep
+    // that died at fact 400 of 1,200 (a SQLITE_BUSY from a concurrent MCP
+    // writer, or the process killed; `nightly.sh` logs FAILED and carries
+    // on) printed nothing, yet the first sightings it had already recorded
+    // were "continuing" from then on and never shown again. That is the
+    // dry-run bug reached through an abort instead of a preview.
+    //
+    // **Buffered and flushed, NOT one transaction around the scan.** The
+    // first fix wrapped the whole body, which took the write lock on the
+    // first fact and held it across ~1,200 `rederive_npmi` /
+    // `shared_episodes` iterations — with `busy_timeout` at 5s, a
+    // concurrent MCP write during the nightly then fails `database is
+    // locked` where it used to interleave, and an abort would discard the
+    // night's decay closes as well as the alarm rows. The guarantee only
+    // ever needed the bookkeeping to land or not land together, so it is
+    // collected in memory and written in one short transaction after the
+    // scan. A sweep that dies before that point wrote nothing.
+    let mut pending = AlarmWrites::default();
+    let out = sweep_npmi_inner(conn, dry_run, &mut pending);
+    if out.is_ok() && !dry_run {
+        let tx = conn.unchecked_transaction()?;
+        pending.flush(conn)?;
+        tx.commit()?;
+    }
+    out
+}
+
+/// Alarm bookkeeping a sweep decided on, held until the sweep finishes.
+///
+/// Nothing here touches the database during the scan — see the note in
+/// [`sweep_npmi`] on why the first version's single long transaction was
+/// worse than the problem it solved.
+#[derive(Default)]
+struct AlarmWrites {
+    /// `(fact_uid, stated_co, observed_co)` to upsert.
+    seen: Vec<(String, i64, i64)>,
+    /// Beliefs no longer collapsed; their row goes.
+    resolved: Vec<String>,
+}
+
+impl AlarmWrites {
+    fn flush(&self, conn: &Connection) -> Result<()> {
+        for (uid, stated, observed) in &self.seen {
+            conn.execute(
+                "INSERT INTO cooccurrence_alarm
+                     (fact_uid, stated_co, observed_co, first_observed_co)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(fact_uid) DO UPDATE SET
+                     observed_co = excluded.observed_co,
+                     stated_co = excluded.stated_co,
+                     -- Unqualified `observed_co` is the row's PRE-update
+                     -- value, strictly closer to the first sighting than
+                     -- tonight's count.
+                     first_observed_co = COALESCE(first_observed_co, observed_co),
+                     last_seen_at = datetime('now')",
+                rusqlite::params![uid, stated, observed],
+            )?;
+        }
+        for uid in &self.resolved {
+            conn.execute(
+                "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                rusqlite::params![uid],
+            )?;
+        }
+        // Rows whose belief has left the sweep entirely — retracted by
+        // `invalidate-phantoms`, which runs immediately before `decay` over
+        // exactly this alarm's zero-support subset, or superseded. No wrong
+        // report (uids are v4), but the table would grow monotonically and
+        // `COPY_TABLES` carries the dead rows into every fork.
+        conn.execute(
+            "DELETE FROM cooccurrence_alarm
+             WHERE fact_uid NOT IN (
+                 SELECT uid FROM fact
+                 WHERE extractor = 'npmi' AND object_id IS NOT NULL
+                   AND polarity = 'positive'
+                   AND valid_to IS NULL AND invalidated_at IS NULL)",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+fn sweep_npmi_inner(
+    conn: &Connection,
+    dry_run: bool,
+    pending: &mut AlarmWrites,
+) -> Result<DecayReport> {
     let mut rep = DecayReport::default();
     let rows: Vec<(i64, String, String, String, String)> = {
         let mut stmt = conn.prepare(
@@ -152,15 +262,102 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
         // debug ingestion.
         let collapsed = (now_co as f64) < (stated_co as f64) * COLLAPSE_RATIO;
         if collapsed {
-            rep.integrity_alarms.push((
-                statement.chars().take(90).collect(),
-                format!(
-                    "input set {stated_co} → {now_co} shared episodes: mentions lost, \
-                     not drift — belief left untouched, check the mention pipeline"
-                ),
-            ));
+            // Loud only when it is news. `prior` is what this belief's
+            // collapse looked like the last time it was reported; a
+            // collapse that has not deepened since then is counted and not
+            // re-narrated.
+            // `first_observed_co` as well as the latest: the message says
+            // "when first reported", and the upsert overwrites `observed_co`
+            // on every non-dry run — so a pair eroding 50 → 40 → 30 across
+            // three nights reported "(was 40 when first reported)" on the
+            // third. The first number was unrecoverable from the row.
+            let prior: Option<(i64, i64, i64)> = conn
+                .query_row(
+                    "SELECT stated_co, observed_co, \
+                            COALESCE(first_observed_co, observed_co) \
+                     FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                    rusqlite::params![uid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let news = match prior {
+                None => true,
+                // **Both halves of the remembered row, not just the
+                // observation.** `stated_co` is parsed out of the statement
+                // prose, and the `refreshed` path below re-renders that
+                // prose when the numbers drift — so a belief can collapse,
+                // recover, be re-rendered against a higher baseline, and
+                // collapse again from it. Comparing observations alone
+                // called that "continuing": remembered 3, restated to 100,
+                // today 20 — an 80-episode loss reported as nothing,
+                // because 20 < 3 is false. A moved baseline means the
+                // remembered observation is not comparable, so it is news.
+                // **Against the FIRST observation, not the last.**
+                // `observed_co` is overwritten on every non-dry sweep
+                // including quiet ones, so comparing to it makes the bar
+                // for "worse" track last night rather than the low-water
+                // mark: a pair wobbling 20 / 25 / 20 / 25 across nightly
+                // `link` rebuilds re-alarmed on nights 3, 5, 7 … printing
+                // "(was 20 when first reported)" beside a current 20 — a
+                // fresh finding whose own two numbers say nothing changed.
+                //
+                // It also made the decision and the sentence disagree: the
+                // decision used the previous observation, the message named
+                // the first, so a partial recovery could be reported as
+                // "worsened" while showing an improvement. Both now use
+                // `first_observed_co`.
+                Some((before_stated, _, first_observed)) => {
+                    now_co < first_observed || stated_co != before_stated
+                }
+            };
+            // **Gated on `dry_run` like every other write in this sweep.**
+            // Ungated it was worse than a false "nothing changed": a dry run
+            // CONSUMED the news. An operator previewing tonight's collapses
+            // recorded them, and the real run that followed reported
+            // `new=0` — downgrading a first sighting to a silent
+            // "continuing" number that no later run would ever raise again.
+            // The exact suppression this branch exists to prevent, reachable
+            // through the command that promises to change nothing.
+            if !dry_run {
+                pending.seen.push((uid.clone(), stated_co, now_co));
+            }
+            if news {
+                let how = match prior {
+                    None => String::new(),
+                    // The FIRST observation, which is what the sentence
+                    // claims. Naming the previous sweep's number instead
+                    // also narrated a "worsening" for a pair that had
+                    // partially recovered since its first sighting.
+                    Some((_, _, first)) => format!(" (was {first} when first reported)"),
+                };
+                rep.integrity_alarms.push((
+                    statement.chars().take(90).collect(),
+                    format!(
+                        "input set {stated_co} → {now_co} shared episodes{how}: the stated \
+                         count is what this belief was minted with, and a merge, split or \
+                         relink moves episodes between nodes by design — so check whether \
+                         either node was re-partitioned before suspecting the mention \
+                         pipeline. Belief left untouched either way."
+                    ),
+                ));
+            } else {
+                rep.integrity_alarms_continuing += 1;
+            }
             continue;
         }
+
+        // **Not collapsed: reap the row.** Without this the table means
+        // "was collapsed once", not "is collapsed" — and the consequence is
+        // not just tidiness. A pair that recovers to exactly its stated
+        // count does not trip the refresh, so the baseline never moves, and
+        // an undone-then-redone re-partition files a genuinely fresh
+        // collapse as "already reported and no worse since". Deleting on
+        // the healthy path also reaps rows for facts this sweep later
+        // closes.
+        if !dry_run {
+            pending.resolved.push(uid.clone());
+        }
+
         // Not collapsed, but NPMI may still be uncomputable — a pair that
         // slid just under NPMI_MIN_COOCCUR without crossing the collapse
         // ratio lands exactly here. That used to be impossible, because
@@ -244,6 +441,19 @@ pub fn sweep_npmi(conn: &Connection, dry_run: bool) -> Result<DecayReport> {
         )?;
         rep.closed += 1;
     }
+    // The age of the standing backlog, from the `first_seen_at` the table
+    // has always written and nothing has ever read.
+    if rep.integrity_alarms_continuing > 0 {
+        rep.integrity_alarms_oldest = conn
+            .query_row(
+                "SELECT MIN(first_seen_at) FROM cooccurrence_alarm",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+
     Ok(rep)
 }
 
@@ -551,12 +761,241 @@ mod tests {
             "a pipeline artifact must not delete a belief"
         );
         assert_eq!(rep.integrity_alarms.len(), 1);
-        assert!(rep.integrity_alarms[0].1.contains("mentions lost"));
+        assert_eq!(
+            rep.integrity_alarms_continuing, 0,
+            "the first sighting is news"
+        );
+        // The detail no longer asserts a cause it cannot know. Every step
+        // change in this alarm's live count landed on an operator merge,
+        // split or relink, so the wording names that first.
+        assert!(
+            rep.integrity_alarms[0].1.contains("re-partitioned"),
+            "{}",
+            rep.integrity_alarms[0].1
+        );
         assert!(get_fact_by_uid(&conn, &uid)
             .unwrap()
             .unwrap()
             .valid_to
             .is_none());
+    }
+
+    /// **The regression.** The alarm had no memory, so it re-narrated the
+    /// identical collapse every night — 54 entries a night for eighteen
+    /// days, no night distinguishable from the last. Fails on the old
+    /// behaviour at the second sweep, which used to report it as news again.
+    #[test]
+    fn a_collapse_is_news_once_and_then_a_number() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        let uid = co_fact(&conn, 297, 0.82);
+
+        let first = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(first.integrity_alarms.len(), 1);
+        assert_eq!(first.integrity_alarms_continuing, 0);
+
+        // Nothing changed between the two sweeps.
+        let second = sweep_npmi(&conn, false).unwrap();
+        assert!(
+            second.integrity_alarms.is_empty(),
+            "an unchanged collapse is not a new finding: {:?}",
+            second.integrity_alarms
+        );
+        assert_eq!(
+            second.integrity_alarms_continuing, 1,
+            "but it is still true, and must not read as resolved"
+        );
+        // And still never closed, whichever list it lands in.
+        assert!(get_fact_by_uid(&conn, &uid)
+            .unwrap()
+            .unwrap()
+            .valid_to
+            .is_none());
+    }
+
+    /// **Review finding, and the worst kind: the preview consumed the
+    /// news.** Every other write in `sweep_npmi` is gated on `dry_run`; the
+    /// alarm upsert was not. So `decay --dry-run` — which prints "(dry run
+    /// — nothing changed)" — recorded the collapses it had just shown, and
+    /// the real run afterwards reported `new=0`, downgrading a first
+    /// sighting to a silent "continuing" number no later run would raise.
+    ///
+    /// Fails on the code as reviewed at the final assertion.
+    #[test]
+    fn a_dry_run_does_not_consume_the_news() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        co_fact(&conn, 297, 0.82);
+
+        let preview = sweep_npmi(&conn, true).unwrap();
+        assert_eq!(
+            preview.integrity_alarms.len(),
+            1,
+            "the preview still reports"
+        );
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a dry run must write nothing");
+
+        // And the real sweep that follows still has news to report.
+        let real = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(
+            real.integrity_alarms.len(),
+            1,
+            "the preview must not have consumed the first sighting"
+        );
+        assert_eq!(real.integrity_alarms_continuing, 0);
+    }
+
+    /// **Review finding.** `news` compared the remembered observation and
+    /// ignored the remembered baseline, so a belief that collapsed,
+    /// recovered, was re-rendered against a higher stated count, then
+    /// collapsed again from it was reported as "continuing": remembered 3,
+    /// restated to 100, today 20 — an 80-episode loss silenced because
+    /// `20 < 3` is false. A moved baseline makes the remembered observation
+    /// incomparable, so it is news.
+    #[test]
+    fn a_moved_baseline_makes_the_old_observation_incomparable() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        let uid = co_fact(&conn, 297, 0.82);
+        assert_eq!(sweep_npmi(&conn, false).unwrap().integrity_alarms.len(), 1);
+        assert!(sweep_npmi(&conn, false)
+            .unwrap()
+            .integrity_alarms
+            .is_empty());
+
+        // The remembered row now claims a much smaller baseline than the
+        // statement does — the shape a refresh-then-recollapse leaves.
+        conn.execute(
+            "UPDATE cooccurrence_alarm SET stated_co = 4, observed_co = 1 WHERE fact_uid = ?1",
+            rusqlite::params![uid],
+        )
+        .unwrap();
+        let after = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(
+            after.integrity_alarms.len(),
+            1,
+            "the baseline moved, so the remembered observation cannot silence this"
+        );
+    }
+
+    /// **Review finding: the record must not outlive an unreported run.**
+    /// Each alarm write used to autocommit, while the report only reaches
+    /// the operator if the sweep returns `Ok` — so a sweep that aborted
+    /// partway had already recorded first sightings that would read as
+    /// "continuing" forever and never be shown. The dry-run bug through a
+    /// different door.
+    ///
+    /// **This drives `sweep_npmi`, not `sweep_npmi_inner`.** An earlier
+    /// version opened its own transaction around the inner function and
+    /// asserted that SQLite rolls back on drop — which left it green with
+    /// the wrapper deleted, testing the database rather than this code.
+    /// Same gap the copy-path guard had in round one.
+    #[test]
+    fn the_bookkeeping_lands_only_when_the_sweep_reports() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        co_fact(&conn, 297, 0.82);
+
+        // A dry run reports and writes nothing — the same guarantee from
+        // the preview side, driven through the real entry point.
+        let preview = sweep_npmi(&conn, true).unwrap();
+        assert_eq!(preview.integrity_alarms.len(), 1);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a preview must leave no bookkeeping");
+
+        // A real run reports AND writes, in that order.
+        let real = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(
+            real.integrity_alarms.len(),
+            1,
+            "the preview must not have consumed the first sighting"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a reported run records what it reported");
+
+        // And the second real run is quiet, which is the whole point.
+        let again = sweep_npmi(&conn, false).unwrap();
+        assert!(again.integrity_alarms.is_empty());
+        assert_eq!(again.integrity_alarms_continuing, 1);
+    }
+
+    /// **The mechanism the abort guarantee rests on: nothing reaches the
+    /// database until `flush`.** The test above pins the observable
+    /// contract (a preview writes nothing, a reported run records, the next
+    /// is quiet) but I could not make it fail under two mutations I tried —
+    /// each is masked by an independent gate, which is defence in depth
+    /// rather than a hole in the contract. This one is sensitive: it drives
+    /// `AlarmWrites` directly, so deleting the buffering and writing inline
+    /// during the scan is exactly what it catches.
+    ///
+    /// The abort path itself (a sweep returning `Err` partway) has no test:
+    /// triggering it needs a failure seam inside `sweep_npmi_inner` that
+    /// does not exist, and adding one to test it would be a larger change
+    /// than the guarantee is worth. Saying so rather than implying coverage.
+    #[test]
+    fn buffered_alarm_writes_touch_nothing_until_flushed() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        let uid = co_fact(&conn, 297, 0.82);
+
+        let mut pending = super::AlarmWrites::default();
+        pending.seen.push((uid.clone(), 297, 3));
+
+        let rows = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM cooccurrence_alarm", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows(&conn), 0, "holding the write must not perform it");
+
+        pending.flush(&conn).unwrap();
+        assert_eq!(rows(&conn), 1, "flush is what performs it");
+
+        // And the resolved list removes, so a recovery is not left behind.
+        let mut undo = super::AlarmWrites::default();
+        undo.resolved.push(uid);
+        undo.flush(&conn).unwrap();
+        assert_eq!(rows(&conn), 0, "a resolved collapse leaves no row");
+    }
+
+    /// A collapse that DEEPENS is news again — the suppression must not
+    /// swallow a situation getting worse, which is the failure mode of
+    /// every "only tell me once" rule.
+    #[test]
+    fn a_worsening_collapse_speaks_up_again() {
+        let conn = open_memory().unwrap();
+        graph(&conn, 3, 0);
+        co_fact(&conn, 297, 0.82);
+        assert_eq!(sweep_npmi(&conn, false).unwrap().integrity_alarms.len(), 1);
+        assert!(sweep_npmi(&conn, false)
+            .unwrap()
+            .integrity_alarms
+            .is_empty());
+
+        // Two of the three remaining shared episodes go away.
+        conn.execute(
+            "DELETE FROM mention WHERE episode_id IN (SELECT id FROM episode LIMIT 2)",
+            [],
+        )
+        .unwrap();
+        let worse = sweep_npmi(&conn, false).unwrap();
+        assert_eq!(
+            worse.integrity_alarms.len(),
+            1,
+            "a deeper collapse is a new finding"
+        );
+        assert!(
+            worse.integrity_alarms[0].1.contains("when first reported"),
+            "{}",
+            worse.integrity_alarms[0].1
+        );
     }
 
     #[test]

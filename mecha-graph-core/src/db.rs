@@ -2,7 +2,7 @@
 //! (vec0 virtual tables are created by migrations), then applies pragmas and
 //! runs migrations.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::migrations;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -94,7 +94,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     migrations::run_migrations(&conn).map_err(|e| {
-        crate::error::Error::Other(format!(
+        Error::Other(format!(
             "cannot read {} ({e}) — if the DB is encrypted, the key is wrong or missing \
              (MECHA_GRAPH_DB_KEY / {})",
             path.display(),
@@ -117,6 +117,10 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// annotations, undo history and tombstones until the fork work caught it.)
 const COPY_TABLES: &[&str] = &[
     "embed_meta",
+    // What the co-occurrence alarm has already reported. Copied, because a
+    // fork that drops it re-raises every long-standing collapse as new —
+    // which is the exact noise the table exists to stop.
+    "cooccurrence_alarm",
     "node_alias",
     "node_identifier",
     "episode",
@@ -211,16 +215,140 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
         crate::embed::ensure_vec_dims(conn, dims)?;
     }
     conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let present: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM src.sqlite_master WHERE type = 'table'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    // **Both loops, not just the copy one.** The guard below started on
+    // `COPY_TABLES` alone, which left this loop reading `src` exactly as
+    // unconditionally — and `node_slot` is created by V013, so a snapshot
+    // archived before that still took `decrypt`, `encrypt_in_place` and
+    // `fork_db` down here, *before* the guarded loop ran. That also dates
+    // the class earlier than the note below first claimed: it is not
+    // "latent since embed_meta (V016)", it has been reachable since the
+    // first migration that created a seeded table, and V020 adding `nodes`
+    // to SEEDED_TABLES is the same shape landing again.
     for t in SEEDED_TABLES {
+        if !present.contains(*t) {
+            // Not "copied as empty" — this loop's tables are SEEDED, so the
+            // destination keeps the rows `run_migrations` gave it. Saying
+            // "empty" here would tell the operator the opposite of what
+            // happened, and the test one file down asserts the seed survives.
+            eprintln!("note: source has no `{t}` (older schema) — kept this database's own seed");
+            continue;
+        }
+        let (cols, src_only) = shared_columns(conn, t)?;
+        if !src_only.is_empty() {
+            // Same refusal as the copy loop below: a newer source is a
+            // downgrade, and a downgrade that drops data quietly is worse
+            // than one that stops.
+            return Err(Error::Other(format!(
+                "source `{t}` has column(s) this build does not know ({}) — refusing \
+                 to copy. This database was written by a NEWER build.",
+                src_only.join(", ")
+            )));
+        }
+        let cols = cols.join(", ");
         conn.execute_batch(&format!(
-            "INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t};"
+            "INSERT OR IGNORE INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
         ))?;
     }
+    // **A table the SOURCE does not have is an empty copy, not a failure.**
+    // `main`'s schema comes from `run_migrations`; `src` is attached as-is
+    // and is never migrated. So every table added by a migration is missing
+    // from any snapshot taken before it, and an unconditional INSERT fails
+    // the whole copy with "no such table: src.<name>" — which breaks
+    // `decrypt`, `encrypt_in_place` and `fork_db` for exactly the archived
+    // `graph.db.pre-*.bak` snapshots those commands exist to open.
+    //
+    // Reachable since the first migration that added a table to either
+    // list — `node_slot` (V013) is the oldest instance, not `embed_meta`
+    // (V016) as an earlier draft of this comment said.
+    // Fixed for the class rather than for this table, because the next one
+    // would land the same way.
     for t in COPY_TABLES {
-        conn.execute_batch(&format!("INSERT INTO main.{t} SELECT * FROM src.{t};"))?;
+        if !present.contains(*t) {
+            // Said, not swallowed: an empty copy is the right outcome and a
+            // silent one is how a reader concludes the data was there.
+            eprintln!("note: source has no `{t}` (older schema) — copied as empty");
+            continue;
+        }
+        let (cols, src_only) = shared_columns(conn, t)?;
+        // **A source WIDER than main is a downgrade, and must not be
+        // silent.** Dropping columns `src` lacks is announced above.
+        // Dropping columns `src` HAS and `main` lacks is the opposite
+        // direction — a snapshot written by a newer build, copied under an
+        // older one — and `SELECT *` at least failed loudly on arity before
+        // the intersection made it quiet. Nothing else would catch it:
+        // `src` is attached raw and never migrated, no `user_version` is
+        // compared, and `quick_counts` checks four row counts.
+        if !src_only.is_empty() {
+            // **Refuse, do not warn.** Replacing `SELECT *` with a column
+            // intersection removed the only thing that noticed a source
+            // column this build does not know: arity. A warning plus exit 0
+            // means `decrypt` produces a verified-looking copy that is
+            // missing a column's data — `quick_counts` compares four row
+            // counts and would pass it. A check that cannot faithfully run
+            // stops the run; the earlier draft diagnosed this precisely and
+            // then chose a log line anyway.
+            return Err(Error::Other(format!(
+                "source `{t}` has column(s) this build does not know ({}) — refusing \
+                 to copy, because doing so would silently drop their data. This \
+                 database was written by a NEWER build; use that build, or upgrade \
+                 this one.",
+                src_only.join(", ")
+            )));
+        }
+        let cols = cols.join(", ");
+        conn.execute_batch(&format!(
+            "INSERT INTO main.{t} ({cols}) SELECT {cols} FROM src.{t};"
+        ))?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// Columns a table has in BOTH databases, comma-joined for a SELECT list.
+///
+/// **`SELECT *` takes the SOURCE's column list**, so a source whose table is
+/// narrower than `main`'s fails the whole copy with "table … has N columns
+/// but M values were supplied" — the same class as a missing table, one step
+/// in. V025's `ADD COLUMN` creates a fresh instance of it for
+/// `cooccurrence_alarm` against any snapshot taken between V024 and V025,
+/// and the same break is latent for every table a later migration widened.
+///
+/// Naming the intersection copies what both sides agree on and leaves the
+/// destination's default in the columns the source never had, which is the
+/// same answer "copied as empty" gives one level up.
+fn shared_columns(conn: &Connection, table: &str) -> Result<(Vec<String>, Vec<String>)> {
+    // Asked of each side directly rather than via `pragma_table_info`,
+    // whose schema argument is not available in every SQLite build.
+    let main_cols: Vec<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM main.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let src_cols: std::collections::HashSet<String> = {
+        let stmt = conn.prepare(&format!("SELECT * FROM src.{table} LIMIT 0"))?;
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let shared: Vec<String> = main_cols
+        .iter()
+        .filter(|c| src_cols.contains(*c))
+        .cloned()
+        .collect();
+    // Columns the SOURCE has that this build does not — the downgrade
+    // direction, returned so the caller can say so rather than lose it
+    // quietly. `SELECT *` at least failed loudly on arity here.
+    let main_set: std::collections::HashSet<&String> = main_cols.iter().collect();
+    let mut src_only: Vec<String> = src_cols
+        .iter()
+        .filter(|c| !main_set.contains(c))
+        .cloned()
+        .collect();
+    src_only.sort();
+    Ok((shared, src_only))
 }
 
 fn quick_counts(conn: &Connection, schema: &str) -> Result<(i64, i64, i64, i64)> {
@@ -239,7 +367,6 @@ fn quick_counts(conn: &Connection, schema: &str) -> Result<(i64, i64, i64, i64)>
 /// The plaintext original is moved to `<db>.plain.bak` — caller decides its
 /// fate. Fails if a key already resolves (already encrypted).
 pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
-    use crate::error::Error;
     register_vec_extension();
 
     if resolve_key(db_path).is_some() {
@@ -316,7 +443,6 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
 /// path (§8.4) for an encrypted store. The snapshot is chmod 600; treat it
 /// as ephemeral.
 pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
-    use crate::error::Error;
     register_vec_extension();
 
     let key = resolve_key(db_path)
@@ -364,7 +490,6 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
 /// directory would clobber the live key. Refused, along with any destination
 /// whose `db.key` already exists.
 pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
-    use crate::error::Error;
     register_vec_extension();
 
     if !db_path.exists() {
@@ -699,5 +824,142 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM episode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+}
+
+#[cfg(test)]
+mod older_source_tests {
+    use rusqlite::Connection;
+
+    /// **The guard, proved.** Review found it untested and was right: every
+    /// other copy-path test builds `src` from `run_migrations`, so `src`
+    /// always has every table and deleting the guard left all 338 green.
+    ///
+    /// This drops one table from each list — `cooccurrence_alarm` from
+    /// `COPY_TABLES` and `node_slot` from `SEEDED_TABLES` — which is what a
+    /// `graph.db.pre-*.bak` archived before V013 or V024 actually looks
+    /// like. `src` is attached as-is and never migrated, so an
+    /// unconditional `INSERT … SELECT * FROM src.<t>` fails the whole copy
+    /// with `no such table`, taking `decrypt`, `encrypt_in_place` and
+    /// `fork_db` down on exactly the snapshots those commands exist to open.
+    #[test]
+    fn a_source_older_than_a_migration_copies_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("old.db");
+
+        // An "older" source: full schema, minus one table from each list.
+        {
+            let src = crate::db::open_memory().unwrap();
+            src.execute_batch(&format!("VACUUM INTO '{}';", src_path.to_string_lossy()))
+                .unwrap();
+        }
+        let src = Connection::open(&src_path).unwrap();
+        // Missing from COPY_TABLES, and missing from SEEDED_TABLES: the
+        // two halves of the missing-table class.
+        src.execute_batch("DROP TABLE embed_meta; DROP TABLE node_slot;")
+            .unwrap();
+        // And the NARROWER-table half, which is a different failure:
+        // `SELECT *` takes the source's column list, so a source missing a
+        // column a later migration added fails with "table has N columns but
+        // M values were supplied". This is V025's own scenario — a snapshot
+        // taken after V024 created the table and before V025 widened it.
+        src.execute_batch("ALTER TABLE cooccurrence_alarm DROP COLUMN first_observed_co;")
+            .expect("the narrower-table case must actually be constructed");
+        // **A row, or the narrower case proves only that nothing failed.**
+        // An empty source table moves zero rows, so a `shared_columns` that
+        // returned one column — or the right columns in the wrong order —
+        // would stay green on `Ok` alone.
+        src.execute(
+            "INSERT INTO cooccurrence_alarm (fact_uid, stated_co, observed_co)
+             VALUES ('uid-narrow', 297, 3)",
+            [],
+        )
+        .unwrap();
+
+        // Assert every part of the fixture is real, or the halves pass
+        // vacuously. An earlier draft used `.ok()` on the ALTER and was
+        // silently testing nothing: the drop had failed on an index.
+        for t in ["embed_meta", "node_slot"] {
+            let n: i64 = src
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{t} must be absent for this test to mean anything");
+        }
+        let narrowed: i64 = src
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cooccurrence_alarm') \
+                 WHERE name = 'first_observed_co'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            narrowed, 0,
+            "src.cooccurrence_alarm must really be narrower"
+        );
+        drop(src);
+
+        // Destination has the current schema; copy from the older source.
+        let dest = crate::db::open_memory().unwrap();
+        dest.execute(
+            "ATTACH DATABASE ?1 AS src",
+            rusqlite::params![src_path.to_string_lossy()],
+        )
+        .unwrap();
+        super::copy_all_tables(&dest).expect("an older source must copy, not fail");
+
+        // The copy completed; what "as empty" means differs by list, and
+        // the difference is the point of the two lists existing.
+        //
+        // A COPY_TABLES entry the source lacks contributes nothing, so the
+        // destination keeps the zero rows `run_migrations` left it.
+        let n: i64 = dest
+            .query_row("SELECT COUNT(*) FROM main.embed_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "an absent COPY_TABLES source contributes nothing");
+
+        // A SEEDED_TABLES entry keeps the DESTINATION's own seed — which is
+        // why that loop is `INSERT OR IGNORE` and not a plain INSERT. An
+        // earlier draft of this test asserted 0 here and failed against 22,
+        // which was the assertion being wrong rather than the code.
+        let n: i64 = dest
+            .query_row("SELECT COUNT(*) FROM main.node_slot", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            n > 0,
+            "an absent SEEDED_TABLES source must leave the destination's own seed intact, got {n}"
+        );
+
+        // The narrower table copied what both sides share and left the
+        // destination's own column at its default, rather than failing the
+        // whole copy on an arity mismatch. `copy_all_tables` returning Ok
+        // above is the assertion; this confirms the column survived.
+        let has_col: i64 = dest
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('cooccurrence_alarm') \
+                 WHERE name = 'first_observed_co'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 1, "the destination keeps its wider schema");
+
+        // The shared columns carried their values, in the right places, and
+        // the column the source never had took the destination's default —
+        // which is the claim the doc comment makes.
+        let (uid, stated, observed, first): (String, i64, i64, Option<i64>) = dest
+            .query_row(
+                "SELECT fact_uid, stated_co, observed_co, first_observed_co \
+                 FROM main.cooccurrence_alarm",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((uid.as_str(), stated, observed), ("uid-narrow", 297, 3));
+        assert_eq!(first, None, "a column the source lacked takes the default");
     }
 }

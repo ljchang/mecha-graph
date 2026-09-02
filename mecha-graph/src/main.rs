@@ -3308,14 +3308,40 @@ reject: it was never true (retracted; the class learns)"
                 );
             }
             if !r.integrity_alarms.is_empty() {
+                // "new or worse", never a running total. The old line said
+                // "N data-integrity alarm(s) — mentions lost" and printed
+                // the same N every night for eighteen days, which is how a
+                // permanent number came to look like a nightly finding.
                 println!(
-                    "\n⚑ {} data-integrity alarm(s) — mentions lost, NOT decay; \
-                     beliefs left untouched:",
+                    "\n⚑ {} NEW or worsened input-set collapse(s); beliefs left untouched:",
                     r.integrity_alarms.len()
                 );
                 for (stmt, detail) in r.integrity_alarms.iter().take(10) {
                     println!("  · {stmt}\n    {detail}");
                 }
+            }
+            // Still true, still unresolved, and not news. Reported as a
+            // number so it cannot be mistaken for either zero or a fresh
+            // finding — a dash is never zero, and neither is a backlog.
+            // Self-naming, because in the steady state this change is built
+            // to produce — 0 new, N continuing — the `⚑` header above never
+            // prints, and an indented parenthetical then dangles under the
+            // scan counts with nothing saying what the number counts.
+            if r.integrity_alarms_continuing > 0 {
+                let lead = if r.integrity_alarms.is_empty() {
+                    "\ninput-set collapses: "
+                } else {
+                    "  "
+                };
+                let age = match &r.integrity_alarms_oldest {
+                    Some(t) => format!(", oldest first seen {t}"),
+                    None => String::new(),
+                };
+                println!(
+                    "{lead}{} already reported and no worse since — unchanged, \
+                     not resolved (beliefs left untouched){age}",
+                    r.integrity_alarms_continuing
+                );
             }
         }
 
