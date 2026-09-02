@@ -236,7 +236,23 @@ pairs = [(n, i) for n, i in pairs if n]
 names = [n for n, _ in pairs]
 ids = dict(pairs)
 
-fresh = [n for n in names if not hist.get(n, (0, False))[1]]
+# **Look the id up first.** The ledger records `node_id` precisely because
+# `display` is derived — `best_label` prefers a multi-word human alias, so
+# promoting one is a rename in practice. An earlier draft recorded the id,
+# emitted it and parsed it, then still matched on the label only: a node
+# probed last night under its old label landed in `fresh`, and `fresh` is
+# taken first, so it was re-probed one night into a seven-day cooldown.
+# An attempt recorded under a key nobody looks up is an attempt that never
+# happened — which is the bug this whole branch exists to fix, reintroduced
+# one layer up.
+def seen_at(name):
+    """(last_probed_epoch, on_cooldown), by id where we have one."""
+    nid = ids.get(name) or ""
+    if nid and nid in hist:
+        return hist[nid]
+    return hist.get(name, (0, False))
+
+fresh = [n for n in names if not seen_at(n)[1]]
 if len(fresh) >= want:
     print("\n".join(f"{n}\t{ids.get(n,'')}" for n in fresh[:want]))
 else:
@@ -254,7 +270,7 @@ else:
     # cooldown was ever for, and oldest-first is rotation even when nothing
     # is strictly fresh.
     stale = [n for n in names if n not in fresh]
-    stale.sort(key=lambda n: hist.get(n, (0, False))[0])
+    stale.sort(key=lambda n: seen_at(n)[0])
     print("\n".join(f"{n}\t{ids.get(n,'')}" for n in (fresh + stale)[:want]))
 ' "$RECENT" "$ENTITIES" 2>>"$LOG")"
 # **A Selector that could not RUN is not an empty queue.** `set -o pipefail`

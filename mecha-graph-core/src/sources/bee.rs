@@ -612,8 +612,17 @@ pub const BEE_PUSH_STUCK_ATTEMPTS: u32 = 3;
 /// failure and keeps retrying, because treating an unknown error as
 /// "already done" would silently drop a verdict that never landed.
 fn is_missing_fact(e: &Error) -> bool {
-    let m = format!("{e}").to_lowercase();
-    m.contains("fact not found") || m.contains("not found.")
+    // **Only the fact.** An earlier draft added `|| m.contains("not found.")`
+    // and called itself narrow; it is not. That clause matches an error
+    // about any other subject — an expired token answering "User not found."
+    // for every call in one sweep would mark the WHOLE pending queue pushed:
+    // rejects counted as deletions, accepts printed once as abandoned, Bee
+    // still holding every fact and no future sync retrying.
+    //
+    // That is the unrecoverable direction. The bug this file fixes retried
+    // forever, which is annoying and self-healing; this one abandons
+    // silently. When in doubt, keep retrying.
+    format!("{e}").to_lowercase().contains("fact not found")
 }
 
 fn bee_json(args: &[&str]) -> Result<serde_json::Value> {
@@ -888,10 +897,10 @@ pub fn sync_bee_facts(conn: &Connection, pull_limit: usize) -> Result<BeeFactsRe
             // **A verdict whose end state already holds is done, not failed.**
             // Measured 2026-09-02, on the first sync that recorded a reason:
             // the one verdict that had retried every night since 2026-08-24
-            // was `delete 10710722`, and Bee answered "Fact not found" —
-            // the fact had already gone. The delete's whole purpose was to
-            // make it absent; it is absent. Retrying that forever is the
-            // idempotence bug underneath the bookkeeping bug.
+            // was a delete, and Bee answered "Fact not found" — the fact had
+            // already gone. The delete's whole purpose was to make it
+            // absent; it is absent. Retrying that forever is the idempotence
+            // bug underneath the bookkeeping bug.
             //
             // A `confirm` on a missing fact is terminal for the opposite
             // reason: there is nothing left to confirm and no future sync
@@ -1185,5 +1194,46 @@ mod push_failure_tests {
         assert_eq!(pending_bee_pushes(&conn).unwrap().len(), 1);
         mark_bee_pushed(&conn, cid).unwrap();
         assert!(pending_bee_pushes(&conn).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod missing_fact_tests {
+    use super::is_missing_fact;
+    use crate::error::Error;
+
+    /// **The predicate that can END a retry is the one that must not fail
+    /// open.** A false positive here marks a verdict pushed that never
+    /// landed, permanently — Bee keeps the fact, the candidate leaves the
+    /// queue, and no future sync looks again. A false negative only costs
+    /// another retry.
+    ///
+    /// The draft this replaces also matched a bare "not found.", so an
+    /// expired token answering "User not found." would have abandoned the
+    /// entire pending queue in one sweep.
+    #[test]
+    fn only_a_missing_fact_ends_a_retry() {
+        // The one error that means the end state already holds.
+        assert!(is_missing_fact(&Error::Other(
+            "bee facts delete 123 failed: Fact not found.".into()
+        )));
+        assert!(is_missing_fact(&Error::Other("FACT NOT FOUND".into())));
+
+        // Everything else keeps retrying — these are the ones that would
+        // silently empty the queue if the predicate were loose.
+        for other in [
+            "bee facts delete 123 failed: User not found.",
+            "bee facts confirm 123 failed: Endpoint not found.",
+            "bee facts delete 123 failed: 404 Not Found.",
+            "bee CLI not runnable: No such file or directory",
+            "bee facts delete 123 failed: 500 Internal Server Error",
+            "bee facts delete 123 failed: request timed out",
+            "",
+        ] {
+            assert!(
+                !is_missing_fact(&Error::Other(other.into())),
+                "must keep retrying: {other}"
+            );
+        }
     }
 }

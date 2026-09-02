@@ -3346,9 +3346,13 @@ reject: it was never true (retracted; the class learns)"
                 println!("{}", serde_json::to_string_pretty(&targets)?);
             } else {
                 for t in &targets {
+                    // `sources` in text too: it is the field `--min-sources`
+                    // filters on, and it was visible only under `--json` —
+                    // so an operator asking why a node was dropped had to
+                    // re-run in another format to see the reason.
                     println!(
-                        "{:6.1}  {} ({}) · {} touches · missing: [{}] · stale: [{}]",
-                        t.score, t.name, t.node_type, t.touches,
+                        "{:6.1}  {} ({}) · {} touches · {} source(s) · missing: [{}] · stale: [{}]",
+                        t.score, t.name, t.node_type, t.touches, t.sources,
                         t.missing_slots.join(", "),
                         t.stale_facts.iter().map(|(p, _)| p.as_str())
                             .collect::<Vec<_>>().join(", ")
