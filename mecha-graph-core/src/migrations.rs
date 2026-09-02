@@ -127,6 +127,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "candidate_embedding",
         sql: V023_CANDIDATE_EMBEDDING,
     },
+    Migration {
+        version: 24,
+        name: "cooccurrence_alarm",
+        sql: V024_COOCCURRENCE_ALARM,
+    },
 ];
 
 /// Semantic rejection memory (review-on-use §5): the embedded index of
@@ -1130,5 +1135,40 @@ CREATE TABLE IF NOT EXISTS embed_meta (
     dims        INTEGER NOT NULL,
     instruction TEXT NOT NULL,
     written_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"#;
+
+/// What the co-occurrence input-set alarm has already reported.
+///
+/// The alarm fires when a co-occurrence belief's *stated* episode count —
+/// frozen in its statement prose at mint time — exceeds a live recount by
+/// more than [`crate::decay::COLLAPSE_RATIO`], and it tells the operator to
+/// "check the mention pipeline". It had no memory, so it re-reported the
+/// identical set every night: 54 alarms a night from 2026-08-25 to
+/// 2026-09-01, and 44-48 a night before that, with no night's output
+/// distinguishable from the last.
+///
+/// They were not a pipeline fault. Every step change in the count lands on a
+/// day an operator re-partitioned entities — 0 → 48 on 2026-08-14
+/// (a person merge), 48 → 193 → 46 on 2026-08-15 (a phantom repair),
+/// 44 → 55 on 2026-08-25 (a relink and a person split). A merge moves
+/// episodes between nodes by design, so the stated number is right as of
+/// mint and the recount is right as of now, and neither says a mention was
+/// lost. `decay.rs`'s own comment records that the 2026-08-15 investigation
+/// found zero beliefs without support; the same shape survived it.
+///
+/// There is no merge audit table to consult, so this does not try to
+/// classify the cause. It records that the alarm was raised and at what
+/// count, which is enough to report NEW and WORSENED collapses loudly and
+/// keep the unchanged ones as a number — an alarm that repeats identically
+/// for eighteen days informs nobody, and trains a reader to skip the line
+/// where a real one would appear.
+const V024_COOCCURRENCE_ALARM: &str = r#"
+CREATE TABLE IF NOT EXISTS cooccurrence_alarm (
+    fact_uid      TEXT PRIMARY KEY,
+    stated_co     INTEGER NOT NULL,
+    observed_co   INTEGER NOT NULL,
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 "#;

@@ -117,6 +117,10 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// annotations, undo history and tombstones until the fork work caught it.)
 const COPY_TABLES: &[&str] = &[
     "embed_meta",
+    // What the co-occurrence alarm has already reported. Copied, because a
+    // fork that drops it re-raises every long-standing collapse as new —
+    // which is the exact noise the table exists to stop.
+    "cooccurrence_alarm",
     "node_alias",
     "node_identifier",
     "episode",
@@ -216,7 +220,30 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             "INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t};"
         ))?;
     }
+    // **A table the SOURCE does not have is an empty copy, not a failure.**
+    // `main`'s schema comes from `run_migrations`; `src` is attached as-is
+    // and is never migrated. So every table added by a migration is missing
+    // from any snapshot taken before it, and an unconditional INSERT fails
+    // the whole copy with "no such table: src.<name>" — which breaks
+    // `decrypt`, `encrypt_in_place` and `fork_db` for exactly the archived
+    // `graph.db.pre-*.bak` snapshots those commands exist to open.
+    //
+    // Latent since `embed_meta` (V016) and reachable for every migration
+    // after it; `cooccurrence_alarm` would have been the second instance.
+    // Fixed for the class rather than for this table, because the next one
+    // would land the same way.
+    let present: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM src.sqlite_master WHERE type = 'table'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
     for t in COPY_TABLES {
+        if !present.contains(*t) {
+            // Said, not swallowed: an empty copy is the right outcome and a
+            // silent one is how a reader concludes the data was there.
+            eprintln!("note: source has no `{t}` (older schema) — copied as empty");
+            continue;
+        }
         conn.execute_batch(&format!("INSERT INTO main.{t} SELECT * FROM src.{t};"))?;
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;

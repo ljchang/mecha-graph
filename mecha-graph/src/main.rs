@@ -3308,14 +3308,27 @@ reject: it was never true (retracted; the class learns)"
                 );
             }
             if !r.integrity_alarms.is_empty() {
+                // "new or worse", never a running total. The old line said
+                // "N data-integrity alarm(s) — mentions lost" and printed
+                // the same N every night for eighteen days, which is how a
+                // permanent number came to look like a nightly finding.
                 println!(
-                    "\n⚑ {} data-integrity alarm(s) — mentions lost, NOT decay; \
-                     beliefs left untouched:",
+                    "\n⚑ {} NEW or worsened input-set collapse(s); beliefs left untouched:",
                     r.integrity_alarms.len()
                 );
                 for (stmt, detail) in r.integrity_alarms.iter().take(10) {
                     println!("  · {stmt}\n    {detail}");
                 }
+            }
+            // Still true, still unresolved, and not news. Reported as a
+            // number so it cannot be mistaken for either zero or a fresh
+            // finding — a dash is never zero, and neither is a backlog.
+            if r.integrity_alarms_continuing > 0 {
+                println!(
+                    "  ({} collapse(s) already reported and no worse since — \
+                     unchanged, not resolved)",
+                    r.integrity_alarms_continuing
+                );
             }
         }
 
