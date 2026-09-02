@@ -39,7 +39,12 @@ docs/MAIL-CORPUS-RESEARCH.md
 # command line — so the next variant would land unguarded. Checked that this
 # does not match `eval/synthetic/gold.jsonl`, which is the fictional set and
 # is deliberately tracked.
-eval/gold*.jsonl
+# `eval/*gold*.jsonl`, not `eval/gold*`: the argument above is about a class
+# of producer output, and `build-semantic-gold.py` names its output on the
+# command line — `semantic-gold.jsonl` or `gold_v2.jsonl` would both have
+# slipped the narrower pattern. Still does not match eval/synthetic/, which
+# is a subdirectory and holds the fictional set.
+eval/*gold*.jsonl
 
 # The tooling that produces and reads those sets, which docs still name by
 # repo-relative path. Same reasoning: the files themselves are clean, but a

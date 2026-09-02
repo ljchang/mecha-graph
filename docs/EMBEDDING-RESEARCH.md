@@ -219,10 +219,10 @@ attempt 2 established this corpus cannot supply.
   episodes, so the queries are personal data even though the aggregate scores
   are not. This document keeps the method and the numbers; the examples above
   are generalised for the same reason mecha's `docs/MAIL-CORPUS-RESEARCH.md` is
-  gitignored *in that repository* (`mecha/.gitignore`) — one corpus's contents
-  belong to its owner. Named with its repo because a bare filename is not
-  checkable from here: a reader who greps this repo's `.gitignore` for it
-  finds nothing and reasonably concludes the claim is false.
+  gitignored, as it is here — one corpus's contents belong to its owner.
+  Named with its repo because the basename alone is not an address: the same
+  filename can exist in both, and a claim about one is unverifiable from the
+  other.
 
 ## If this is redone
 

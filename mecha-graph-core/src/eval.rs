@@ -185,9 +185,9 @@ mod gold_path_tests {
             p,
             PathBuf::from("/home/someone/.mecha-graph/eval/gold.jsonl")
         );
-        // The relocation this asserts is what let the private repo stop
-        // being a code repo; a repo-relative default re-couples them.
-        assert!(!p.starts_with("eval/"));
+        // No second assert on the same value: `assert_eq!` above pins `p`
+        // exactly, so `!p.starts_with("eval/")` had no input that could fail
+        // it. A test that cannot fail is not a check.
 
         assert_eq!(
             gold_path_from(Some("/tmp/other-gold.jsonl"), Some("/home/someone")),

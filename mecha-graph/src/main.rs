@@ -664,6 +664,24 @@ enum Command {
         /// (2026-08-28 → 2026-09-01), a third of the nightly budget spent
         /// on a probe that could not run.
         ///
+        /// **"Source" is connector-level, and that is weaker than it
+        /// sounds.** `episode.source` holds `email.thread`,
+        /// `bee.conversation`, `slack.thread`, `note`, `calendar.event` —
+        /// about a dozen values. So a node whose evidence is forty email
+        /// threads from forty different correspondents counts as ONE
+        /// source and is dropped from the nightly, permanently, with the
+        /// empty-targets branch reporting that no node has two witnessing
+        /// sources.
+        ///
+        /// That is gossip's own definition, not this flag's:
+        /// `kg_entity`'s coverage is `GROUP BY e.source`
+        /// (`episode.rs`), and `choose_vantages` picks two rows from it.
+        /// So the filter still never drops a node gossip would have
+        /// accepted, which is what makes it a safe necessary condition —
+        /// but a reader should not take "two witnesses" to mean two
+        /// people. Widening it (per-correspondent vantages for
+        /// `email.thread`) is gossip's change to make, not this filter's.
+        ///
         /// **Necessary, not sufficient**, and off by default: gossip also
         /// wants `min_coverage` episodes per source inside its own window,
         /// which is measured at probe time and is not knowable from SQL.
@@ -2847,7 +2865,15 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             // on Bee's side — where every pending verdict fails in one
             // sweep and an uncapped loop turns one outage into a page of
             // stderr.
-            for f in r.push_failures.iter().take(10) {
+            // **Stuck first, so the cap cannot hide what the header names.**
+            // The summary line says `N STUCK (see below)`; with more than ten
+            // failures the stuck one could sit at position eleven and be
+            // truncated away, leaving a header pointing at nothing — and the
+            // stuck entries are the whole reason this list exists, since a
+            // fresh failure is expected to resolve itself.
+            let mut ordered: Vec<&_> = r.push_failures.iter().collect();
+            ordered.sort_by_key(|f| std::cmp::Reverse(f.attempts));
+            for f in ordered.iter().take(10) {
                 let verb = if f.accepted { "confirm" } else { "delete" };
                 let stuck_marker = if f.attempts >= BEE_PUSH_STUCK_ATTEMPTS {
                     " ⚑ STUCK"
@@ -2864,14 +2890,20 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             // pressingly, because the scenario that comment names (a fact set
             // deleted in bulk on Bee's side) fills THIS list, not that one:
             // every pending verdict comes back "Fact not found" at once.
+            // Each tail directly under its own list — they had been ordered
+            // opposite to the lists they continue, so "… and N more" sat
+            // under the abandoned block while counting failures.
+            if r.push_failures.len() > 10 {
+                eprintln!(
+                    "  … and {} more failure(s), lowest attempt counts first",
+                    r.push_failures.len() - 10
+                );
+            }
             for t in r.push_terminal.iter().take(10) {
                 eprintln!("  bee push abandoned: {t}");
             }
             if r.push_terminal.len() > 10 {
                 eprintln!("  … and {} more abandoned", r.push_terminal.len() - 10);
-            }
-            if r.push_failures.len() > 10 {
-                eprintln!("  … and {} more", r.push_failures.len() - 10);
             }
         }
 

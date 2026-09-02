@@ -211,7 +211,7 @@ pub fn probe_targets_opts(
         // caller that a filter in the ranker would silently starve. The
         // production filter is `--min-sources`, applied by the one consumer
         // that has the precondition.
-        // `prepare_cached`, like the three slot/fact queries below it.
+        // `prepare_cached`, like the other slot and fact queries in this loop.
         // An earlier comment here claimed this had been "the only statement
         // re-prepared per node"; it was not — the `nodes` lookup at the top
         // of this loop uses `conn.query_row` and re-prepares too. Left as
