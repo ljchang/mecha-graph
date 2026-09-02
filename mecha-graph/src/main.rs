@@ -3333,9 +3333,13 @@ reject: it was never true (retracted; the class learns)"
                 } else {
                     "  "
                 };
+                let age = match &r.integrity_alarms_oldest {
+                    Some(t) => format!(", oldest first seen {t}"),
+                    None => String::new(),
+                };
                 println!(
                     "{lead}{} already reported and no worse since — unchanged, \
-                     not resolved (beliefs left untouched)",
+                     not resolved (beliefs left untouched){age}",
                     r.integrity_alarms_continuing
                 );
             }

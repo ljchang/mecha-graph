@@ -86,6 +86,14 @@ pub struct DecayReport {
     /// seen. A number, not a list: they are still true and still unresolved,
     /// and dropping them entirely would be the opposite error.
     pub integrity_alarms_continuing: usize,
+    /// When the OLDEST still-standing collapse was first seen, RFC-3339-ish
+    /// (`datetime('now')` shape). `None` when nothing is continuing.
+    ///
+    /// Age is the one thing that separates standing residue from something
+    /// that arrived this week, and `first_seen_at` was written and never
+    /// read — a backlog with no age reads the same on night two and night
+    /// two hundred.
+    pub integrity_alarms_oldest: Option<String>,
     /// Unparseable statements — left alone rather than guessed at.
     pub unparsed: usize,
 }
@@ -284,8 +292,22 @@ fn sweep_npmi_inner(
                 // today 20 — an 80-episode loss reported as nothing,
                 // because 20 < 3 is false. A moved baseline means the
                 // remembered observation is not comparable, so it is news.
-                Some((before_stated, before_observed, _)) => {
-                    now_co < before_observed || stated_co != before_stated
+                // **Against the FIRST observation, not the last.**
+                // `observed_co` is overwritten on every non-dry sweep
+                // including quiet ones, so comparing to it makes the bar
+                // for "worse" track last night rather than the low-water
+                // mark: a pair wobbling 20 / 25 / 20 / 25 across nightly
+                // `link` rebuilds re-alarmed on nights 3, 5, 7 … printing
+                // "(was 20 when first reported)" beside a current 20 — a
+                // fresh finding whose own two numbers say nothing changed.
+                //
+                // It also made the decision and the sentence disagree: the
+                // decision used the previous observation, the message named
+                // the first, so a partial recovery could be reported as
+                // "worsened" while showing an improvement. Both now use
+                // `first_observed_co`.
+                Some((before_stated, _, first_observed)) => {
+                    now_co < first_observed || stated_co != before_stated
                 }
             };
             // **Gated on `dry_run` like every other write in this sweep.**
@@ -419,6 +441,19 @@ fn sweep_npmi_inner(
         )?;
         rep.closed += 1;
     }
+    // The age of the standing backlog, from the `first_seen_at` the table
+    // has always written and nothing has ever read.
+    if rep.integrity_alarms_continuing > 0 {
+        rep.integrity_alarms_oldest = conn
+            .query_row(
+                "SELECT MIN(first_seen_at) FROM cooccurrence_alarm",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+
     Ok(rep)
 }
 

@@ -2,7 +2,7 @@
 //! (vec0 virtual tables are created by migrations), then applies pragmas and
 //! runs migrations.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::migrations;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -94,7 +94,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     migrations::run_migrations(&conn).map_err(|e| {
-        crate::error::Error::Other(format!(
+        Error::Other(format!(
             "cannot read {} ({e}) — if the DB is encrypted, the key is wrong or missing \
              (MECHA_GRAPH_DB_KEY / {})",
             path.display(),
@@ -244,7 +244,7 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             // Same refusal as the copy loop below: a newer source is a
             // downgrade, and a downgrade that drops data quietly is worse
             // than one that stops.
-            return Err(crate::error::Error::Other(format!(
+            return Err(Error::Other(format!(
                 "source `{t}` has column(s) this build does not know ({}) — refusing \
                  to copy. This database was written by a NEWER build.",
                 src_only.join(", ")
@@ -293,7 +293,7 @@ fn copy_all_tables(conn: &Connection) -> Result<()> {
             // counts and would pass it. A check that cannot faithfully run
             // stops the run; the earlier draft diagnosed this precisely and
             // then chose a log line anyway.
-            return Err(crate::error::Error::Other(format!(
+            return Err(Error::Other(format!(
                 "source `{t}` has column(s) this build does not know ({}) — refusing \
                  to copy, because doing so would silently drop their data. This \
                  database was written by a NEWER build; use that build, or upgrade \
@@ -367,7 +367,6 @@ fn quick_counts(conn: &Connection, schema: &str) -> Result<(i64, i64, i64, i64)>
 /// The plaintext original is moved to `<db>.plain.bak` — caller decides its
 /// fate. Fails if a key already resolves (already encrypted).
 pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
-    use crate::error::Error;
     register_vec_extension();
 
     if resolve_key(db_path).is_some() {
@@ -376,7 +375,7 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
         ));
     }
     if !db_path.exists() {
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "{} does not exist",
             db_path.display()
         )));
@@ -423,7 +422,7 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
         let dst_counts = quick_counts(&conn, "main")?;
         if src_counts != dst_counts {
             let _ = conn.execute_batch("ROLLBACK;");
-            return Err(crate::error::Error::Other(format!(
+            return Err(Error::Other(format!(
                 "verification failed: src {src_counts:?} != encrypted {dst_counts:?}"
             )));
         }
@@ -444,7 +443,6 @@ pub fn encrypt_in_place(db_path: &Path) -> Result<PathBuf> {
 /// path (§8.4) for an encrypted store. The snapshot is chmod 600; treat it
 /// as ephemeral.
 pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
-    use crate::error::Error;
     register_vec_extension();
 
     let key = resolve_key(db_path)
@@ -468,7 +466,7 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
     let dst_counts = quick_counts(&conn, "main")?;
     if src_counts != dst_counts {
         let _ = conn.execute_batch("ROLLBACK;");
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "verification failed: src {src_counts:?} != snapshot {dst_counts:?}"
         )));
     }
@@ -492,17 +490,16 @@ pub fn export_plaintext(db_path: &Path, out: &Path) -> Result<()> {
 /// directory would clobber the live key. Refused, along with any destination
 /// whose `db.key` already exists.
 pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
-    use crate::error::Error;
     register_vec_extension();
 
     if !db_path.exists() {
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "{} does not exist",
             db_path.display()
         )));
     }
     if out.exists() {
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "{} already exists — deleting a fork is a deliberate act, do it yourself",
             out.display()
         )));
@@ -526,7 +523,7 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
     // at the LIVE key and must never name where a fork's fresh key lands.
     let dest_key = out.with_file_name("db.key");
     if dest_key.exists() {
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "{} already exists — refusing to overwrite a key",
             dest_key.display()
         )));
@@ -572,7 +569,7 @@ pub fn fork_db(db_path: &Path, out: &Path) -> Result<PathBuf> {
     if src_counts != dst_counts {
         let _ = conn.execute_batch("ROLLBACK;");
         let _ = std::fs::remove_file(&dest_key);
-        return Err(crate::error::Error::Other(format!(
+        return Err(Error::Other(format!(
             "verification failed: src {src_counts:?} != fork {dst_counts:?}"
         )));
     }
@@ -868,6 +865,16 @@ mod older_source_tests {
         // taken after V024 created the table and before V025 widened it.
         src.execute_batch("ALTER TABLE cooccurrence_alarm DROP COLUMN first_observed_co;")
             .expect("the narrower-table case must actually be constructed");
+        // **A row, or the narrower case proves only that nothing failed.**
+        // An empty source table moves zero rows, so a `shared_columns` that
+        // returned one column — or the right columns in the wrong order —
+        // would stay green on `Ok` alone.
+        src.execute(
+            "INSERT INTO cooccurrence_alarm (fact_uid, stated_co, observed_co)
+             VALUES ('uid-narrow', 297, 3)",
+            [],
+        )
+        .unwrap();
 
         // Assert every part of the fixture is real, or the halves pass
         // vacuously. An earlier draft used `.ok()` on the ALTER and was
@@ -940,5 +947,19 @@ mod older_source_tests {
             )
             .unwrap();
         assert_eq!(has_col, 1, "the destination keeps its wider schema");
+
+        // The shared columns carried their values, in the right places, and
+        // the column the source never had took the destination's default —
+        // which is the claim the doc comment makes.
+        let (uid, stated, observed, first): (String, i64, i64, Option<i64>) = dest
+            .query_row(
+                "SELECT fact_uid, stated_co, observed_co, first_observed_co \
+                 FROM main.cooccurrence_alarm",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((uid.as_str(), stated, observed), ("uid-narrow", 297, 3));
+        assert_eq!(first, None, "a column the source lacked takes the default");
     }
 }
