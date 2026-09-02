@@ -2860,8 +2860,15 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     f.bee_fact_id, f.candidate_id, f.attempts, f.first_failed_at, f.error
                 );
             }
-            for t in &r.push_terminal {
+            // Capped for the same reason as `push_failures` below — and more
+            // pressingly, because the scenario that comment names (a fact set
+            // deleted in bulk on Bee's side) fills THIS list, not that one:
+            // every pending verdict comes back "Fact not found" at once.
+            for t in r.push_terminal.iter().take(10) {
                 eprintln!("  bee push abandoned: {t}");
+            }
+            if r.push_terminal.len() > 10 {
+                eprintln!("  … and {} more abandoned", r.push_terminal.len() - 10);
             }
             if r.push_failures.len() > 10 {
                 eprintln!("  … and {} more", r.push_failures.len() - 10);

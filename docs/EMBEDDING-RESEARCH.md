@@ -218,8 +218,11 @@ attempt 2 established this corpus cannot supply.
   which now live at `~/.mecha-graph/eval/`. Generated from one person's
   episodes, so the queries are personal data even though the aggregate scores
   are not. This document keeps the method and the numbers; the examples above
-  are generalised for the same reason `MAIL-CORPUS-RESEARCH.md` is gitignored —
-  one corpus's contents belong to its owner.
+  are generalised for the same reason mecha's `docs/MAIL-CORPUS-RESEARCH.md` is
+  gitignored *in that repository* (`mecha/.gitignore`) — one corpus's contents
+  belong to its owner. Named with its repo because a bare filename is not
+  checkable from here: a reader who greps this repo's `.gitignore` for it
+  finds nothing and reasonably concludes the claim is false.
 
 ## If this is redone
 
