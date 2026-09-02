@@ -33,7 +33,8 @@ Harrier GGUF.
 
 ## Attempt 1: the existing gold set. Measured nothing.
 
-`eval/gold.jsonl` — 37 human-curated queries — was the obvious instrument. Every
+`~/.mecha-graph/eval/gold.jsonl` — 37 human-curated queries — was the obvious
+instrument. Every
 model scored identically:
 
 | model | insight | memory | tasks |
@@ -213,7 +214,7 @@ attempt 2 established this corpus cannot supply.
   anything quoting an episode lives there instead of diverging into two copies.
 - `eval/gold-semantic.jsonl` — the 80 queries, and `scripts/build-semantic-gold.py`
   / `score-semantic.py` / `diagnose-failures.py` that produce and read them.
-  **Private repo only**, like `eval/gold.jsonl`: generated from one person's
+  **Outside the repository**, like the gold set beside it: generated from one person's
   episodes, so the queries are personal data even though the aggregate scores
   are not. This document keeps the method and the numbers; the examples above
   are generalised for the same reason `MAIL-CORPUS-RESEARCH.md` is gitignored —

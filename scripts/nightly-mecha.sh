@@ -218,8 +218,24 @@ else:
     stale.sort(key=lambda n: hist.get(n, (0, False))[0])
     print("\n".join((fresh + stale)[:want]))
 ' "$RECENT" "$ENTITIES" 2>>"$LOG")"
+# **A Selector that could not RUN is not an empty queue.** `set -o pipefail`
+# is on, so this is the pipeline's status: a locked database, an unreadable
+# keyfile or a mid-flight migration all make `probe-targets` exit non-zero,
+# the filter reads nothing, and `TARGETS` comes back empty — identical to a
+# night where every target was genuinely on cooldown. Reported as the
+# cooldown, gossip stops silently and the log names the one cause an
+# operator will not look behind, because it is the cause that really does
+# produce that line.
+#
+# Unknown is never clean, and this file has already paid a debugging round
+# for the same conflation one comment up (the heredoc that ate stdin). That
+# instance is fixed; the class was not.
+TARGETS_STATUS=$?
 
-if [ -z "$TARGETS" ]; then
+if [ "$TARGETS_STATUS" -ne 0 ]; then
+    log "probe-targets FAILED (exit $TARGETS_STATUS) — NOT a cooldown; skipping gossip. \
+Check the graph store is readable and not mid-migration; see the stderr above in this log."
+elif [ -z "$TARGETS" ]; then
     log "no fresh probe targets (all ${COOLDOWN}d-recent or none ranked) — skipping gossip"
 else
     while IFS= read -r entity; do

@@ -196,7 +196,9 @@ they have nothing to say:
   linker cascade → GPU-gated embed + LLM extract → precheck → scope
   summaries → `MEMORY.md` boot context → health alerts. Everything is
   cursored and idempotent; a missed night just catches up.
-- **Eval**: `eval/gold.jsonl` is a regression guard run after any
+- **Eval**: `~/.mecha-graph/eval/gold.jsonl` (outside the repo — it is mined
+  from real episodes; `--gold` or `MECHA_GRAPH_GOLD` override) is a regression
+  guard run after any
   router/linker change. Recall@10 = 1.00 is the floor, not a score.
 
 ## Boundaries — what lives here, what lives in the agent

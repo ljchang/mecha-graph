@@ -1,5 +1,7 @@
 //! Eval harness (§11): build the ruler before the thing it measures.
-//! Gold queries live in `eval/gold.jsonl`; `run` reports recall@10 and MRR
+//! Gold queries live at `~/.mecha-graph/eval/gold.jsonl` — outside the
+//! repository, because they are mined from real episodes. See
+//! [`default_gold_path`]. `run` reports recall@10 and MRR
 //! per job so a change that helps one job and hurts another is visible.
 
 /// Default gold-set path: `~/.mecha-graph/eval/gold.jsonl`, overridable via
