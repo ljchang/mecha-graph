@@ -567,6 +567,10 @@ pub struct BeeFactsReport {
     /// with no record anywhere of what was wrong. "Will retry" is a label,
     /// not a mechanism: the retry needs somewhere to accumulate.
     pub push_failures: Vec<BeePushFailure>,
+    /// Verdicts that left the queue without succeeding, because no future
+    /// attempt could change the outcome. Reported so they are visible once
+    /// rather than counted as errors forever.
+    pub push_terminal: Vec<String>,
 }
 
 /// A verdict that could not be pushed back to Bee, and its history.
@@ -584,12 +588,33 @@ pub struct BeePushFailure {
     pub error: String,
 }
 
-/// Attempts after which a push is reported as stuck rather than retrying.
+/// Attempts after which a push is REPORTED as stuck. It keeps retrying.
 ///
-/// A permanent failure and a transient one are indistinguishable on the
-/// first night and obvious by the eighth; this is where the report stops
-/// saying "will retry" and starts naming it as something to look at.
+/// A reporting threshold, not a ceiling — the earlier wording said
+/// "reported as stuck rather than retrying", which promised a stop that
+/// does not exist and would be the wrong behaviour anyway: a genuinely
+/// transient outage (Bee down for a week) must resume on its own, and a
+/// push that stops trying after three nights would need a human to notice
+/// and restart it.
+///
+/// What ends a hopeless retry is [`is_missing_fact`], which recognises the
+/// one error no future attempt can fix and takes the verdict out of the
+/// queue. This constant only decides when the summary stops saying "will
+/// retry" — because a permanent failure and a transient one are
+/// indistinguishable on the first night and obvious by the eighth.
 pub const BEE_PUSH_STUCK_ATTEMPTS: u32 = 3;
+
+/// Whether an error means the fact is not there.
+///
+/// Matched on the CLI's message because that is the only channel it has —
+/// `bee` exits non-zero with "Fact not found." on stderr and no code we can
+/// key on. Deliberately narrow: anything not recognisably this stays a real
+/// failure and keeps retrying, because treating an unknown error as
+/// "already done" would silently drop a verdict that never landed.
+fn is_missing_fact(e: &Error) -> bool {
+    let m = format!("{e}").to_lowercase();
+    m.contains("fact not found") || m.contains("not found.")
+}
 
 fn bee_json(args: &[&str]) -> Result<serde_json::Value> {
     let output = std::process::Command::new("bee")
@@ -860,6 +885,33 @@ pub fn sync_bee_facts(conn: &Connection, pull_limit: usize) -> Result<BeeFactsRe
             // nowhere — not in the log, not on the candidate, not in the
             // report. Eight nights of "1 push errors (will retry)" and no
             // way to learn what was wrong without changing the code first.
+            // **A verdict whose end state already holds is done, not failed.**
+            // Measured 2026-09-02, on the first sync that recorded a reason:
+            // the one verdict that had retried every night since 2026-08-24
+            // was `delete 10710722`, and Bee answered "Fact not found" —
+            // the fact had already gone. The delete's whole purpose was to
+            // make it absent; it is absent. Retrying that forever is the
+            // idempotence bug underneath the bookkeeping bug.
+            //
+            // A `confirm` on a missing fact is terminal for the opposite
+            // reason: there is nothing left to confirm and no future sync
+            // can change that. Both leave the queue; they differ in what
+            // gets counted, because "we achieved it" and "we can never
+            // achieve it" are not the same finding.
+            Err(e) if is_missing_fact(&e) => {
+                mark_bee_pushed(conn, pending.candidate_id)?;
+                if pending.accepted {
+                    report.push_terminal.push(format!(
+                        "confirm fact {} (candidate {}): gone from Bee before the verdict \
+                         reached it — nothing left to confirm, so it leaves the queue \
+                         rather than retrying forever",
+                        pending.bee_fact_id, pending.candidate_id
+                    ));
+                } else {
+                    // The end state the verdict asked for.
+                    report.deleted += 1;
+                }
+            }
             Err(e) => {
                 let message = format!("{e}");
                 let attempts = pending.attempts.saturating_add(1);

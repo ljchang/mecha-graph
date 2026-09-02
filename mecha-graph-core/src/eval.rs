@@ -14,11 +14,24 @@
 /// [`crate::db::default_db_path`]: the data lives in `~/.mecha-graph/`, the
 /// code lives here, and nothing has to be stripped on the way out.
 pub fn default_gold_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("MECHA_GRAPH_GOLD") {
+    gold_path_from(
+        std::env::var("MECHA_GRAPH_GOLD").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The resolution rule, as a pure function of its two inputs.
+///
+/// Split out so it can be tested without touching process state. The first
+/// draft of that test called `set_var("HOME", ..)` and broke an unrelated
+/// test in `similar` — Rust runs a crate's tests as threads of one process,
+/// so an env write is not test-local however carefully the test is written.
+/// A pure function needs no such care.
+pub fn gold_path_from(env_override: Option<&str>, home: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = env_override {
         return std::path::PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home)
+    std::path::PathBuf::from(home.unwrap_or("."))
         .join(".mecha-graph")
         .join("eval")
         .join("gold.jsonl")
@@ -156,4 +169,37 @@ pub fn run(
         .collect();
 
     Ok(EvalReport { per_job, results })
+}
+
+#[cfg(test)]
+mod gold_path_tests {
+    use super::gold_path_from;
+    use std::path::PathBuf;
+
+    /// No env mutation: the rule is a pure function, so the test cannot
+    /// disturb a test running beside it.
+    #[test]
+    fn the_gold_path_defaults_outside_the_repo_and_yields_to_the_env() {
+        let p = gold_path_from(None, Some("/home/someone"));
+        assert_eq!(
+            p,
+            PathBuf::from("/home/someone/.mecha-graph/eval/gold.jsonl")
+        );
+        // The relocation this asserts is what let the private repo stop
+        // being a code repo; a repo-relative default re-couples them.
+        assert!(!p.starts_with("eval/"));
+
+        assert_eq!(
+            gold_path_from(Some("/tmp/other-gold.jsonl"), Some("/home/someone")),
+            PathBuf::from("/tmp/other-gold.jsonl"),
+            "the env override must win, so a checkout can point at a fixture"
+        );
+
+        // No HOME is not a panic: it degrades to a relative path, the same
+        // fallback `db::default_db_path` uses.
+        assert_eq!(
+            gold_path_from(None, None),
+            PathBuf::from("./.mecha-graph/eval/gold.jsonl")
+        );
+    }
 }

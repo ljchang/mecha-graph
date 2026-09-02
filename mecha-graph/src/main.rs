@@ -2854,6 +2854,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     f.bee_fact_id, f.candidate_id, f.attempts, f.first_failed_at, f.error
                 );
             }
+            for t in &r.push_terminal {
+                eprintln!("  bee push abandoned: {t}");
+            }
             if r.push_failures.len() > 10 {
                 eprintln!("  … and {} more", r.push_failures.len() - 10);
             }

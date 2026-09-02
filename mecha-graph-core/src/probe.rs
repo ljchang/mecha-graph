@@ -332,6 +332,65 @@ mod tests {
         assert!(hot.missing_slots.contains(&"role".into()));
     }
 
+    /// `sources` is what `--min-sources` filters on, and it counts DISTINCT
+    /// episode sources — not mentions. A node with twenty mentions from one
+    /// source cannot be gossiped ("one witness cannot gossip"), and the
+    /// count has to say so.
+    #[test]
+    fn sources_counts_distinct_sources_not_mentions() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("person-one", "person", "One Source")).unwrap();
+        upsert_node(&conn, &Node::new("person-two", "person", "Two Sources")).unwrap();
+        let mut mk = |node: &str, src: &str, i: usize| {
+            let e = crate::episode::upsert_episode(
+                &conn,
+                &crate::episode::Episode {
+                    id: 0,
+                    uid: String::new(),
+                    source: src.into(),
+                    source_id: format!("{node}-{src}-{i}"),
+                    source_ref: None,
+                    body: "evidence".into(),
+                    occurred_at: "2026-01-01 10:00:00".into(),
+                    occurred_end: None,
+                    ingested_at: String::new(),
+                    lat: None,
+                    lon: None,
+                    location: None,
+                    sensitivity: "personal".into(),
+                    scope_id: None,
+                    meta: None,
+                    raw: None,
+                },
+            )
+            .unwrap()
+            .0;
+            crate::episode::add_mention(&conn, e, node, "manual", 1.0).unwrap();
+        };
+        // Three mentions, all one source: still one witness.
+        for i in 0..3 {
+            mk("person-one", "note", i);
+        }
+        // Two mentions from two sources.
+        mk("person-two", "note", 0);
+        mk("person-two", "slack.thread", 0);
+        touch(&conn, "person-one", 10);
+        touch(&conn, "person-two", 10);
+
+        let t = probe_targets(&conn, 10).unwrap();
+        let one = t.iter().find(|t| t.node_id == "person-one");
+        let two = t.iter().find(|t| t.node_id == "person-two");
+        assert_eq!(
+            one.map(|t| t.sources),
+            Some(1),
+            "three mentions, one source"
+        );
+        assert_eq!(two.map(|t| t.sources), Some(2));
+        // And the ranker still REPORTS rather than enforces: the
+        // single-source node is present, for the caller to drop.
+        assert!(one.is_some(), "probe.rs ranks; --min-sources disposes");
+    }
+
     #[test]
     fn test_cold_sampling_is_opt_in_and_finds_undemanded_nodes() {
         let conn = open_memory().unwrap();

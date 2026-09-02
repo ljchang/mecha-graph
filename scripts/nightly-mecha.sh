@@ -120,20 +120,42 @@ run_precheck
 # One line per probe attempt. `entity` matches the gossip output's own key so
 # the cooldown reader treats both files identically.
 record_attempt() {
-    python3 - "$PROBE_LEDGER" "$1" <<'LEDGER' 2>>"$LOG"
+    python3 - "$PROBE_LEDGER" "$1" "${2:-}" <<'LEDGER' 2>>"$LOG"
 import json, sys, datetime
 path, entity = sys.argv[1], sys.argv[2]
+node_id = sys.argv[3] if len(sys.argv) > 3 else ""
+# **`node_id` beside the name, and it is the durable half.** `display` is
+# derived — `best_label` prefers a human alias over an email-shaped name, so
+# promoting an alias or renaming a node changes it, and a cooldown keyed on
+# the label alone silently forgets that node was probed yesterday. Names are
+# still written and still matched, because every row from before this change
+# has only a name.
 row = {"entity": entity,
+       "node_id": node_id,
        "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
 with open(path, "a") as fh:
     fh.write(json.dumps(row) + "\n")
 LEDGER
 }
 
+# **Failing open is right for ABSENT history and wrong for an unreadable
+# one.** No ledger yet means nothing to exclude, which is correct on a fresh
+# install. An unreadable log dir means the cooldown silently excludes nobody
+# and every entity looks fresh — the repeat this branch exists to stop, in
+# the one state where nothing would notice. Status is read below.
 RECENT="$(python3 - "$LOG_DIR" "$COOLDOWN" <<'PY' 2>>"$LOG"
 import glob, json, os, sys, time, datetime
 log_dir, days = sys.argv[1], int(sys.argv[2])
 cutoff = time.time() - days * 86400
+# **glob() cannot tell you it failed.** On a missing or unreadable directory
+# it returns [] exactly as it does for an empty one, so "no history" and
+# "cannot read the history" arrive identically — and the second silently
+# excludes nobody, making every entity look fresh. Ask the directory
+# directly, and exit non-zero so the caller can refuse rather than probe
+# everything.
+if not os.path.isdir(log_dir) or not os.access(log_dir, os.R_OK | os.X_OK):
+    print(f"cooldown: {log_dir} is not a readable directory", file=sys.stderr)
+    sys.exit(1)
 # entity -> most recent probe, as an epoch. A MAP, not a set: when every
 # ranked target is on cooldown the night must still probe something, and
 # "least recently probed" is the only sensible order to fall back to.
@@ -156,6 +178,10 @@ for path in paths:
         ent = row.get("entity")
         if not ent:
             continue
+        # Key on the id where a row has one, else the name. Both are emitted
+        # so a rename does not orphan the history, and rows written before
+        # ids were recorded still match by name.
+        key = row.get("node_id") or ent
         # The row's own stamp where it has one, else the file's mtime. The
         # ledger writes `at` per row; the older gossip output does not.
         when = mtime
@@ -165,11 +191,20 @@ for path in paths:
                 when = datetime.datetime.fromisoformat(at).timestamp()
             except Exception:
                 pass
-        seen[ent] = max(seen.get(ent, 0.0), when)
+        seen[key] = max(seen.get(key, 0.0), when)
+        if key != ent:
+            seen[ent] = max(seen.get(ent, 0.0), when)
 for ent, when in sorted(seen.items()):
     print("%s\t%d\t%d" % (ent, when, 1 if when >= cutoff else 0))
 PY
 )"
+RECENT_STATUS=$?
+if [ "$RECENT_STATUS" -ne 0 ]; then
+    log "cooldown reader FAILED (exit $RECENT_STATUS) — refusing to gossip rather than \
+probing everything as if nothing were recent; see the stderr above in this log."
+    log "=== mecha nightly done (cooldown unreadable) ==="
+    exit 1
+fi
 [ -n "$RECENT" ] && log "cooldown (${COOLDOWN}d) excludes: $(echo "$RECENT" | awk -F'\t' '$3==1{printf "%s ", $1}')"
 
 # Ask for more than needed, then filter — the excluded ones are usually the
@@ -194,12 +229,16 @@ try:
     rows = json.load(sys.stdin)
 except Exception:
     rows = []
-names = [r.get("display") or r.get("name") for r in rows]
-names = [n for n in names if n]
+# name and id together: the id is what the ledger keys on, the name is
+# what `gossip --entity` takes.
+pairs = [((r.get("display") or r.get("name")), r.get("node_id") or "") for r in rows]
+pairs = [(n, i) for n, i in pairs if n]
+names = [n for n, _ in pairs]
+ids = dict(pairs)
 
 fresh = [n for n in names if not hist.get(n, (0, False))[1]]
 if len(fresh) >= want:
-    print("\n".join(fresh[:want]))
+    print("\n".join(f"{n}\t{ids.get(n,'')}" for n in fresh[:want]))
 else:
     # **The pool can be smaller than the cooldown holds.** GOSSIP_ENTITIES=3
     # a night over GOSSIP_COOLDOWN_DAYS=7 ages 21 distinct entities, and the
@@ -216,7 +255,7 @@ else:
     # is strictly fresh.
     stale = [n for n in names if n not in fresh]
     stale.sort(key=lambda n: hist.get(n, (0, False))[0])
-    print("\n".join((fresh + stale)[:want]))
+    print("\n".join(f"{n}\t{ids.get(n,'')}" for n in (fresh + stale)[:want]))
 ' "$RECENT" "$ENTITIES" 2>>"$LOG")"
 # **A Selector that could not RUN is not an empty queue.** `set -o pipefail`
 # is on, so this is the pipeline's status: a locked database, an unreadable
@@ -238,16 +277,24 @@ Check the graph store is readable and not mid-migration; see the stderr above in
 elif [ -z "$TARGETS" ]; then
     log "no fresh probe targets (all ${COOLDOWN}d-recent or none ranked) — skipping gossip"
 else
-    while IFS= read -r entity; do
-        [ -n "$entity" ] || continue
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        entity="${line%%$'\t'*}"
+        node_id="${line#*$'\t'}"
+        [ "$node_id" = "$line" ] && node_id=""
         log "probing: $entity"
         # Written BEFORE the probe, not after: a run killed by the 30m
         # timeout, or by the box going down mid-probe, has still consumed the
         # slot and must still age. Recording on success only is the bug this
         # ledger exists to fix, one level down.
-        record_attempt "$entity"
+        record_attempt "$entity" "$node_id"
+        # `< /dev/null`: the loop is fed by a here-string, so without it
+        # gossip inherits the REMAINING entity lines as its own stdin and can
+        # eat them — the loop then probes one target and reports the rest as
+        # never selected. Same class as the `python3 -c` note above, which
+        # cost a debugging round when a heredoc claimed stdin.
         if timeout 30m "$MECHA" gossip --entity "$entity" --yes \
-            --workspace "$WORKSPACE" --out "$GOSSIP_OUT" >>"$LOG" 2>&1; then
+            --workspace "$WORKSPACE" --out "$GOSSIP_OUT" >>"$LOG" 2>&1 </dev/null; then
             log "probed: $entity"
         else
             log "gossip FAILED (exit $?): $entity — continuing"
@@ -259,7 +306,18 @@ fi
 [ -f "$GOSSIP_OUT" ] && python3 - "$GOSSIP_OUT" >>"$LOG" 2>&1 <<'PY'
 import json, sys
 from collections import Counter
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+# Per-line, guarded — the cooldown reader over these same files already
+# skips a torn line rather than dying on it, and a summary that raises takes
+# the whole night's log with it. A nightly appends while this may run.
+rows = []
+for l in open(sys.argv[1]):
+    l = l.strip()
+    if not l:
+        continue
+    try:
+        rows.append(json.loads(l))
+    except Exception:
+        continue
 c = Counter(a["verdict"] for r in rows for a in r.get("audit", []))
 print(f"  gossip audit across {len(rows)} run(s): {dict(c)}")
 for r in rows:
