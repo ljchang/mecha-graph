@@ -1,6 +1,41 @@
 //! Eval harness (§11): build the ruler before the thing it measures.
-//! Gold queries live in `eval/gold.jsonl`; `run` reports recall@10 and MRR
+//! Gold queries live at `~/.mecha-graph/eval/gold.jsonl` — outside the
+//! repository, because they are mined from real episodes. See
+//! [`default_gold_path`]. `run` reports recall@10 and MRR
 //! per job so a change that helps one job and hurts another is visible.
+
+/// Default gold-set path: `~/.mecha-graph/eval/gold.jsonl`, overridable via
+/// `MECHA_GRAPH_GOLD`.
+///
+/// **Outside the repository, because the gold set is not code.** Its queries
+/// are mined from real episodes, so it was one of ten files an export script
+/// stripped before this repo could be published — and keeping it in-tree was
+/// the reason a second, private checkout had to exist at all. Same shape as
+/// [`crate::db::default_db_path`]: the data lives in `~/.mecha-graph/`, the
+/// code lives here, and nothing has to be stripped on the way out.
+pub fn default_gold_path() -> std::path::PathBuf {
+    gold_path_from(
+        std::env::var("MECHA_GRAPH_GOLD").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The resolution rule, as a pure function of its two inputs.
+///
+/// Split out so it can be tested without touching process state. The first
+/// draft of that test called `set_var("HOME", ..)` and broke an unrelated
+/// test in `similar` — Rust runs a crate's tests as threads of one process,
+/// so an env write is not test-local however carefully the test is written.
+/// A pure function needs no such care.
+pub fn gold_path_from(env_override: Option<&str>, home: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = env_override {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(home.unwrap_or("."))
+        .join(".mecha-graph")
+        .join("eval")
+        .join("gold.jsonl")
+}
 
 use crate::embed::Embedder;
 use crate::error::Result;
@@ -134,4 +169,37 @@ pub fn run(
         .collect();
 
     Ok(EvalReport { per_job, results })
+}
+
+#[cfg(test)]
+mod gold_path_tests {
+    use super::gold_path_from;
+    use std::path::PathBuf;
+
+    /// No env mutation: the rule is a pure function, so the test cannot
+    /// disturb a test running beside it.
+    #[test]
+    fn the_gold_path_defaults_outside_the_repo_and_yields_to_the_env() {
+        let p = gold_path_from(None, Some("/home/someone"));
+        assert_eq!(
+            p,
+            PathBuf::from("/home/someone/.mecha-graph/eval/gold.jsonl")
+        );
+        // No second assert on the same value: `assert_eq!` above pins `p`
+        // exactly, so `!p.starts_with("eval/")` had no input that could fail
+        // it. A test that cannot fail is not a check.
+
+        assert_eq!(
+            gold_path_from(Some("/tmp/other-gold.jsonl"), Some("/home/someone")),
+            PathBuf::from("/tmp/other-gold.jsonl"),
+            "the env override must win, so a checkout can point at a fixture"
+        );
+
+        // No HOME is not a panic: it degrades to a relative path, the same
+        // fallback `db::default_db_path` uses.
+        assert_eq!(
+            gold_path_from(None, None),
+            PathBuf::from("./.mecha-graph/eval/gold.jsonl")
+        );
+    }
 }

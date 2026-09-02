@@ -40,6 +40,14 @@ pub struct ProbeTarget {
     pub node_type: String,
     /// Demand: times this node was served or resolved (retrieval_touch).
     pub touches: i64,
+    /// How many distinct episode sources hold a mention of this node.
+    ///
+    /// Gossip is two readers over *independent sources*, so a node every
+    /// witness to which is one source cannot be gossiped at all — the run
+    /// refuses with "one witness cannot gossip", exits 0 and produces
+    /// nothing. Carried so a caller can see the precondition rather than
+    /// discover it a probe later.
+    pub sources: i64,
     /// Required predicate slots with no live positive fact.
     pub missing_slots: Vec<String>,
     /// Live facts past their predicate's half-life: (predicate, statement).
@@ -195,6 +203,29 @@ pub fn probe_targets_opts(
             continue; // complete and current — nothing to probe
         }
 
+        // How many distinct sources witness this node.
+        //
+        // **Reported, never enforced here.** This module ranks and the
+        // caller disposes — gossip's two-source rule is gossip's, and a
+        // fork experiment measuring single-source behaviour is a legitimate
+        // caller that a filter in the ranker would silently starve. The
+        // production filter is `--min-sources`, applied by the one consumer
+        // that has the precondition.
+        // `prepare_cached`, like the other slot and fact queries in this loop.
+        // An earlier comment here claimed this had been "the only statement
+        // re-prepared per node"; it was not — the `nodes` lookup at the top
+        // of this loop uses `conn.query_row` and re-prepares too. Left as
+        // it is rather than swept in, since it predates this change and is
+        // not what this branch is about, but the claim had to go.
+        let sources: i64 = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COUNT(DISTINCT e.source)
+                 FROM mention m JOIN episode e ON e.id = m.episode_id
+                 WHERE m.node_id = ?1",
+            )?;
+            stmt.query_row(params![node_id], |r| r.get(0))?
+        };
+
         // Fresh λ>0 facts, minus the stale set — verification candidates.
         let verify_facts: Vec<(String, String)> = {
             let mut stmt = conn.prepare_cached(
@@ -220,6 +251,7 @@ pub fn probe_targets_opts(
             aliases,
             node_type,
             touches,
+            sources,
             missing_slots,
             stale_facts,
             verify_facts,
@@ -302,6 +334,65 @@ mod tests {
         let hot = targets.iter().find(|t| t.node_id == "person-hot").unwrap();
         assert!(hot.missing_slots.contains(&"employer".into()));
         assert!(hot.missing_slots.contains(&"role".into()));
+    }
+
+    /// `sources` is what `--min-sources` filters on, and it counts DISTINCT
+    /// episode sources — not mentions. A node with twenty mentions from one
+    /// source cannot be gossiped ("one witness cannot gossip"), and the
+    /// count has to say so.
+    #[test]
+    fn sources_counts_distinct_sources_not_mentions() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("person-one", "person", "One Source")).unwrap();
+        upsert_node(&conn, &Node::new("person-two", "person", "Two Sources")).unwrap();
+        let mk = |node: &str, src: &str, i: usize| {
+            let e = crate::episode::upsert_episode(
+                &conn,
+                &crate::episode::Episode {
+                    id: 0,
+                    uid: String::new(),
+                    source: src.into(),
+                    source_id: format!("{node}-{src}-{i}"),
+                    source_ref: None,
+                    body: "evidence".into(),
+                    occurred_at: "2026-01-01 10:00:00".into(),
+                    occurred_end: None,
+                    ingested_at: String::new(),
+                    lat: None,
+                    lon: None,
+                    location: None,
+                    sensitivity: "personal".into(),
+                    scope_id: None,
+                    meta: None,
+                    raw: None,
+                },
+            )
+            .unwrap()
+            .0;
+            crate::episode::add_mention(&conn, e, node, "manual", 1.0).unwrap();
+        };
+        // Three mentions, all one source: still one witness.
+        for i in 0..3 {
+            mk("person-one", "note", i);
+        }
+        // Two mentions from two sources.
+        mk("person-two", "note", 0);
+        mk("person-two", "slack.thread", 0);
+        touch(&conn, "person-one", 10);
+        touch(&conn, "person-two", 10);
+
+        let t = probe_targets(&conn, 10).unwrap();
+        let one = t.iter().find(|t| t.node_id == "person-one");
+        let two = t.iter().find(|t| t.node_id == "person-two");
+        assert_eq!(
+            one.map(|t| t.sources),
+            Some(1),
+            "three mentions, one source"
+        );
+        assert_eq!(two.map(|t| t.sources), Some(2));
+        // And the ranker still REPORTS rather than enforces: the
+        // single-source node is present, for the caller to drop.
+        assert!(one.is_some(), "probe.rs ranks; --min-sources disposes");
     }
 
     #[test]

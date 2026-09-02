@@ -52,7 +52,8 @@ eval/synthetic/run.sh
 builds a throwaway graph from a fictional corpus (a twelve-message mailbox
 and a small calendar) and grades 24 retrieval queries against it — no
 personal data, no live store, works on a fresh clone. It doubles as the
-retrieval-quality ruler: `eval/gold.jsonl` is the same format, mined from
+retrieval-quality ruler: `~/.mecha-graph/eval/gold.jsonl` is the same format,
+kept outside the repository because it is mined from
 your own corpus once you have one.
 
 ## Quick start with your data

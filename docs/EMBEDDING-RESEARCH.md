@@ -33,7 +33,8 @@ Harrier GGUF.
 
 ## Attempt 1: the existing gold set. Measured nothing.
 
-`eval/gold.jsonl` — 37 human-curated queries — was the obvious instrument. Every
+`~/.mecha-graph/eval/gold.jsonl` — 37 human-curated queries — was the obvious
+instrument. Every
 model scored identically:
 
 | model | insight | memory | tasks |
@@ -213,11 +214,15 @@ attempt 2 established this corpus cannot supply.
   anything quoting an episode lives there instead of diverging into two copies.
 - `eval/gold-semantic.jsonl` — the 80 queries, and `scripts/build-semantic-gold.py`
   / `score-semantic.py` / `diagnose-failures.py` that produce and read them.
-  **Private repo only**, like `eval/gold.jsonl`: generated from one person's
+  **In the private repo, not this one** — unlike the gold sets beside them,
+  which now live at `~/.mecha-graph/eval/`. Generated from one person's
   episodes, so the queries are personal data even though the aggregate scores
   are not. This document keeps the method and the numbers; the examples above
-  are generalised for the same reason `MAIL-CORPUS-RESEARCH.md` is gitignored —
-  one corpus's contents belong to its owner.
+  are generalised for the same reason mecha's `docs/MAIL-CORPUS-RESEARCH.md` is
+  gitignored, as it is here — one corpus's contents belong to its owner.
+  Named with its repo because the basename alone is not an address: the same
+  filename can exist in both, and a claim about one is unverifiable from the
+  other.
 
 ## If this is redone
 
