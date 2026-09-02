@@ -341,7 +341,7 @@ mod tests {
         let conn = open_memory().unwrap();
         upsert_node(&conn, &Node::new("person-one", "person", "One Source")).unwrap();
         upsert_node(&conn, &Node::new("person-two", "person", "Two Sources")).unwrap();
-        let mut mk = |node: &str, src: &str, i: usize| {
+        let mk = |node: &str, src: &str, i: usize| {
             let e = crate::episode::upsert_episode(
                 &conn,
                 &crate::episode::Episode {
