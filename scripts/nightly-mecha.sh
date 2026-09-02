@@ -85,6 +85,25 @@ DURABLE_PREDICATES=(uses works_on works_at authored collaborates_with
 
 umask 077
 mkdir -p "$LOG_DIR"
+
+# ── Retention, and the trap in it ────────────────────────────────────────────
+#
+# Nothing prunes this directory today: `nightly.sh`'s `find -name
+# "nightly-*.log"` does not match `mecha-nightly-*.log`, `gossip-*.jsonl`,
+# `probed-*.jsonl` or `vet-durable-*.jsonl`. Growth is a few hundred KB a
+# night and the cooldown re-parses the whole history each run, so it is not
+# urgent — but it is unbounded, which is a slow way to become urgent.
+#
+# **The trap is for whoever adds the prune, so it is written down before
+# they do.** `probed-*.jsonl` is not a log: it IS the cooldown ledger. A
+# prune that deletes a file inside GOSSIP_COOLDOWN_DAYS silently forgets
+# those attempts, the entities in them look fresh again, and the nightly
+# re-probes a target it probed this week — the exact bug this branch exists
+# to fix, reintroduced by a housekeeping change that looks unrelated.
+#
+# Any retention here must keep `probed-*.jsonl` for strictly longer than
+# GOSSIP_COOLDOWN_DAYS, and should key on the same cutoff the reader uses
+# rather than a second hard-coded number that can drift from it.
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
 
 log "=== mecha nightly start ==="
@@ -119,9 +138,12 @@ run_precheck
 # ── 3. gossip, rotating ──────────────────────────────────────────────────────
 # One line per probe attempt. `entity` matches the gossip output's own key so
 # the cooldown reader treats both files identically.
+# Exits non-zero if the row does not land. The caller skips the probe on a
+# failure, because a probe whose attempt cannot be recorded is a slot spent
+# on something that will be top-ranked again tomorrow.
 record_attempt() {
     python3 - "$PROBE_LEDGER" "$1" "${2:-}" <<'LEDGER' 2>>"$LOG"
-import json, sys, datetime
+import json, os, sys, datetime
 path, entity = sys.argv[1], sys.argv[2]
 node_id = sys.argv[3] if len(sys.argv) > 3 else ""
 # **`node_id` beside the name, and it is the durable half.** `display` is
@@ -133,8 +155,12 @@ node_id = sys.argv[3] if len(sys.argv) > 3 else ""
 row = {"entity": entity,
        "node_id": node_id,
        "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+# Flush and fsync: an append buffered in the page cache is not a record if
+# the box goes down between the write and the probe.
 with open(path, "a") as fh:
     fh.write(json.dumps(row) + "\n")
+    fh.flush()
+    os.fsync(fh.fileno())
 LEDGER
 }
 
@@ -153,8 +179,12 @@ cutoff = time.time() - days * 86400
 # excludes nobody, making every entity look fresh. Ask the directory
 # directly, and exit non-zero so the caller can refuse rather than probe
 # everything.
-if not os.path.isdir(log_dir) or not os.access(log_dir, os.R_OK | os.X_OK):
-    print(f"cooldown: {log_dir} is not a readable directory", file=sys.stderr)
+# W_OK as well as R_OK: the ledger is appended to in this same directory,
+# and a readable-but-not-writable dir passes the read check and then loses
+# every attempt silently — the half of the cooldown that has no reader to
+# notice it.
+if not os.path.isdir(log_dir) or not os.access(log_dir, os.R_OK | os.X_OK | os.W_OK):
+    print(f"cooldown: {log_dir} is not a readable AND writable directory", file=sys.stderr)
     sys.exit(1)
 # entity -> most recent probe, as an epoch. A MAP, not a set: when every
 # ranked target is on cooldown the night must still probe something, and
@@ -291,7 +321,14 @@ if [ "$TARGETS_STATUS" -ne 0 ]; then
     log "probe-targets FAILED (exit $TARGETS_STATUS) — NOT a cooldown; skipping gossip. \
 Check the graph store is readable and not mid-migration; see the stderr above in this log."
 elif [ -z "$TARGETS" ]; then
-    log "no fresh probe targets (all ${COOLDOWN}d-recent or none ranked) — skipping gossip"
+    # Not "all on cooldown" any more: since the cooldown became a
+    # preference, a full cooldown falls through to least-recently-probed and
+    # still returns targets. An empty TARGETS now means the RANKER returned
+    # nothing — typically `--min-sources 2` emptying the pool, or no node
+    # having any gap left. Naming the old cause would be the same conflation
+    # this file polices two comments above.
+    log "no probe targets ranked — the Selector returned none (with --min-sources 2, \
+that usually means no node has two witnessing sources AND an open slot). Not a cooldown."
 else
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -303,7 +340,17 @@ else
         # timeout, or by the box going down mid-probe, has still consumed the
         # slot and must still age. Recording on success only is the bug this
         # ledger exists to fix, one level down.
-        record_attempt "$entity" "$node_id"
+        # **The write side must fail as loudly as the read side.** The
+        # cooldown reader refuses the night when it cannot read; this is the
+        # write it depends on, and its status was never checked. A full disk
+        # or a non-writable $LOG_DIR gives no row, a consumed slot, and the
+        # same entity top-ranked again tomorrow — indefinitely. That is the
+        # exact repeat this branch exists to end, restored by the fix for it.
+        if ! record_attempt "$entity" "$node_id"; then
+            log "ledger write FAILED for $entity — skipping the probe rather than \
+consuming a slot that will not age. Check $LOG_DIR is writable."
+            continue
+        fi
         # `< /dev/null`: the loop is fed by a here-string, so without it
         # gossip inherits the REMAINING entity lines as its own stdin and can
         # eat them — the loop then probes one target and reports the rest as
@@ -334,13 +381,21 @@ for l in open(sys.argv[1]):
         rows.append(json.loads(l))
     except Exception:
         continue
-c = Counter(a["verdict"] for r in rows for a in r.get("audit", []))
+# `.get`, not `[...]`: the parse is guarded per line above, but one audit
+# entry missing a key would still take the whole summary — and the summary
+# is the surface that made the original nightly repeat visible at all.
+c = Counter(
+    a.get("verdict", "(no verdict)")
+    for r in rows
+    for a in r.get("audit", []) or []
+    if isinstance(a, dict)
+)
 print(f"  gossip audit across {len(rows)} run(s): {dict(c)}")
 for r in rows:
-    for a in r.get("audit", []):
-        if a["verdict"] in ("contradicted", "unsupported"):
+    for a in r.get("audit", []) or []:
+        if isinstance(a, dict) and a.get("verdict") in ("contradicted", "unsupported"):
             claim = a.get("claim") or a.get("statement", "")
-            print(f"  ⚑ {r['entity']}: {str(claim)[:110]}")
+            print(f"  ⚑ {r.get('entity', '(unknown)')}: {str(claim)[:110]}")
 PY
 
 log "=== mecha nightly done ==="

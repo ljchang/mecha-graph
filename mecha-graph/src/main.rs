@@ -2836,11 +2836,17 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             );
             // The reason, on stderr beside the summary. A count that names
             // no cause cannot be acted on, which is the whole finding here.
-            // Capped like the decay alarm printer in this same binary. If
-            // the `bee` CLI is unreachable — a documented failure mode; the
-            // nightly's own header describes the D-Bus/keyring outage that
-            // broke ingestion — EVERY pending verdict fails in one sweep,
-            // and an uncapped loop turns one outage into a page of stderr.
+            // Capped like the decay alarm printer in this same binary.
+            //
+            // **Not for an unreachable CLI** — that was the stated reason
+            // and it is unreachable: a `bee` that will not run fails the
+            // PULL first, which propagates with `?`, so this loop never
+            // executes. The cap earns its place on the case that IS
+            // reachable: `facts list` healthy while `confirm`/`delete`
+            // fail — a revoked write scope, or a fact set deleted in bulk
+            // on Bee's side — where every pending verdict fails in one
+            // sweep and an uncapped loop turns one outage into a page of
+            // stderr.
             for f in r.push_failures.iter().take(10) {
                 let verb = if f.accepted { "confirm" } else { "delete" };
                 let stuck_marker = if f.attempts >= BEE_PUSH_STUCK_ATTEMPTS {
