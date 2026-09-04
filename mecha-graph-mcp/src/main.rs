@@ -1649,7 +1649,7 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
         .format("%Y-%m-%d")
         .to_string();
     // An unresolvable entity is an ERROR, never an empty board. "No tasks
-    // for Grace" and "there is nobody here called Grace" are opposite
+    // for Nadia" and "there is nobody here called Nadia" are opposite
     // findings, and a caller that cannot tell them apart will report the
     // first when the truth is the second.
     let entity = match args["entity"]
@@ -1756,7 +1756,7 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::set_task_session(conn, task, session)?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
-    // `set` would make "also file this under Grace" silently drop whoever
+    // `set` would make "also file this under Nadia" silently drop whoever
     // was already there.
     for name in args["about_add"].as_array().unwrap_or(&Vec::new()) {
         if let Some(name) = name.as_str() {

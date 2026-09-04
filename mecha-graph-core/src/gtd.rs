@@ -71,7 +71,7 @@ pub struct TaskItem {
 /// All three are real edges (`object_id` set), so all three traverse. They
 /// differ in what they claim, and the entity filter deliberately unions them
 /// rather than making a caller pick: someone asking "what is open and closed
-/// for Grace" does not mean "…but only the ones where she holds the ball".
+/// for Nadia" does not mean "…but only the ones where she holds the ball".
 pub const TASK_ENTITY_PREDICATES: &[&str] = &["about", "waiting_on", "assigned_to"];
 
 /// Names inside a `group_concat` are joined on ASCII unit separator rather
@@ -693,7 +693,7 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
 /// Drop a task's association with an entity. Returns whether one was there.
 ///
 /// A **valid-time close**, not an invalidation: "this task is no longer
-/// filed under Grace" says the association ended, not that it was never
+/// filed under Nadia" says the association ended, not that it was never
 /// true, and the history behind it stays readable. `invalidated_at` is for
 /// beliefs that were wrong — see `fact::invalidate_never_true`.
 pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<bool> {
