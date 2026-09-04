@@ -803,7 +803,16 @@ enum Command {
         /// Include done/dropped
         #[arg(long)]
         all: bool,
+        /// Only tasks associated with this person, project or topic. Unions
+        /// `about`, `waiting_on` and `assigned_to`, plus tasks whose parent
+        /// project is this node. Pair with --all for everything, open and
+        /// finished, involving them.
+        #[arg(long)]
+        entity: Option<String>,
     },
+    /// Scan task titles for entities the graph already knows, filing matches
+    /// as unreviewed (`shadow`) `about` associations
+    ScanTasks,
     /// List duplicate-person merge candidates (same full name)
     Dups,
     /// Show or set the graph's owner — the person whose life this is
@@ -2220,8 +2229,36 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
             }
         }
-        Command::Tasks { all } => {
-            let tasks = gtd::list_tasks(&conn, all)?;
+        Command::ScanTasks => {
+            let report = gtd::propose_task_entities(&conn)?;
+            if want_json(cli_json, cli_text) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "scanned {} unassociated task(s): {} association(s) filed as shadow, \
+                     {} already live, {} weak first-name match(es) refused",
+                    report.scanned, report.minted, report.already, report.refused_weak
+                );
+                if report.minted > 0 {
+                    println!(
+                        "these are UNREVIEWED — they earn a verdict when a query serves one \
+                         (`mecha-graph shadow`)"
+                    );
+                }
+            }
+        }
+        Command::Tasks { all, entity } => {
+            // Resolve first: an unknown name must not print an empty board,
+            // which reads as "this person has no tasks".
+            let tasks = match entity.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(name) => {
+                    let node = graph::resolve_entity(&conn, name)?.ok_or_else(|| {
+                        mecha_graph_core::Error::Other(format!("no node matches '{name}'"))
+                    })?;
+                    gtd::tasks_for_entity(&conn, &node.id, all)?
+                }
+                None => gtd::list_tasks(&conn, all)?,
+            };
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else if tasks.is_empty() {
@@ -2235,6 +2272,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     }
                     if let Some(w) = &t.waiting_on {
                         extra.push(format!("waiting on {w}"));
+                    }
+                    if !t.about.is_empty() {
+                        extra.push(format!("about {}", t.about.join(", ")));
                     }
                     if let Some(p) = &t.project {
                         extra.push(format!("[{p}]"));

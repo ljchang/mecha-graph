@@ -40,6 +40,19 @@ pub struct TaskItem {
     /// answers a different question (traversal and provenance) and so cannot
     /// disagree with this one.
     pub session: Option<String>,
+    /// The entities this task is *about* — a permanent association, and what
+    /// makes a *completed* task still findable under the person it concerned.
+    ///
+    /// Deliberately a different predicate from [`TaskItem::waiting_on`],
+    /// because the two have different lifetimes and one field cannot carry
+    /// both. `waiting_on` is a live claim about who holds the ball *now*, so
+    /// closing the task closes the fact — it stopped being true in the world.
+    /// `about` is what the task concerned, which finishing it does not
+    /// change. Collapsing them into one predicate forces a choice between a
+    /// person's card carrying stale "waiting on" claims forever and their
+    /// finished work becoming unfindable. Keeping them apart is what lets
+    /// both be right.
+    pub about: Vec<String>,
     /// What the task was captured *from* — the email that asked, the
     /// stranger's request, the conversation it fell out of. See
     /// [`set_task_captured_from`] for the shape and why it is a pointer.
@@ -52,27 +65,86 @@ pub struct TaskItem {
     pub captured_from: Option<serde_json::Value>,
 }
 
+/// The predicates that associate a task with an entity, for the purposes of
+/// "show me this person's tasks".
+///
+/// All three are real edges (`object_id` set), so all three traverse. They
+/// differ in what they claim, and the entity filter deliberately unions them
+/// rather than making a caller pick: someone asking "what is open and closed
+/// for Grace" does not mean "…but only the ones where she holds the ball".
+pub const TASK_ENTITY_PREDICATES: &[&str] = &["about", "waiting_on", "assigned_to"];
+
+/// Names inside a `group_concat` are joined on ASCII unit separator rather
+/// than a comma, because a node name may contain a comma and splitting on
+/// one would quietly saw a person in half.
+const NAME_SEP: char = '\u{1f}';
+
 /// All tasks, actionable statuses first then by due date. `include_closed`
 /// adds done/dropped (newest completions first within their group).
 pub fn list_tasks(conn: &Connection, include_closed: bool) -> Result<Vec<TaskItem>> {
-    let mut stmt = conn.prepare_cached(
+    list_tasks_filtered(conn, include_closed, None)
+}
+
+/// Every task associated with one entity, open and closed, newest completion
+/// first within each status group. `entity` is a node **id** — resolve a name
+/// through [`crate::graph::resolve_entity`] first, so an unknown name is an
+/// error the caller can report rather than an empty board that reads like
+/// "this person has no tasks".
+pub fn tasks_for_entity(
+    conn: &Connection,
+    entity_id: &str,
+    include_closed: bool,
+) -> Result<Vec<TaskItem>> {
+    list_tasks_filtered(conn, include_closed, Some(entity_id))
+}
+
+/// The one task query, with the entity filter as a parameter rather than a
+/// second SQL string.
+///
+/// Written as `?2 IS NULL OR …` so the filtered and unfiltered boards are
+/// *literally the same statement*. Two queries would drift: the board grew a
+/// `defer_until` column and an ordering rule the hard way, and a parallel
+/// entity query would have had to grow them again, from memory, correctly.
+fn list_tasks_filtered(
+    conn: &Connection,
+    include_closed: bool,
+    entity_id: Option<&str>,
+) -> Result<Vec<TaskItem>> {
+    // The predicate list is interpolated rather than bound because SQLite has
+    // no array parameter. It is a private `const` of string literals, never
+    // caller input, so there is nothing here for a caller to inject.
+    let predicates = TASK_ENTITY_PREDICATES
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
         "SELECT n.id, n.name, td.status, td.task_type, td.due_at, td.defer_until,
                 td.context_tag, td.completed_at,
                 json_extract(n.properties, '$.session'),
                 json_extract(n.properties, '$.captured_from'),
                 (SELECT p.name FROM nodes p WHERE p.id = td.parent_id),
                 (SELECT pn.name FROM fact_current f JOIN nodes pn ON pn.id = f.object_id
-                 WHERE f.subject_id = n.id AND f.predicate = 'waiting_on' LIMIT 1)
+                 WHERE f.subject_id = n.id AND f.predicate = 'waiting_on' LIMIT 1),
+                (SELECT group_concat(an.name, char(31)) FROM fact_current af
+                 JOIN nodes an ON an.id = af.object_id
+                 WHERE af.subject_id = n.id AND af.predicate = 'about')
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
-         WHERE ?1 OR td.status NOT IN ('done','dropped')
+         WHERE (?1 OR td.status NOT IN ('done','dropped'))
+           AND (?2 IS NULL
+                OR td.parent_id = ?2
+                OR EXISTS (SELECT 1 FROM fact_current ef
+                           WHERE ef.subject_id = n.id AND ef.object_id = ?2
+                             AND ef.predicate IN ({predicates})))
          ORDER BY CASE td.status WHEN 'next' THEN 0 WHEN 'inbox' THEN 1
                                  WHEN 'scheduled' THEN 2 WHEN 'waiting' THEN 3
                                  WHEN 'done' THEN 4 ELSE 5 END,
                   td.due_at IS NULL, td.due_at ASC,
-                  td.completed_at DESC, n.created_at ASC",
-    )?;
+                  td.completed_at DESC, n.created_at ASC"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     let tasks = stmt
-        .query_map(params![include_closed], |r| {
+        .query_map(params![include_closed, entity_id], |r| {
             Ok(TaskItem {
                 node_id: r.get(0)?,
                 name: r.get(1)?,
@@ -92,6 +164,10 @@ pub fn list_tasks(conn: &Connection, include_closed: bool) -> Result<Vec<TaskIte
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
                 project: r.get(10)?,
                 waiting_on: r.get(11)?,
+                about: r
+                    .get::<_, Option<String>>(12)?
+                    .map(|joined| joined.split(NAME_SEP).map(str::to_string).collect())
+                    .unwrap_or_default(),
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -386,14 +462,7 @@ pub const OWNER: &str = "@owner";
 ///
 /// Returns the resolved name, or `None` when the field was cleared.
 pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Result<Option<String>> {
-    let is_task: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM task_detail WHERE node_id = ?1",
-        params![node_id],
-        |r| r.get(0),
-    )?;
-    if !is_task {
-        return Err(Error::Other(format!("{node_id} is not a task")));
-    }
+    require_task(conn, node_id)?;
 
     // **Resolve before retiring anything.** Retiring first and resolving after
     // means a typo does not merely fail — it *clears* who actually had the
@@ -465,8 +534,238 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     Ok(Some(target.name))
 }
 
+/// Associate a task with an entity it concerns, as a live `about` fact.
+///
+/// Multi-valued, unlike [`set_task_waiting_on`]: a task can be about several
+/// people and topics at once, and there is no single answer to retire when a
+/// second one arrives. So this *adds*; [`remove_task_about`] is the inverse.
+///
+/// Same resolution rule as `waiting_on`, for the same reason: the name must
+/// already be a node. Minting one here would let a typo create a plausible
+/// looking person nobody ever meant, and a task filed under them is worse
+/// than a task filed under nobody — it reads as an answer.
+///
+/// Idempotent. The live-fact unique index already forbids a duplicate
+/// (subject, predicate, object), so re-adding the same association returns
+/// the existing name rather than failing; a caller re-running a scan should
+/// not have to care.
+pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<String> {
+    require_task(conn, node_id)?;
+    let what = what.trim();
+    if what.is_empty() {
+        return Err(Error::Other("about needs a name".into()));
+    }
+    let target = match what {
+        OWNER => crate::graph::owner_node(conn)?.ok_or_else(|| {
+            Error::Other(
+                "this graph has no owner set, so `@owner` names nobody — \
+                 `mecha-graph owner <node>` marks one"
+                    .into(),
+            )
+        })?,
+        _ => crate::graph::resolve_entity(conn, what)?.ok_or_else(|| {
+            Error::Other(format!(
+                "no node matches '{what}' — about must name something the graph already knows"
+            ))
+        })?,
+    };
+    let task_name: String = conn.query_row(
+        "SELECT name FROM nodes WHERE id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    crate::fact::assert_fact(
+        conn,
+        node_id,
+        "about",
+        Some(&target.id),
+        None,
+        &format!("{task_name} is about {}", target.name),
+        None,
+        None,
+        1.0,
+        "manual",
+    )?;
+    Ok(target.name)
+}
+
+/// Drop a task's association with an entity. Returns whether one was there.
+///
+/// A **valid-time close**, not an invalidation: "this task is no longer
+/// filed under Grace" says the association ended, not that it was never
+/// true, and the history behind it stays readable. `invalidated_at` is for
+/// beliefs that were wrong — see `fact::invalidate_never_true`.
+pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<bool> {
+    require_task(conn, node_id)?;
+    let Some(target) = crate::graph::resolve_entity(conn, what.trim())? else {
+        return Ok(false);
+    };
+    let n = conn.execute(
+        "UPDATE fact SET valid_to = datetime('now')
+          WHERE subject_id = ?1 AND predicate = 'about' AND object_id = ?2
+            AND valid_to IS NULL AND invalidated_at IS NULL",
+        params![node_id, target.id],
+    )?;
+    Ok(n > 0)
+}
+
+/// What one pass of [`propose_task_entities`] did.
+#[derive(Debug, Default, Serialize)]
+pub struct TaskScanReport {
+    /// Tasks examined — those with no `about` association yet.
+    pub scanned: usize,
+    /// Associations proposed and minted live at tier `shadow`.
+    pub minted: usize,
+    /// Strong matches already asserted; the scan is re-runnable.
+    pub already: usize,
+    /// Weak matches (a bare first name) refused for want of corroboration.
+    pub refused_weak: usize,
+}
+
+/// Scan task titles for entities the graph already knows, and mint the
+/// matches as **shadow** `about` facts (review-on-use).
+///
+/// Why shadow and not direct: a task the owner typed is an instruction, but
+/// "this title contains a word that is also a person's name" is an
+/// inference, and inference does not get to land as settled fact. Shadow is
+/// the tier that already means exactly this — live and retrievable, labeled
+/// unreviewed, rank-discounted, earning a human verdict the first time a
+/// query actually serves it. So the board is useful today without anything
+/// pretending to be more certain than it is.
+///
+/// **Strong matches only.** `alias_verdict` lets a weak match (a bare first
+/// name) through when other strong matches in the same episode corroborate
+/// it. A task title is one line — there is no corroborating context to be
+/// had, and the 2026-08-24 repair is what happens when a bare first name is
+/// trusted without it. Here a weak match is always refused, and counted so
+/// the refusal is visible rather than silent.
+///
+/// Tasks are excluded as *targets*: their names live in `nodes` like any
+/// other, so without this every task links to every task sharing a word.
+pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
+    let mut report = TaskScanReport::default();
+    let pairs = crate::episode::alias_pairs(conn)?;
+
+    // Tasks with no association yet — re-running must not re-propose what a
+    // previous pass already minted or a human already asserted.
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.name FROM nodes n JOIN task_detail td ON td.node_id = n.id
+          WHERE NOT EXISTS (SELECT 1 FROM fact_current f
+                            WHERE f.subject_id = n.id AND f.predicate = 'about')",
+    )?;
+    let tasks: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (task_id, task_name) in tasks {
+        report.scanned += 1;
+        let lower = task_name.to_lowercase();
+        for (name, node_id, weak) in &pairs {
+            if node_id == &task_id || !crate::episode::appears_in(&lower, name) {
+                continue;
+            }
+            if *weak {
+                report.refused_weak += 1;
+                continue;
+            }
+            let node_type: String = conn.query_row(
+                "SELECT node_type FROM nodes WHERE id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )?;
+            if node_type == "task" {
+                continue;
+            }
+            let target_name: String = conn.query_row(
+                "SELECT name FROM nodes WHERE id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )?;
+            // Already live from an earlier pass or a human? Nothing to do.
+            let live: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'about' AND object_id = ?2",
+                params![task_id, node_id],
+                |r| r.get(0),
+            )?;
+            if live {
+                report.already += 1;
+                continue;
+            }
+            let proposed = crate::fact::ProposedFact {
+                subject: task_name.clone(),
+                predicate: "about".into(),
+                object: Some(target_name.clone()),
+                object_value: None,
+                statement: format!("{task_name} is about {target_name}"),
+                valid_from: None,
+                confidence: Some(0.6),
+                tags: None,
+                // Set, because this producer derived the pair FROM nodes —
+                // it never guessed at a name. That is what keeps two
+                // genuinely distinct same-named people from folding into
+                // one another at accept time.
+                subject_node: Some(task_id.clone()),
+                object_node: Some(node_id.clone()),
+            };
+            let cid = crate::fact::propose_fact(conn, &proposed, "linker:task-title", None)?;
+            crate::fact::mint_shadow_candidate(conn, cid)?;
+            report.minted += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// The entities a task is currently about, as `(node_id, name)`.
+pub fn task_about(conn: &Connection, node_id: &str) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT an.id, an.name FROM fact_current af
+         JOIN nodes an ON an.id = af.object_id
+         WHERE af.subject_id = ?1 AND af.predicate = 'about'
+         ORDER BY an.name",
+    )?;
+    let rows = stmt
+        .query_map(params![node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Guard shared by every task mutator: the id must actually be a task.
+///
+/// Factored out of [`set_task_waiting_on`], which had it inline. Two copies
+/// of "is this a task" is one copy away from a mutator that forgets to ask
+/// and writes a `waiting_on` onto a person node.
+fn require_task(conn: &Connection, node_id: &str) -> Result<()> {
+    let is_task: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if !is_task {
+        return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+    Ok(())
+}
+
 /// Move a task through its lifecycle. Sets/clears `completed_at` so 'done'
 /// carries a timestamp and reopening clears it.
+///
+/// **Closing a task closes its `waiting_on`**, and that is a valid-time
+/// close, not an invalidation: nobody owes a finished task, so the claim
+/// stopped being true — it was not wrong. Without this the fact stays live
+/// forever and every future read of that person says they still hold a ball
+/// they handed back months ago; `facts_for_node` is bidirectional, so it is
+/// their card that carries it, not the task's.
+///
+/// The task stays findable under that person afterwards, because the entity
+/// filter unions `about` with `waiting_on` and reads `fact` history rather
+/// than only what is live. That union is the whole reason this close is
+/// safe: retiring the live claim does not retire the association.
+///
+/// Reopening deliberately does **not** resurrect it. Who owes a reopened
+/// task is a new question with a new answer, and guessing the old one is how
+/// a person silently re-acquires an obligation nobody gave them.
 pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result<()> {
     if !TASK_STATUSES.contains(&status) {
         return Err(Error::Other(format!(
@@ -484,6 +783,14 @@ pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result
     )?;
     if n == 0 {
         return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+    if matches!(status, "done" | "dropped") {
+        conn.execute(
+            "UPDATE fact SET valid_to = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                AND valid_to IS NULL AND invalidated_at IS NULL",
+            params![node_id],
+        )?;
     }
     Ok(())
 }
@@ -964,5 +1271,258 @@ mod tests {
         assert_eq!(t.due_at.as_deref(), Some("2026-08-25"));
         assert_eq!(t.context_tag, None);
         assert!(update_task_schedule(&conn, "nope", Some(None), None, None).is_err());
+    }
+
+    /// The whole point of the `about` predicate, in one assertion.
+    ///
+    /// Fails on the old behaviour twice over: there was no `about` at all, so
+    /// there was nothing to survive; and `waiting_on` — the only association
+    /// that existed — was never closed, so the *other* half of this test
+    /// (that a finished task stops claiming somebody owes it) also failed.
+    #[test]
+    fn a_finished_task_is_still_findable_under_the_person_it_was_about() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-ostrander", "person", "Ostrander")).unwrap();
+        let id = create_task(&conn, "Draft the SAS award citation", None, None, None).unwrap();
+        add_task_about(&conn, &id, "Ostrander").unwrap();
+        set_task_waiting_on(&conn, &id, "Ostrander").unwrap();
+
+        // Open: found either way.
+        assert_eq!(
+            tasks_for_entity(&conn, "p-ostrander", false).unwrap().len(),
+            1
+        );
+
+        // The negative below is only worth something if the fact was there to
+        // begin with. Without this line a `waiting_on` that never got written
+        // would make the "it was closed" assertion pass vacuously.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1, "the obligation is live while the task is open");
+
+        set_task_status(&conn, &id, "done").unwrap();
+
+        // Closed and excluded from the live board...
+        assert!(
+            tasks_for_entity(&conn, "p-ostrander", false)
+                .unwrap()
+                .is_empty(),
+            "a done task is not open work"
+        );
+        // ...but still findable, with its completion stamp, which is the
+        // capability this whole change exists for.
+        let closed = tasks_for_entity(&conn, "p-ostrander", true).unwrap();
+        assert_eq!(closed.len(), 1, "a finished task stays findable under them");
+        assert_eq!(closed[0].status, "done");
+        assert!(closed[0].completed_at.is_some());
+        assert_eq!(closed[0].about, vec!["Ostrander".to_string()]);
+
+        // And the live claim is gone: nobody owes a finished task. This is
+        // the assertion that fails loudest on the old code.
+        let live_waiting: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_waiting, 0, "closing a task closes who owes it");
+        // Closed in valid time, not invalidated: it was true, and stopped.
+        let closed_not_wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                    AND valid_to IS NOT NULL AND invalidated_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            closed_not_wrong, 1,
+            "a finished obligation ended, it was not wrong"
+        );
+    }
+
+    /// The filter unions every way a task can be tied to an entity, and ties
+    /// nothing else in. The negative half matters most: a filter that returns
+    /// everything is indistinguishable from one that works, on a board this
+    /// small.
+    #[test]
+    fn the_entity_filter_unions_the_three_associations_and_the_project() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+
+        let about = create_task(&conn, "Write the intro", None, None, None).unwrap();
+        add_task_about(&conn, &about, "Wren").unwrap();
+
+        let waiting = create_task(&conn, "Collect the consent forms", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &waiting, "Wren").unwrap();
+
+        let assigned = create_task(&conn, "Book the room", None, None, None).unwrap();
+        assert_fact(
+            &conn,
+            &assigned,
+            "assigned_to",
+            Some("p-wren"),
+            None,
+            "Book the room is assigned to Wren",
+            None,
+            None,
+            1.0,
+            "manual",
+        )
+        .unwrap();
+
+        let child = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        let unrelated = create_task(&conn, "Renew the parking permit", None, None, None).unwrap();
+
+        let mut found: Vec<String> = tasks_for_entity(&conn, "p-wren", true)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.node_id)
+            .collect();
+        found.sort();
+        let mut want = vec![about, waiting, assigned];
+        want.sort();
+        assert_eq!(
+            found, want,
+            "about + waiting_on + assigned_to, and nothing else"
+        );
+
+        // The project is a foreign key, not a fact — so it needs its own arm
+        // of the filter, and this is what catches its removal.
+        let by_project: Vec<String> = tasks_for_entity(&conn, "proj-tide", true)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.node_id)
+            .collect();
+        assert_eq!(by_project, vec![child], "a task's parent project finds it");
+        assert!(
+            !by_project.contains(&unrelated),
+            "an unrelated task is not everyone's"
+        );
+    }
+
+    /// `about` is multi-valued and additive. A `set`-shaped API would make
+    /// "also file this under Wren" silently drop Ostrander.
+    #[test]
+    fn about_accumulates_is_idempotent_and_removes_one_at_a_time() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("p-ostrander", "person", "Ostrander")).unwrap();
+        let id = create_task(&conn, "Schedule the committee", None, None, None).unwrap();
+
+        add_task_about(&conn, &id, "Ostrander").unwrap();
+        add_task_about(&conn, &id, "Wren").unwrap();
+        assert_eq!(
+            task_about(&conn, &id).unwrap().len(),
+            2,
+            "adding never replaces"
+        );
+
+        // Re-adding is a no-op, so a re-run of the scan is safe.
+        add_task_about(&conn, &id, "Wren").unwrap();
+        assert_eq!(task_about(&conn, &id).unwrap().len(), 2, "idempotent");
+
+        assert!(remove_task_about(&conn, &id, "Wren").unwrap());
+        let left = task_about(&conn, &id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1, "Ostrander", "removing one leaves the other");
+        assert!(
+            !remove_task_about(&conn, &id, "Wren").unwrap(),
+            "removing what is not there reports false rather than erroring"
+        );
+
+        // A name the graph does not know is an error, never a new node.
+        assert!(add_task_about(&conn, &id, "Nobody At All").is_err());
+        let minted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE name = 'Nobody At All'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(minted, 0, "a typo must not mint a plausible person");
+
+        assert!(
+            add_task_about(&conn, "p-wren", "Ostrander").is_err(),
+            "not a task"
+        );
+    }
+
+    /// The title scan files what it finds as *shadow*, refuses a bare first
+    /// name, and never links one task to another.
+    #[test]
+    fn the_title_scan_mints_shadow_and_refuses_a_bare_first_name() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        upsert_node(&conn, &Node::new("p-ostrander", "person", "Ostrander")).unwrap();
+        conn.execute(
+            "INSERT INTO node_alias (alias, node_id, source) VALUES ('wren', 'p-ostrander', 'firstname')",
+            [],
+        )
+        .unwrap();
+
+        let hit = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        let weak = create_task(&conn, "Call wren about the forms", None, None, None).unwrap();
+        create_task(&conn, "Renew the parking permit", None, None, None).unwrap();
+
+        let report = propose_task_entities(&conn).unwrap();
+        assert_eq!(report.scanned, 3);
+        assert_eq!(
+            report.minted, 1,
+            "the canonical project name is a strong match"
+        );
+        assert!(
+            report.refused_weak >= 1,
+            "a bare first name has no corroboration here"
+        );
+
+        // Filed, and findable...
+        let found = tasks_for_entity(&conn, "proj-tide", true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id, hit);
+
+        // ...but labelled unreviewed, which is the whole bargain.
+        let tier: String = conn
+            .query_row(
+                "SELECT tier FROM fact_current WHERE subject_id = ?1 AND predicate = 'about'",
+                params![hit],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tier, "shadow", "inference is served, never asserted");
+
+        assert!(
+            task_about(&conn, &weak).unwrap().is_empty(),
+            "the weak match was refused, not quietly filed"
+        );
+
+        // Re-running proposes nothing new — the scan is safe on a cron.
+        let again = propose_task_entities(&conn).unwrap();
+        assert_eq!(again.minted, 0, "already-associated tasks are skipped");
+    }
+
+    /// Task nodes are in `nodes` like anything else, so the scan has to
+    /// exclude them explicitly or every task links to every task sharing a
+    /// word. This is the test for that one `continue`.
+    #[test]
+    fn the_title_scan_never_links_one_task_to_another() {
+        let conn = open_memory().unwrap();
+        create_task(&conn, "Review the Tidelab budget", None, None, None).unwrap();
+        create_task(&conn, "Review the Tidelab budget again", None, None, None).unwrap();
+        let report = propose_task_entities(&conn).unwrap();
+        assert_eq!(
+            report.minted, 0,
+            "tasks are not entities to file each other under"
+        );
     }
 }

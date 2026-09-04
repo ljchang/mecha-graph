@@ -93,7 +93,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_entity",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, and `sources` — which episode sources cover this entity, how many episodes each holds and over what span. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again.",
+            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, `sources` — which episode sources cover this entity, how many episodes each holds and over what span — and `tasks`, this entity's board split into `open` and `closed`. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again. A task in `tasks` may carry an unreviewed association: the title scan proposes `about` links at tier 'shadow', so check the fact's tier before treating 'this task is about X' as established.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -236,11 +236,12 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about`, and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "include_closed": { "type": "boolean", "description": "Also return done/dropped tasks (default false)" }
+                    "include_closed": { "type": "boolean", "description": "Also return done/dropped tasks (default false)" },
+                    "entity": { "type": "string", "description": "Only tasks associated with this person, project or topic, by name or node id. Unions three associations: `about` (what the task concerns — survives completion), `waiting_on` (who currently holds the ball — cleared when the task closes) and `assigned_to`, plus tasks whose parent project IS this node. An unknown name is an error, not an empty list." }
                 }
             }
         },
@@ -255,6 +256,11 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
                     "project": { "type": "string", "description": "Parent project/topic — must resolve to an existing node" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
+                    "about": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "People, projects or topics this task concerns, by name. A PERMANENT association: it survives completion, which is what makes a finished task still findable under the person it was for. Use it for 'who/what is this task about'; use waiting_on (on kg_task_update) for 'who owes me this right now', which is cleared when the task closes. Each name must already resolve to a node — an unknown one is an error, never a new node."
+                    },
                     "captured_from": {
                         "type": "object",
                         "description": "What prompted this task, so a person can read the original later — `mecha tasks source <id>` follows it. A pointer, never a copy: no bodies, no quoted text, and a key that is not listed here is refused. Set it when the task comes from something with an address; omit it entirely for one somebody typed, where the absence is the honest answer.",
@@ -283,7 +289,9 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
-                    "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'." },
+                    "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
+                    "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
+                    "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },
                     "session": { "type": "string", "description": "The agent conversation working this task. Set by the harness that starts one — do not invent a value; \"\" clears." },
                     "captured_from": { "description": "What the task was captured from — same object kg_task_create takes; \"\" clears. Set it from what you actually read, never reconstructed from the task's wording." }
                 },
@@ -588,6 +596,27 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         })
         .collect();
 
+    // The board, filtered to this entity, split by whether it is still live.
+    //
+    // A block of its own rather than more `facts` rows: the association IS
+    // in `facts` already (it is an `about`/`waiting_on` edge), but a fact
+    // statement carries no status and no due date, and the 25-row cap means
+    // a busy person's tasks fall off the bottom silently. Splitting open
+    // from closed here is what makes "and what did we finish" answerable
+    // without a second call.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let all_tasks = gtd::tasks_for_entity(conn, &node.id, true)?;
+    let (closed, open): (Vec<_>, Vec<_>) = all_tasks
+        .iter()
+        .partition(|t| matches!(t.status.as_str(), "done" | "dropped"));
+    let tasks = json!({
+        "open": open.iter().map(|t| task_json(t, &today)).collect::<Vec<_>>(),
+        "closed": closed.iter().map(|t| task_json(t, &today)).collect::<Vec<_>>(),
+    });
+
     Ok(json!({
         "v": 1, "found": true,
         "node": { "id": node.id, "name": node.name, "type": node.node_type,
@@ -596,6 +625,7 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         "interaction": pi,
         "context": ctx,
         "facts": facts,
+        "tasks": tasks,
         "sources": coverage,
         "episodes": episodes
     }))
@@ -1292,6 +1322,63 @@ mod tests {
         assert_eq!(by_name("late")["overdue"], true);
         assert_eq!(by_name("future")["overdue"], false);
     }
+
+    /// An entity nobody has heard of is an ERROR, not an empty board.
+    ///
+    /// "No tasks for Ostrander" and "there is nobody here called Ostrander"
+    /// are opposite findings, and the caller that cannot distinguish them
+    /// will confidently report the first. Same shape as the unreadable store
+    /// that must not read as an empty queue.
+    #[test]
+    fn an_unknown_entity_is_an_error_not_an_empty_board() {
+        let conn = open_memory().unwrap();
+        kg_task_create(&conn, &json!({ "name": "something" })).unwrap();
+        let err = kg_task_list(&conn, &json!({ "entity": "Nobody At All" }));
+        assert!(err.is_err(), "an unresolvable name must not answer with []");
+
+        // And the real thing resolves, echoing who it resolved to so the
+        // caller can see which of two same-named people it got.
+        upsert_node(&conn, &Node::new("p-ostrander", "person", "Ostrander")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "write it up" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": id, "about_add": ["Ostrander"] })).unwrap();
+        let board = kg_task_list(&conn, &json!({ "entity": "Ostrander" })).unwrap();
+        assert_eq!(board["items"].as_array().unwrap().len(), 1);
+        assert_eq!(board["entity"]["name"], "Ostrander");
+        assert_eq!(board["items"][0]["about"][0], "Ostrander");
+    }
+
+    /// The entity's card carries its board, split by whether it is still
+    /// live — the second surface, and the one a "tell me about X" lands on.
+    #[test]
+    fn an_entity_card_carries_its_open_and_closed_tasks() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let open = kg_task_create(&conn, &json!({ "name": "open one", "about": ["Wren"] }))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let done = kg_task_create(&conn, &json!({ "name": "done one", "about": ["Wren"] }))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": done, "status": "done" })).unwrap();
+
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Wren" })).unwrap();
+        let tasks = &card["tasks"];
+        assert_eq!(tasks["open"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["closed"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["open"][0]["id"], open);
+        assert_eq!(tasks["closed"][0]["id"], done);
+        assert!(
+            tasks["closed"][0]["completed_at"].is_string(),
+            "a closed task carries when it closed"
+        );
+    }
 }
 
 /// The Verifier's deterministic tier, over MCP.
@@ -1536,30 +1623,58 @@ fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
 }
 
+/// One task as the board renders it. Shared by `kg_task_list` and the
+/// `tasks` block on `kg_entity`, so the two surfaces cannot disagree about
+/// what a task looks like or when one is overdue.
+fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
+    let overdue = t
+        .due_at
+        .as_deref()
+        .is_some_and(|d| d < today && t.completed_at.is_none());
+    json!({
+        "id": t.node_id, "name": t.name, "status": t.status,
+        "due_at": t.due_at, "defer_until": t.defer_until,
+        "context": t.context_tag, "project": t.project,
+        "waiting_on": t.waiting_on, "about": t.about,
+        "session": t.session, "completed_at": t.completed_at,
+        "captured_from": t.captured_from,
+        "overdue": overdue
+    })
+}
+
 fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let include_closed = args["include_closed"].as_bool().unwrap_or(false);
     let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let items: Vec<Value> = gtd::list_tasks(conn, include_closed)?
-        .into_iter()
-        .map(|t| {
-            let overdue = t
-                .due_at
-                .as_deref()
-                .is_some_and(|d| d < today.as_str() && t.completed_at.is_none());
-            json!({
-                "id": t.node_id, "name": t.name, "status": t.status,
-                "due_at": t.due_at, "defer_until": t.defer_until,
-                "context": t.context_tag, "project": t.project,
-                "waiting_on": t.waiting_on, "session": t.session, "completed_at": t.completed_at,
-                "captured_from": t.captured_from,
-                "overdue": overdue
-            })
-        })
-        .collect();
-    Ok(json!({ "v": 1, "items": items, "today": today, "truncated": false }))
+    // An unresolvable entity is an ERROR, never an empty board. "No tasks
+    // for Grace" and "there is nobody here called Grace" are opposite
+    // findings, and a caller that cannot tell them apart will report the
+    // first when the truth is the second.
+    let entity = match args["entity"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(name) => Some(graph::resolve_entity(conn, name)?.ok_or_else(|| {
+            mecha_graph_core::Error::Other(format!(
+                "no node matches '{name}' — kg_entity resolves names, and \
+                 an unknown one is not an empty task list"
+            ))
+        })?),
+        None => None,
+    };
+    let tasks = match &entity {
+        Some(node) => gtd::tasks_for_entity(conn, &node.id, include_closed)?,
+        None => gtd::list_tasks(conn, include_closed)?,
+    };
+    let items: Vec<Value> = tasks.iter().map(|t| task_json(t, &today)).collect();
+    let mut out = json!({ "v": 1, "items": items, "today": today, "truncated": false });
+    if let Some(node) = entity {
+        out["entity"] = json!({ "id": node.id, "name": node.name });
+    }
+    Ok(out)
 }
 
 fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -1584,7 +1699,19 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if !args["captured_from"].is_null() {
         gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
     }
-    Ok(json!({ "v": 1, "status": "created", "id": task_id, "due_at": due }))
+    // Same rule as `project`: an unknown name fails the call rather than
+    // minting a node. Failing here leaves the task created and the
+    // association absent, which the error says explicitly — better than a
+    // silent half-write the caller has to guess at.
+    let mut about: Vec<String> = Vec::new();
+    for name in args["about"].as_array().unwrap_or(&Vec::new()) {
+        if let Some(name) = name.as_str() {
+            about.push(gtd::add_task_about(conn, &task_id, name)?);
+        }
+    }
+    Ok(json!({
+        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about
+    }))
 }
 
 fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -1627,6 +1754,19 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     }
     if let Some(session) = args["session"].as_str() {
         gtd::set_task_session(conn, task, session)?;
+    }
+    // Add and remove rather than set, because `about` is multi-valued: a
+    // `set` would make "also file this under Grace" silently drop whoever
+    // was already there.
+    for name in args["about_add"].as_array().unwrap_or(&Vec::new()) {
+        if let Some(name) = name.as_str() {
+            gtd::add_task_about(conn, task, name)?;
+        }
+    }
+    for name in args["about_remove"].as_array().unwrap_or(&Vec::new()) {
+        if let Some(name) = name.as_str() {
+            gtd::remove_task_about(conn, task, name)?;
+        }
     }
     // An object sets it; `""` clears it, which is the tri-state every other
     // field here speaks. `null` cannot mean "clear" — an absent key

@@ -281,7 +281,14 @@ pub fn episodes_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result
 /// are; matching "flowmail" or "tidelab" is distinctive, not a guess.
 /// MAX(weak) is the conservative fold: a name reachable both ways is
 /// treated as the weaker of the two.
-fn alias_pairs(conn: &Connection) -> Result<Vec<(String, String, bool)>> {
+/// `(name, node_id, weak)` for every name that resolves unambiguously.
+///
+/// `pub(crate)` so the task-title scan matches *identically* to the episode
+/// scan — the same reason the reconcile shares it. Note for any new caller:
+/// this includes `task` nodes, whose canonical names are in `nodes` like
+/// anything else, so a scanner over task text must exclude them or every
+/// task links to every task that shares a word.
+pub(crate) fn alias_pairs(conn: &Connection) -> Result<Vec<(String, String, bool)>> {
     let mut stmt = conn.prepare_cached(
         "SELECT name, MIN(nid), MAX(weak) FROM (
              SELECT a.alias AS name, a.node_id AS nid, a.source = 'firstname' AS weak
@@ -301,7 +308,7 @@ fn alias_pairs(conn: &Connection) -> Result<Vec<(String, String, bool)>> {
 /// Whole-word containment. Shared for the same reason as `alias_pairs`:
 /// a reconcile that matched differently from the linker would retract
 /// mentions the live path would still make.
-fn appears_in(body_lower: &str, alias: &str) -> bool {
+pub(crate) fn appears_in(body_lower: &str, alias: &str) -> bool {
     let is_boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
     let mut start = 0;
     while let Some(pos) = body_lower[start..].find(alias) {
