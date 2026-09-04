@@ -1499,6 +1499,83 @@ mod tests {
         assert_eq!(gtd::task_about(&conn, &id).unwrap().len(), 1);
     }
 
+    /// Finishing a task and naming who owed it, in ONE call, still leaves
+    /// nobody owing it.
+    ///
+    /// `status` was applied first, so the close ran before the claim existed
+    /// and then the claim was asserted onto an already-finished task — with
+    /// nothing left to close it, ever. The single call most likely to hit it
+    /// is the natural one: recording who owed a thing at the moment you
+    /// record that it is done.
+    #[test]
+    fn closing_and_naming_the_owed_party_in_one_call_leaves_no_live_claim() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "the thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 0,
+            "nobody owes a finished task, whatever the field order"
+        );
+
+        // And she still has it on her card, through the closed claim.
+        let found = gtd::tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].previously_waiting_on, vec!["Nadia".to_string()]);
+    }
+
+    /// Re-stating the current holder changes nothing, however many times.
+    #[test]
+    fn re_setting_the_same_waiting_on_does_not_make_them_their_own_predecessor() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "the thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for _ in 0..3 {
+            kg_task_update(&conn, &json!({ "task": id, "waiting_on": "Nadia" })).unwrap();
+        }
+        let t = gtd::list_tasks(&conn, true).unwrap().remove(0);
+        assert_eq!(t.waiting_on.as_deref(), Some("Nadia"));
+        assert!(
+            t.previously_waiting_on.is_empty(),
+            "the current holder is not their own history, and repeats do not stack"
+        );
+    }
+
+    /// The create echo uses the same association shape as every other
+    /// surface, so a caller can tell a vetted link from a guess.
+    #[test]
+    fn create_echoes_about_in_the_shape_the_tool_descriptions_promise() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let out = kg_task_create(&conn, &json!({ "name": "x", "about": ["Nadia"] })).unwrap();
+        assert_eq!(out["about"][0]["name"], "Nadia");
+        assert_eq!(
+            out["about"][0]["unreviewed"], false,
+            "a hand-set association, and the shape says so"
+        );
+    }
+
     /// The update response says what the associations now are, so a removal
     /// that removed nothing is visible.
     #[test]
@@ -2027,10 +2104,21 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     }
     // Every name here already resolved above, so these cannot fail on a
     // lookup and the task cannot be left half-associated.
-    let mut about: Vec<String> = Vec::new();
     for name in &about_names {
-        about.push(gtd::add_task_about(conn, &task_id, name)?);
+        gtd::add_task_about(conn, &task_id, name)?;
     }
+    // Echoed in the SAME shape every other surface uses — `{name, unreviewed}`,
+    // read back from the store rather than from the names that went in. Bare
+    // strings here made this the one response where a caller could not tell a
+    // vetted association from a guess, contradicting the tool descriptions
+    // this PR wrote; and reading it back means the echo reflects what was
+    // actually recorded, including a pre-existing shadow row upgraded to
+    // reviewed by this very call.
+    let about = gtd::list_tasks(conn, true)?
+        .into_iter()
+        .find(|t| t.node_id == task_id)
+        .map(|t| t.about)
+        .unwrap_or_default();
     Ok(json!({
         "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about
     }))
@@ -2058,10 +2146,6 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
                 "no node matches '{name}' — nothing was changed"
             )));
         }
-    }
-
-    if let Some(status) = args["status"].as_str() {
-        gtd::set_task_status(conn, task, status)?;
     }
 
     // Absent field → untouched; "" → cleared — the same tri-state
@@ -2118,6 +2202,18 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             gtd::set_task_captured_from(conn, task, None)?;
         }
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
+    }
+
+    // **Status goes LAST, and the order is the guarantee.** Applied first, a
+    // single `{status: "done", waiting_on: "Nadia"}` closed nothing — there
+    // was nothing to close yet — and then asserted a live obligation onto a
+    // task that was already finished, which nothing afterwards would ever
+    // close. That is precisely the state this branch exists to make
+    // impossible, reachable through the one call a caller is most likely to
+    // make: recording who owed a thing at the same moment they record that
+    // it is done. Closing runs after every field that could open a claim.
+    if let Some(status) = args["status"].as_str() {
+        gtd::set_task_status(conn, task, status)?;
     }
 
     // `task_json`, not a second literal. The reason this response echoes

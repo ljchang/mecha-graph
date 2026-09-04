@@ -880,6 +880,29 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // hand-off chain retracts the whole chain rather than the last link. Both
     // are rarer than a mis-set name, and a wrong claim about a real person
     // that no command can remove is the worse failure.
+    // **Re-stating the current holder is a no-op, not a hand-off.** Closing
+    // and re-asserting the same claim would make that person their own
+    // predecessor: `previously_waiting_on` means "who held it before", and it
+    // reads closed-but-true rows, so the current holder would appear in their
+    // own history — once more on every repeat. Idempotence matters here
+    // because the natural way to confirm an obligation is to state it again,
+    // and a re-sync or a retried tool call does exactly that.
+    //
+    // Not a problem under the old code, which invalidated on re-point: those
+    // rows were invisible to both the history arm of the filter and to
+    // `previously_waiting_on`. Moving to a valid-time close is what made
+    // churn visible, and this is its other half.
+    if let Some(t) = &target {
+        let already: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM fact_current
+              WHERE subject_id = ?1 AND predicate = 'waiting_on' AND object_id = ?2",
+            params![node_id, t.id],
+            |r| r.get(0),
+        )?;
+        if already {
+            return Ok(Some(t.name.clone()));
+        }
+    }
     let how = if target.is_none() {
         Retire::NeverTrue
     } else {
