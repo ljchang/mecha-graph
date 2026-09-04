@@ -139,7 +139,20 @@ const FIELD_SEP: char = '\u{1e}';
 /// All tasks, actionable statuses first then by due date. `include_closed`
 /// adds done/dropped (newest completions first within their group).
 pub fn list_tasks(conn: &Connection, include_closed: bool) -> Result<Vec<TaskItem>> {
-    list_tasks_filtered(conn, include_closed, None)
+    list_tasks_filtered(conn, include_closed, None, None)
+}
+
+/// One task, rendered exactly as the board renders it.
+///
+/// The two MCP echoes were reading the WHOLE board to keep a single row —
+/// and this branch gave that query two more correlated subqueries per row,
+/// so the cost of one `kg_task_create` had come to scale with the size of
+/// the board. Sharing one renderer is right; sharing it by materialising
+/// everything is not.
+pub fn get_task(conn: &Connection, node_id: &str) -> Result<Option<TaskItem>> {
+    Ok(list_tasks_filtered(conn, true, None, Some(node_id))?
+        .into_iter()
+        .next())
 }
 
 /// Every task associated with one entity, open and closed, newest completion
@@ -152,7 +165,7 @@ pub fn tasks_for_entity(
     entity_id: &str,
     include_closed: bool,
 ) -> Result<Vec<TaskItem>> {
-    list_tasks_filtered(conn, include_closed, Some(entity_id))
+    list_tasks_filtered(conn, include_closed, Some(entity_id), None)
 }
 
 /// The one task query, with the entity filter as a parameter rather than a
@@ -166,6 +179,7 @@ fn list_tasks_filtered(
     conn: &Connection,
     include_closed: bool,
     entity_id: Option<&str>,
+    only_task: Option<&str>,
 ) -> Result<Vec<TaskItem>> {
     // The predicate list is interpolated rather than bound because SQLite has
     // no array parameter. It is a private `const` of string literals, never
@@ -212,6 +226,7 @@ fn list_tasks_filtered(
                    ORDER BY pf.valid_to DESC))
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
+           AND (?3 IS NULL OR n.id = ?3)
            AND (?2 IS NULL
                 OR td.parent_id = ?2
                 -- `fact`, not `fact_current`, and the difference is the whole
@@ -261,7 +276,7 @@ fn list_tasks_filtered(
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let tasks = stmt
-        .query_map(params![include_closed, entity_id], |r| {
+        .query_map(params![include_closed, entity_id, only_task], |r| {
             Ok(TaskItem {
                 node_id: r.get(0)?,
                 name: r.get(1)?,
@@ -918,7 +933,7 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
         params![node_id],
         |r| r.get(0),
     )?;
-    crate::fact::assert_fact(
+    let uid = crate::fact::assert_fact(
         conn,
         node_id,
         "waiting_on",
@@ -930,6 +945,33 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
         1.0,
         "manual",
     )?;
+
+    // **A finished task cannot acquire a live obligation, whoever asks.**
+    //
+    // Ordering `status` last in `kg_task_update` closed the one-call form of
+    // this and left the two-call form open: `{status: "done"}` in one turn,
+    // `{waiting_on: "Nadia"}` in the next, and nothing runs afterwards to
+    // close it — `set_task_status` is the only thing that does, and it has
+    // already been. From then on every entity-anchored read of that person
+    // carries a ball they handed back, which is the exact sentence
+    // `set_task_status`'s doc uses for why the close exists. Guarding the
+    // caller was fixing the symptom; the invariant belongs on the writer,
+    // where no call shape can route around it.
+    //
+    // Closed rather than refused, because the intent is legitimate and worth
+    // keeping: "Nadia had owed this" is true, and recording it as history
+    // gives `previously_waiting_on` and the entity filter something real.
+    // Only the *live* claim is impossible. Valid time ends now and starts
+    // wherever it started, so this is an obligation that ended, not one that
+    // never was.
+    let closed: bool = conn.query_row(
+        "SELECT status IN ('done','dropped') FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if closed {
+        crate::fact::close_valid_time(conn, &uid, None)?;
+    }
     Ok(Some(target.name))
 }
 
@@ -965,7 +1007,14 @@ pub fn resolve_about(conn: &Connection, what: &str) -> Result<Option<crate::grap
             )
         })?));
     }
-    crate::graph::resolve_entity(conn, what)
+    // A node id resolves too, and it has to: the ambiguity refusal below
+    // tells the caller to name an id instead, and advice a function cannot
+    // honour is worse than no advice. Names first, because a name is what a
+    // caller normally has and an id shaped like a name is not a thing here.
+    if let Some(node) = crate::graph::resolve_entity(conn, what)? {
+        return Ok(Some(node));
+    }
+    crate::graph::get_node(conn, what)
 }
 
 pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<String> {
@@ -973,6 +1022,28 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
     let what = what.trim();
     if what.is_empty() {
         return Err(Error::Other("about needs a name".into()));
+    }
+    // **Ambiguity is surfaced, never resolved by sort order.** `about` is
+    // permanent by design, so the write path is the one that makes a wrong
+    // guess unrecoverable — and it was the quiet one: `resolve_entity` takes
+    // `.next()`, so two people called Wren meant whichever sorted first, and
+    // the echo is byte-identical either way. The read paths in this branch
+    // already print the node they chose; ARCHITECTURE §2 says an ambiguous
+    // name never auto-links.
+    if what != OWNER {
+        let matches = crate::graph::resolve_entity_all(conn, what)?;
+        if matches.len() > 1 {
+            let names: Vec<String> = matches
+                .iter()
+                .map(|n| format!("{} ({})", n.name, n.id))
+                .collect();
+            return Err(Error::Other(format!(
+                "'{what}' matches {} nodes — name the id instead, since an \
+                 `about` is permanent: {}",
+                matches.len(),
+                names.join(", ")
+            )));
+        }
     }
     let target = match resolve_about(conn, what)? {
         Some(node) => node,
@@ -982,6 +1053,19 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
             )))
         }
     };
+    // A task is not something another task is *about*. The title scan
+    // excludes task nodes as targets and `alias_pairs` carries a note telling
+    // every new caller to do the same; the manual path did not, so
+    // `about_add: ["Book the venue"]` — a plausible slip for a model whose
+    // context is full of task titles — minted a task→task edge nothing in
+    // this feature expects.
+    if target.node_type == "task" {
+        return Err(Error::Other(format!(
+            "'{}' is a task — `about` files a task under a person, project or \
+             topic, not under another task",
+            target.name
+        )));
+    }
     let task_name: String = conn.query_row(
         "SELECT name FROM nodes WHERE id = ?1",
         params![node_id],
@@ -2305,6 +2389,77 @@ mod tests {
             "a hand-off is not a retraction"
         );
         assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+    }
+
+    /// The invariant holds however the call is split, because it lives on the
+    /// writer rather than on the caller.
+    ///
+    /// Ordering `status` last in `kg_task_update` closed the one-call form
+    /// and left the two-call form open — `{status: "done"}`, then
+    /// `{waiting_on: "Nadia"}` a turn later, and nothing runs afterwards to
+    /// close it. Every entity-anchored read of her then carries a ball she
+    /// handed back, which is the sentence `set_task_status` uses for why the
+    /// close exists at all.
+    #[test]
+    fn a_finished_task_cannot_acquire_a_live_obligation() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Send the figures", None, None, None).unwrap();
+
+        set_task_status(&conn, &id, "done").unwrap();
+        // A separate turn, recording who had owed it.
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap();
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 0, "a done task holds nobody to anything");
+
+        // The intent is kept, as history: she did owe it, and that is what
+        // puts the finished task on her card.
+        let found = tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].previously_waiting_on, vec!["Nadia".to_string()]);
+    }
+
+    /// The `about` write path refuses what it cannot resolve unambiguously,
+    /// and refuses another task outright.
+    #[test]
+    fn about_refuses_an_ambiguous_name_and_a_task_target() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("wren-a", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("wren-b", "person", "Wren")).unwrap();
+        let id = create_task(&conn, "Write the abstract", None, None, None).unwrap();
+        let other = create_task(&conn, "Book the venue", None, None, None).unwrap();
+
+        let err = add_task_about(&conn, &id, "Wren").unwrap_err().to_string();
+        assert!(
+            err.contains("matches 2 nodes"),
+            "it says what is ambiguous: {err}"
+        );
+        assert!(
+            err.contains("wren-a") && err.contains("wren-b"),
+            "and names both"
+        );
+        assert!(
+            task_about(&conn, &id).unwrap().is_empty(),
+            "an ambiguous name files nothing — `about` is permanent"
+        );
+        // Naming the id resolves it.
+        add_task_about(&conn, &id, "wren-a").unwrap();
+        assert_eq!(task_about(&conn, &id).unwrap().len(), 1);
+
+        // And a task is not something a task is about.
+        let err = add_task_about(&conn, &id, "Book the venue")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a task"), "{err}");
+        assert!(task_about(&conn, &other).unwrap().is_empty());
     }
 
     /// A task on somebody's card through a CLOSED claim says so on the task.

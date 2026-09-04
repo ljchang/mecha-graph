@@ -810,6 +810,18 @@ enum Command {
         #[arg(long)]
         entity: Option<String>,
     },
+    /// File or unfile a task under a person, project or topic — the direct
+    /// correction channel for what `scan-tasks` proposes
+    TaskAbout {
+        /// The task's node id, e.g. 'task-1a2b3c4d'
+        task: String,
+        /// File it under this entity (repeatable)
+        #[arg(long)]
+        add: Vec<String>,
+        /// Stop filing it under this entity (repeatable)
+        #[arg(long)]
+        remove: Vec<String>,
+    },
     /// Scan task titles for entities the graph already knows, filing matches
     /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
     ScanTasks {
@@ -2300,6 +2312,42 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         "\n{} malformed value(s) — dry run, re-run with --apply to null them",
                         report.found.len()
                     );
+                }
+            }
+        }
+        Command::TaskAbout { task, add, remove } => {
+            // The direct interface is the unmediated correction channel and
+            // the audit surface for autonomy (ARCHITECTURE). `scan-tasks
+            // --apply` is a bulk auto-producer of exactly these rows, and
+            // until now the only way to correct one was to ask an agent —
+            // which is no ground-truth path at all.
+            for name in &add {
+                let filed = gtd::add_task_about(&conn, &task, name)?;
+                println!("filed under {filed}");
+            }
+            for name in &remove {
+                if gtd::remove_task_about(&conn, &task, name)? {
+                    println!("unfiled from {name}");
+                } else {
+                    println!("was not filed under {name} — nothing removed");
+                }
+            }
+            if add.is_empty() && remove.is_empty() {
+                let t = gtd::get_task(&conn, &task)?
+                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                if t.about.is_empty() {
+                    println!("{} — filed under nothing", t.name);
+                } else {
+                    println!("{}", t.name);
+                    for a in &t.about {
+                        // The tier is the point of showing this at all: an
+                        // unreviewed row is what a human is here to judge.
+                        println!(
+                            "  {}{}",
+                            a.name,
+                            if a.unreviewed { "  (unreviewed)" } else { "" }
+                        );
+                    }
                 }
             }
         }

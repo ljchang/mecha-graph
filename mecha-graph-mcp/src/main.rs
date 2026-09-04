@@ -2114,9 +2114,7 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // this PR wrote; and reading it back means the echo reflects what was
     // actually recorded, including a pre-existing shadow row upgraded to
     // reviewed by this very call.
-    let about = gtd::list_tasks(conn, true)?
-        .into_iter()
-        .find(|t| t.node_id == task_id)
+    let about = gtd::get_task(conn, &task_id)?
         .map(|t| t.about)
         .unwrap_or_default();
     Ok(json!({
@@ -2228,9 +2226,6 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let updated = gtd::list_tasks(conn, true)?
-        .into_iter()
-        .find(|t| t.node_id == task)
-        .map(|t| task_json(&t, &today));
+    let updated = gtd::get_task(conn, task)?.map(|t| task_json(&t, &today));
     Ok(json!({ "v": 1, "status": "updated", "task": updated }))
 }
