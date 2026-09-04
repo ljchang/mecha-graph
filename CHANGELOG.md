@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A task's association with an entity now outlives the task.** `about`
+  (task → person/project/topic) carries what a task *concerns*; `waiting_on`
+  keeps its existing job of naming who holds the ball. One predicate could
+  not be both, and trying made each surface wrong in a different direction:
+  close the fact on completion and the finished work disappears from the
+  person it was for; leave it live and their card claims they owe something
+  they handed back months ago. `facts_for_node` is bidirectional, so it was
+  their card carrying it, not the task's.
+
+  Two read surfaces, because they answer different questions: `kg_task_list`
+  and `mecha-graph tasks` gain `entity` (the precise query — unions `about`,
+  `waiting_on` and `assigned_to`, plus tasks whose parent project is that
+  node), and `kg_entity` gains a `tasks` block split into open and closed,
+  capped at 15 a side with the total and a `truncated` flag. An unknown
+  entity name is an error on all of them: "no tasks for her" and "there is
+  nobody here by that name" are opposite findings.
+
+  No migration — `about` and `assigned_to` were already in the seeded
+  vocabulary with inverses. Nothing had ever written them for tasks.
+
+- **`mecha-graph scan-tasks`** proposes associations by scanning task titles
+  for entities the graph already knows, landing them at tier `shadow`:
+  "this title contains a word that is also a name" is an inference, and
+  inference is served rather than asserted. Strong matches only — a bare
+  first name has no corroboration to draw on in a one-line title — and task
+  nodes are excluded as targets, or every task files itself under every task
+  sharing a word. Rejection memory keys on whether the pair was ever
+  asserted in any state, so a refuted association is not re-minted nightly.
+
+- **`mecha-graph repair-dates`** finds date columns holding text that is not
+  a date, and clears them with `--apply`. Reports by default.
+
+### Changed
+
+- **Closing a task now closes its `waiting_on`**, in valid time — the
+  obligation ended, it was not wrong. This changes what an existing call
+  does to existing rows: before, the claim stayed live forever and every
+  later read of that person carried it. The task stays findable under them,
+  because the entity filter reads `fact` history rather than only what is
+  live. Reopening deliberately does not resurrect the claim; who owes a
+  reopened task is a new question, and guessing the old answer silently
+  re-obligates someone.
+
+### Fixed
+
+- **A model's `when` is parsed before it is stored.** `accept_commitment`
+  wrote the extractor's raw string into three date columns —
+  `task_detail.due_at` and the `valid_from` of both facts it asserts. A
+  model answering the literal string `"null"` put that in all three, where
+  it sorts as a date (lexically after any real one), so the task never read
+  as overdue and it answered the wrong side of every bi-temporal `--as-of`
+  query. Nothing on any surface renders `valid_from`, which is how it stayed
+  invisible. Unparseable now degrades to `None` rather than failing the
+  accept; the candidate payload keeps the raw value either way.
+
 ## [0.1.4] - 2026-08-31
 
 Large for a patch, and numbered one anyway to stay in step with this

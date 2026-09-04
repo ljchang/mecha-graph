@@ -147,9 +147,19 @@ fn list_tasks_filtered(
                 -- means it was NEVER TRUE, and a refuted association must
                 -- not go on filing the task under someone a human already
                 -- said it did not belong to.
+                -- And `polarity = 'positive'`, which is the third thing
+                -- `fact_current` was doing and the easiest to lose on the way
+                -- out of it. V013 names GTD as a consumer and says a negative
+                -- edge in graph traversal would be a bug. A correction that
+                -- denies an association with no replacement supersedes the
+                -- positive and writes a live NEGATIVE in its place — so
+                -- without this, the denial itself is what keeps the task
+                -- filed under the person it was denied for, shown next to a
+                -- `facts` block stating the denial.
                 OR EXISTS (SELECT 1 FROM fact ef
                            WHERE ef.subject_id = n.id AND ef.object_id = ?2
                              AND ef.invalidated_at IS NULL
+                             AND ef.polarity = 'positive'
                              AND ef.predicate IN ({predicates})))
          ORDER BY CASE td.status WHEN 'next' THEN 0 WHEN 'inbox' THEN 1
                                  WHEN 'scheduled' THEN 2 WHEN 'waiting' THEN 3
@@ -726,8 +736,14 @@ pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result
         ))
     })?;
     let n = conn.execute(
+        // `polarity = 'positive'`: this closes the *claim* that the task is
+        // about someone. A live negative is the record that it was denied,
+        // which is a different statement and not this function's to retire —
+        // closing it would erase the rejection memory that stops the denial
+        // being re-proposed.
         "UPDATE fact SET valid_to = datetime('now')
           WHERE subject_id = ?1 AND predicate = 'about' AND object_id = ?2
+            AND polarity = 'positive'
             AND valid_to IS NULL AND invalidated_at IS NULL",
         params![node_id, target.id],
     )?;
@@ -771,17 +787,25 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
     let mut report = TaskScanReport::default();
     let pairs = crate::episode::alias_pairs(conn)?;
 
-    // Open tasks with no association yet. Two exclusions, both deliberate:
-    // any pair ever asserted (see the rejection-memory guard below), and
-    // done/dropped work — filing fresh unreviewed associations onto archived
-    // tasks spends a human's review budget on things nobody will act on.
-    // Already-associated closed tasks stay findable; this only declines to
-    // invent new claims about them.
+    // Every OPEN task, including ones that already carry an association.
+    //
+    // An earlier cut excluded any task with an `about` row, which looked like
+    // cheap work-avoidance and was actually a second bug: association is
+    // per-PAIR, so a task already filed under a project could never afterwards
+    // be filed under a person whose node appeared later. It also made
+    // `TaskScanReport.already` structurally unreachable — the counter could
+    // only be incremented by tasks the query had just excluded, so a nightly
+    // would report `0 already live` forever while skipping every one of them.
+    // The per-pair guard below is the real gate; this query only decides
+    // which tasks are worth reading.
+    //
+    // done/dropped stay out: filing fresh unreviewed claims onto archived work
+    // spends a human's review budget on things nobody will act on. Closed
+    // tasks that are already associated remain findable — this declines to
+    // invent new claims about them, not to remember old ones.
     let mut stmt = conn.prepare(
         "SELECT n.id, n.name FROM nodes n JOIN task_detail td ON td.node_id = n.id
-          WHERE td.status NOT IN ('done','dropped')
-            AND NOT EXISTS (SELECT 1 FROM fact f
-                            WHERE f.subject_id = n.id AND f.predicate = 'about')",
+          WHERE td.status NOT IN ('done','dropped')",
     )?;
     let tasks: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -933,8 +957,13 @@ pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result
     }
     if matches!(status, "done" | "dropped") {
         conn.execute(
+            // Positive only, same reason as `remove_task_about`: a live
+            // negative `waiting_on` is a recorded denial that nobody owes
+            // this, and finishing the task does not make that denial stop
+            // being true.
             "UPDATE fact SET valid_to = datetime('now')
               WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                AND polarity = 'positive'
                 AND valid_to IS NULL AND invalidated_at IS NULL",
             params![node_id],
         )?;
@@ -1697,7 +1726,10 @@ mod tests {
             "the weak match was refused, not quietly filed"
         );
 
-        // Re-running proposes nothing new — the scan is safe on a cron.
+        // Re-running proposes nothing new. Stated as a property of the scan,
+        // not as a claim about a schedule: nothing wires `scan-tasks` into
+        // `scripts/nightly.sh` today, and whether it belongs there is a
+        // separate decision from whether repeating it is safe.
         let again = propose_task_entities(&conn).unwrap();
         assert_eq!(again.minted, 0, "already-associated tasks are skipped");
     }
@@ -1803,6 +1835,87 @@ mod tests {
         );
     }
 
+    /// A recorded denial does not hold the association open.
+    ///
+    /// The subtle cost of reading raw `fact` to see `valid_to` history:
+    /// `fact_current` was doing three things, and `polarity = 'positive'` is
+    /// the one easiest to lose on the way out (V013 names GTD as a consumer
+    /// that must not traverse negatives). A correction denying an association
+    /// supersedes the positive and writes a live NEGATIVE in its place — so
+    /// without the guard, the denial itself is what keeps the task filed
+    /// under the person it was denied for.
+    #[test]
+    fn a_denied_association_does_not_keep_the_task_on_the_board() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Send the revised figures", None, None, None).unwrap();
+        add_task_about(&conn, &id, "Nadia").unwrap();
+        assert_eq!(tasks_for_entity(&conn, "p-nadia", true).unwrap().len(), 1);
+
+        // What `corrections::apply` does to a denial with no replacement:
+        // supersede the positive, then record the negative as live.
+        conn.execute(
+            "UPDATE fact SET valid_to = datetime('now'), invalidated_at = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'about' AND polarity = 'positive'",
+            params![id],
+        )
+        .unwrap();
+        crate::fact::assert_negative_fact(
+            &conn,
+            &id,
+            "about",
+            Some("p-nadia"),
+            None,
+            "Send the revised figures is NOT about Nadia",
+            None,
+            1.0,
+            "manual",
+        )
+        .unwrap();
+
+        assert!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().is_empty(),
+            "a denial is not an association"
+        );
+    }
+
+    /// Closing a task retires the claim, not the denial.
+    #[test]
+    fn closing_a_task_leaves_a_recorded_denial_standing() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Chase the reviewers", None, None, None).unwrap();
+        crate::fact::assert_negative_fact(
+            &conn,
+            &id,
+            "waiting_on",
+            Some("p-nadia"),
+            None,
+            "Chase the reviewers is NOT waiting on Nadia",
+            None,
+            1.0,
+            "manual",
+        )
+        .unwrap();
+
+        set_task_status(&conn, &id, "done").unwrap();
+
+        let live_negative: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                    AND polarity = 'negative'
+                    AND valid_to IS NULL AND invalidated_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live_negative, 1,
+            "finishing a task does not make a denial stop being true"
+        );
+    }
+
     /// A human verdict survives the next scan.
     ///
     /// The scan's only guard was "no live `about` fact". Refuting leaves
@@ -1829,6 +1942,10 @@ mod tests {
 
         let again = propose_task_entities(&conn).unwrap();
         assert_eq!(again.minted, 0, "a refusal is remembered, not re-litigated");
+        assert_eq!(
+            again.already, 1,
+            "and the counter reports it, rather than being unreachable"
+        );
         assert!(
             task_about(&conn, &id).unwrap().is_empty(),
             "and the association stays gone"

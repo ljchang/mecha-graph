@@ -1807,6 +1807,36 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         .as_str()
         .ok_or_else(|| mecha_graph_core::Error::Other("kg_task_update needs `task`".into()))?;
 
+    // **Validate the `about` names before the first write, not beside their
+    // own.** This function applies its fields in sequence, so a name checked
+    // where it is used would refuse the association *after* the status change
+    // and the reschedule had already landed — and the error would say nothing
+    // about which of them stuck. Checked here, "nothing was changed" is true.
+    //
+    // A non-string entry is refused rather than skipped: dropping it silently
+    // reports success for a name nobody applied.
+    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> {
+        let Some(arr) = args[key].as_array() else {
+            return Ok(Vec::new());
+        };
+        arr.iter()
+            .map(|n| {
+                n.as_str().map(str::to_string).ok_or_else(|| {
+                    mecha_graph_core::Error::Other(format!("{key} takes strings, got {n}"))
+                })
+            })
+            .collect()
+    };
+    let to_add = names("about_add")?;
+    let to_remove = names("about_remove")?;
+    for name in to_add.iter().chain(to_remove.iter()) {
+        if graph::resolve_entity(conn, name.trim())?.is_none() {
+            return Err(mecha_graph_core::Error::Other(format!(
+                "no node matches '{name}' — nothing was changed"
+            )));
+        }
+    }
+
     if let Some(status) = args["status"].as_str() {
         gtd::set_task_status(conn, task, status)?;
     }
@@ -1846,15 +1876,14 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // Add and remove rather than set, because `about` is multi-valued: a
     // `set` would make "also file this under Nadia" silently drop whoever
     // was already there.
-    for name in args["about_add"].as_array().unwrap_or(&Vec::new()) {
-        if let Some(name) = name.as_str() {
-            gtd::add_task_about(conn, task, name)?;
-        }
+    //
+    // Both lists were resolved at the top of this function, so neither loop
+    // can fail on a lookup and leave the edit half applied.
+    for name in &to_add {
+        gtd::add_task_about(conn, task, name)?;
     }
-    for name in args["about_remove"].as_array().unwrap_or(&Vec::new()) {
-        if let Some(name) = name.as_str() {
-            gtd::remove_task_about(conn, task, name)?;
-        }
+    for name in &to_remove {
+        gtd::remove_task_about(conn, task, name)?;
     }
     // An object sets it; `""` clears it, which is the tri-state every other
     // field here speaks. `null` cannot mean "clear" — an absent key
