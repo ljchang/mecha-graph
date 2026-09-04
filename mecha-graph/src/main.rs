@@ -813,6 +813,13 @@ enum Command {
     /// Scan task titles for entities the graph already knows, filing matches
     /// as unreviewed (`shadow`) `about` associations
     ScanTasks,
+    /// Report date columns holding text that is not a date (a model's `when`
+    /// written verbatim). Dry unless --apply, which nulls them
+    RepairDates {
+        /// Actually null the malformed values; omit to survey only
+        #[arg(long)]
+        apply: bool,
+    },
     /// List duplicate-person merge candidates (same full name)
     Dups,
     /// Show or set the graph's owner — the person whose life this is
@@ -2225,6 +2232,26 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         &e.occurred_at[..10.min(e.occurred_at.len())],
                         e.body.lines().next().unwrap_or("").chars().take(90).collect::<String>(),
                         st.dim(&format!("{} · {}", e.source, e.uid))
+                    );
+                }
+            }
+        }
+        Command::RepairDates { apply } => {
+            let report = gtd::repair_unparseable_dates(&conn, apply)?;
+            if want_json(cli_json, cli_text) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.found.is_empty() {
+                println!("no malformed dates");
+            } else {
+                for b in &report.found {
+                    println!("{:<24} {:<12} {}", b.column, b.value, b.label);
+                }
+                if apply {
+                    println!("\nnulled {} value(s)", report.repaired);
+                } else {
+                    println!(
+                        "\n{} malformed value(s) — dry run, re-run with --apply to null them",
+                        report.found.len()
                     );
                 }
             }

@@ -174,6 +174,107 @@ fn list_tasks_filtered(
     Ok(tasks)
 }
 
+/// One date column holding something that is not a date.
+#[derive(Debug, Clone, Serialize)]
+pub struct BadDate {
+    /// `task_detail.due_at`, `task_detail.defer_until`, or `fact.valid_from`.
+    pub column: String,
+    /// The task node id, or the fact uid.
+    pub row: String,
+    /// What is actually stored — the point of the report.
+    pub value: String,
+    /// The task name or fact statement, so a reader can tell what it is.
+    pub label: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct DateRepairReport {
+    pub found: Vec<BadDate>,
+    /// Rows actually nulled. Zero on a dry run, however many were found.
+    pub repaired: usize,
+}
+
+/// Find (and optionally clear) date columns holding text that is not a date.
+///
+/// The damage `accept_commitment` did before it learned to parse: a model's
+/// `when` went verbatim into `task_detail.due_at` and into the `valid_from`
+/// of the two facts the acceptance asserts. A literal `"null"` there sorts
+/// as a date, never reads as overdue, and quietly answers the wrong side of
+/// every `--as-of` query.
+///
+/// **Reporting is the default and `apply` is opt-in**, the same way
+/// `relink_alias_mentions` is: this nulls columns, and a pass that can erase
+/// dates should not be able to do it to somebody who ran it expecting a
+/// survey.
+///
+/// A date here is anything starting `YYYY-` — every writer in this codebase
+/// produces either `YYYY-MM-DD` or SQLite's `datetime('now')`, so the prefix
+/// separates real values from prose without having to parse the tail. NULL is
+/// not malformed; it is the honest "no date", and is left alone.
+pub fn repair_unparseable_dates(conn: &Connection, apply: bool) -> Result<DateRepairReport> {
+    let mut report = DateRepairReport::default();
+    // GLOB rather than LIKE: '[0-9]' is a character class in GLOB, and
+    // matching four literal digits is the whole test.
+    const IS_DATEISH: &str = "GLOB '[0-9][0-9][0-9][0-9]-*'";
+
+    for column in ["due_at", "defer_until"] {
+        let sql = format!(
+            "SELECT td.node_id, td.{column}, n.name FROM task_detail td
+             JOIN nodes n ON n.id = td.node_id
+             WHERE td.{column} IS NOT NULL AND NOT (td.{column} {IS_DATEISH})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<BadDate> = stmt
+            .query_map([], |r| {
+                Ok(BadDate {
+                    column: format!("task_detail.{column}"),
+                    row: r.get(0)?,
+                    value: r.get(1)?,
+                    label: r.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        if apply && !rows.is_empty() {
+            report.repaired += conn.execute(
+                &format!(
+                    "UPDATE task_detail SET {column} = NULL
+                      WHERE {column} IS NOT NULL AND NOT ({column} {IS_DATEISH})"
+                ),
+                [],
+            )?;
+        }
+        report.found.extend(rows);
+    }
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT uid, valid_from, statement FROM fact
+          WHERE valid_from IS NOT NULL AND NOT (valid_from {IS_DATEISH})"
+    ))?;
+    let facts: Vec<BadDate> = stmt
+        .query_map([], |r| {
+            Ok(BadDate {
+                column: "fact.valid_from".into(),
+                row: r.get(0)?,
+                value: r.get(1)?,
+                label: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    if apply && !facts.is_empty() {
+        report.repaired += conn.execute(
+            &format!(
+                "UPDATE fact SET valid_from = NULL
+                  WHERE valid_from IS NOT NULL AND NOT (valid_from {IS_DATEISH})"
+            ),
+            [],
+        )?;
+    }
+    report.found.extend(facts);
+    Ok(report)
+}
+
 /// Parse a human due-date: `YYYY-MM-DD`, `today`, `tomorrow`, or `+Nd`.
 /// Returns None for empty input; Err for anything unparseable (better to
 /// bounce the form than silently store garbage in task_detail.due_at).
@@ -1509,6 +1610,107 @@ mod tests {
         // Re-running proposes nothing new — the scan is safe on a cron.
         let again = propose_task_entities(&conn).unwrap();
         assert_eq!(again.minted, 0, "already-associated tasks are skipped");
+    }
+
+    /// A model's `when` is text until it parses, and the repair finds what
+    /// went in before that was true.
+    ///
+    /// Fails on the old behaviour at the first assertion: `"null"` used to
+    /// land in `due_at` verbatim.
+    #[test]
+    fn a_models_when_is_parsed_and_the_old_damage_is_repairable() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+
+        // Straight through the accept path, which is where the bug lived.
+        let propose = |when: &str| {
+            let payload = serde_json::json!({
+                "kind": "commitment", "what": format!("thing due {when}"),
+                "who": "Wren", "when": when, "direction": "owed_to_me",
+            });
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, status, proposed_by)
+                 VALUES (?1, 'proposed', 'llm')",
+                params![payload.to_string()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+
+        let junk = crate::extract::accept_commitment(&conn, propose("null")).unwrap();
+        let real = crate::extract::accept_commitment(&conn, propose("2026-09-15")).unwrap();
+        let prose = crate::extract::accept_commitment(&conn, propose("sometime soon")).unwrap();
+
+        let due = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT due_at FROM task_detail WHERE node_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            due(&junk),
+            None,
+            "'null' is not a date and must not be stored"
+        );
+        assert_eq!(due(&prose), None, "neither is prose");
+        assert_eq!(
+            due(&real).as_deref(),
+            Some("2026-09-15"),
+            "a real date survives"
+        );
+
+        // And the fact's valid_from — the half that is easy to forget,
+        // because nothing about the board shows it.
+        let vf: Option<String> = conn
+            .query_row(
+                "SELECT valid_from FROM fact WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                params![junk],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vf, None,
+            "garbage must not reach bi-temporal valid time either"
+        );
+
+        // The repair, for rows written before the parse existed. Hand-write
+        // the damage the old code would have made.
+        conn.execute(
+            "UPDATE task_detail SET due_at = 'null' WHERE node_id = ?1",
+            params![junk],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE fact SET valid_from = 'whenever' WHERE subject_id = ?1",
+            params![junk],
+        )
+        .unwrap();
+
+        let dry = repair_unparseable_dates(&conn, false).unwrap();
+        assert!(dry.found.len() >= 2, "the survey sees both columns");
+        assert_eq!(dry.repaired, 0, "a survey must not write");
+        assert_eq!(
+            due(&junk).as_deref(),
+            Some("null"),
+            "and must not have written"
+        );
+
+        let applied = repair_unparseable_dates(&conn, true).unwrap();
+        assert!(applied.repaired >= 2);
+        assert_eq!(due(&junk), None);
+
+        // The good row is untouched — a repair that also erases valid data
+        // is not a repair.
+        assert_eq!(due(&real).as_deref(), Some("2026-09-15"));
+        assert!(
+            repair_unparseable_dates(&conn, false)
+                .unwrap()
+                .found
+                .is_empty(),
+            "and it is idempotent"
+        );
     }
 
     /// Task nodes are in `nodes` like anything else, so the scan has to

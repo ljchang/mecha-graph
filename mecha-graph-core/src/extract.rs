@@ -617,9 +617,29 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
 
     let what = p["what"].as_str().unwrap_or("(unnamed)");
     let who = p["who"].as_str().unwrap_or("");
-    let when = p["when"].as_str();
     let direction = p["direction"].as_str().unwrap_or("owed_by_me");
     let owed_to_me = direction == "owed_to_me";
+
+    // **A model's `when` is text until it parses.** This went in raw, and it
+    // reaches three date columns — `task_detail.due_at` below, and the
+    // `valid_from` of both facts asserted further down. A model that answered
+    // the literal string "null" put that in all three: it sorts as a date,
+    // never comes out overdue, and silently joins the wrong side of every
+    // bi-temporal `--as-of` query. One row on this graph, which is exactly
+    // how long a bug like this stays invisible.
+    //
+    // Unparseable degrades to None rather than failing the accept: the
+    // commitment is real even when its date is noise, and refusing to accept
+    // it would leave a genuine obligation stuck in the queue over a word.
+    // Nothing is lost — the candidate payload keeps the raw `when` verbatim.
+    //
+    // Caveat worth knowing: `parse_due` resolves 'tomorrow' and '+3d'
+    // against *now*, not against the episode the commitment came from, so a
+    // relative date accepted late lands late. Still strictly better than
+    // storing the word, and it keeps one date parser rather than two.
+    let when_raw = p["when"].as_str();
+    let when_owned = when_raw.and_then(|raw| crate::gtd::parse_due(raw).ok().flatten());
+    let when = when_owned.as_deref();
 
     let task_id = format!("task-{}", uuid_suffix());
     let mut task = graph::Node::new(&task_id, "task", what);
