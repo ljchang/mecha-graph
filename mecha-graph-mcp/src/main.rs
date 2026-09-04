@@ -612,9 +612,25 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     let (closed, open): (Vec<_>, Vec<_>) = all_tasks
         .iter()
         .partition(|t| matches!(t.status.as_str(), "done" | "dropped"));
+    // Capped, like every other block on this card (`facts` 25, `episodes` 8,
+    // `context` 1500 tokens). Closed tasks only ever accumulate, and a
+    // project node collects every task ever filed under it, so an uncapped
+    // block grows without bound on exactly the nodes most worth asking
+    // about. The objection that motivated this block was a cap that
+    // truncates SILENTLY — so the count and the flag are reported, and
+    // `kg_task_list` with `entity` is named as the way to see the rest.
+    const TASK_CAP: usize = 15;
+    let block = |rows: &[&gtd::TaskItem]| {
+        json!({
+            "items": rows.iter().take(TASK_CAP).map(|t| task_json(t, &today)).collect::<Vec<_>>(),
+            "total": rows.len(),
+            "truncated": rows.len() > TASK_CAP,
+        })
+    };
     let tasks = json!({
-        "open": open.iter().map(|t| task_json(t, &today)).collect::<Vec<_>>(),
-        "closed": closed.iter().map(|t| task_json(t, &today)).collect::<Vec<_>>(),
+        "open": block(&open),
+        "closed": block(&closed),
+        "all": "kg_task_list with `entity` returns the full list, unabridged",
     });
 
     Ok(json!({
@@ -1370,14 +1386,71 @@ mod tests {
 
         let card = kg_entity(&conn, &json!({ "name_or_id": "Wren" })).unwrap();
         let tasks = &card["tasks"];
-        assert_eq!(tasks["open"].as_array().unwrap().len(), 1);
-        assert_eq!(tasks["closed"].as_array().unwrap().len(), 1);
-        assert_eq!(tasks["open"][0]["id"], open);
-        assert_eq!(tasks["closed"][0]["id"], done);
+        assert_eq!(tasks["open"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["closed"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["open"]["items"][0]["id"], open);
+        assert_eq!(tasks["closed"]["items"][0]["id"], done);
+        assert_eq!(tasks["open"]["truncated"], false);
         assert!(
-            tasks["closed"][0]["completed_at"].is_string(),
+            tasks["closed"]["items"][0]["completed_at"].is_string(),
             "a closed task carries when it closed"
         );
+    }
+
+    /// A bad `about` name creates no task at all.
+    ///
+    /// Resolving after the create returned an error carrying no id, for a
+    /// task that existed — so the caller fixed the spelling, retried, and
+    /// made a second one. The near-miss name is the common case, because the
+    /// caller is guessing at spellings.
+    #[test]
+    fn an_unresolvable_about_name_creates_no_task() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let before = gtd::list_tasks(&conn, true).unwrap().len();
+
+        let err = kg_task_create(
+            &conn,
+            &json!({ "name": "write it up", "about": ["Wren", "Wrenn"] }),
+        );
+        assert!(err.is_err(), "a name that does not resolve fails the call");
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before,
+            "and leaves no orphan behind for the retry to duplicate"
+        );
+
+        // The good spelling works and associates both nothing-left-behind.
+        kg_task_create(&conn, &json!({ "name": "write it up", "about": ["Wren"] })).unwrap();
+        assert_eq!(gtd::list_tasks(&conn, true).unwrap().len(), before + 1);
+    }
+
+    /// The card's task block is capped, and says so.
+    ///
+    /// The block exists because a silent 25-fact cut hid a person's tasks.
+    /// Replacing it with an unbounded list would trade that for an entity
+    /// card that grows forever on exactly the nodes worth asking about, so
+    /// the cap is real and the truncation is reported rather than inferred.
+    #[test]
+    fn the_entity_cards_task_block_is_capped_and_says_so() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        for i in 0..20 {
+            kg_task_create(
+                &conn,
+                &json!({ "name": format!("task {i}"), "about": ["Wren"] }),
+            )
+            .unwrap();
+        }
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Wren" })).unwrap();
+        let open = &card["tasks"]["open"];
+        assert_eq!(open["items"].as_array().unwrap().len(), 15, "capped");
+        assert_eq!(open["total"], 20, "and the real count is still reported");
+        assert_eq!(open["truncated"], true, "a cut the reader can see");
+
+        // The uncapped route is the one the card points at.
+        let full = kg_task_list(&conn, &json!({ "entity": "Wren" })).unwrap();
+        assert_eq!(full["items"].as_array().unwrap().len(), 20);
     }
 }
 
@@ -1683,6 +1756,25 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         Some(raw) => gtd::parse_due(raw)?,
         None => None,
     };
+    // **Resolve every `about` name before creating anything.** The same rule
+    // `set_task_waiting_on` states as "resolve before retiring anything",
+    // for the same reason one step earlier: resolving afterwards makes a
+    // near-miss name — the common failure, since the caller is guessing at
+    // spellings — return an error carrying no task id, for a task that now
+    // exists. The caller corrects the name, retries, and there are two.
+    // Checking first makes the call all-or-nothing.
+    let about_names: Vec<&str> = args["about"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|n| n.as_str()).collect())
+        .unwrap_or_default();
+    for name in &about_names {
+        if graph::resolve_entity(conn, name.trim())?.is_none() {
+            return Err(mecha_graph_core::Error::Other(format!(
+                "no node matches '{name}' — no task was created; \
+                 `about` must name something the graph already knows"
+            )));
+        }
+    }
     let task_id = gtd::create_task(
         conn,
         name,
@@ -1699,15 +1791,11 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if !args["captured_from"].is_null() {
         gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
     }
-    // Same rule as `project`: an unknown name fails the call rather than
-    // minting a node. Failing here leaves the task created and the
-    // association absent, which the error says explicitly — better than a
-    // silent half-write the caller has to guess at.
+    // Every name here already resolved above, so these cannot fail on a
+    // lookup and the task cannot be left half-associated.
     let mut about: Vec<String> = Vec::new();
-    for name in args["about"].as_array().unwrap_or(&Vec::new()) {
-        if let Some(name) = name.as_str() {
-            about.push(gtd::add_task_about(conn, &task_id, name)?);
-        }
+    for name in &about_names {
+        about.push(gtd::add_task_about(conn, &task_id, name)?);
     }
     Ok(json!({
         "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about

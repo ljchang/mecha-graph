@@ -133,8 +133,23 @@ fn list_tasks_filtered(
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?2 IS NULL
                 OR td.parent_id = ?2
-                OR EXISTS (SELECT 1 FROM fact_current ef
+                -- `fact`, not `fact_current`, and the difference is the whole
+                -- feature. `fact_current` hides anything with `valid_to` set,
+                -- which is exactly what closing a task writes onto its
+                -- `waiting_on` — so filtering on it would make a finished
+                -- task vanish from the person it was finished for, at the
+                -- moment it was finished. That is the capability this query
+                -- exists to provide, deleted by the close that enables it.
+                --
+                -- `invalidated_at IS NULL` is still required, and is the
+                -- other half of the same distinction: `valid_to` means the
+                -- association ENDED and history keeps it; `invalidated_at`
+                -- means it was NEVER TRUE, and a refuted association must
+                -- not go on filing the task under someone a human already
+                -- said it did not belong to.
+                OR EXISTS (SELECT 1 FROM fact ef
                            WHERE ef.subject_id = n.id AND ef.object_id = ?2
+                             AND ef.invalidated_at IS NULL
                              AND ef.predicate IN ({predicates})))
          ORDER BY CASE td.status WHEN 'next' THEN 0 WHEN 'inbox' THEN 1
                                  WHEN 'scheduled' THEN 2 WHEN 'waiting' THEN 3
@@ -696,11 +711,20 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
 /// filed under Nadia" says the association ended, not that it was never
 /// true, and the history behind it stays readable. `invalidated_at` is for
 /// beliefs that were wrong — see `fact::invalidate_never_true`.
+///
+/// An unresolvable name is an **error**, the same as it is when adding one.
+/// Returning `Ok(false)` for it conflates "there was nothing to remove" with
+/// "I could not tell what you meant", and the caller most likely to hit it
+/// is one that mistyped a name it intended to remove — which then reports
+/// success for a removal that never happened.
 pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<bool> {
     require_task(conn, node_id)?;
-    let Some(target) = crate::graph::resolve_entity(conn, what.trim())? else {
-        return Ok(false);
-    };
+    let target = crate::graph::resolve_entity(conn, what.trim())?.ok_or_else(|| {
+        Error::Other(format!(
+            "no node matches '{}' — nothing was removed",
+            what.trim()
+        ))
+    })?;
     let n = conn.execute(
         "UPDATE fact SET valid_to = datetime('now')
           WHERE subject_id = ?1 AND predicate = 'about' AND object_id = ?2
@@ -747,11 +771,16 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
     let mut report = TaskScanReport::default();
     let pairs = crate::episode::alias_pairs(conn)?;
 
-    // Tasks with no association yet — re-running must not re-propose what a
-    // previous pass already minted or a human already asserted.
+    // Open tasks with no association yet. Two exclusions, both deliberate:
+    // any pair ever asserted (see the rejection-memory guard below), and
+    // done/dropped work — filing fresh unreviewed associations onto archived
+    // tasks spends a human's review budget on things nobody will act on.
+    // Already-associated closed tasks stay findable; this only declines to
+    // invent new claims about them.
     let mut stmt = conn.prepare(
         "SELECT n.id, n.name FROM nodes n JOIN task_detail td ON td.node_id = n.id
-          WHERE NOT EXISTS (SELECT 1 FROM fact_current f
+          WHERE td.status NOT IN ('done','dropped')
+            AND NOT EXISTS (SELECT 1 FROM fact f
                             WHERE f.subject_id = n.id AND f.predicate = 'about')",
     )?;
     let tasks: Vec<(String, String)> = stmt
@@ -766,10 +795,10 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
             if node_id == &task_id || !crate::episode::appears_in(&lower, name) {
                 continue;
             }
-            if *weak {
-                report.refused_weak += 1;
-                continue;
-            }
+            // Node type BEFORE weakness: a task is not a candidate target at
+            // all, so a weak alias pointing at one is not a refusal, it is a
+            // non-event. Counting it inflates `refused_weak` with matches
+            // that were never on offer, and that number is meant to be read.
             let node_type: String = conn.query_row(
                 "SELECT node_type FROM nodes WHERE id = ?1",
                 params![node_id],
@@ -778,19 +807,36 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
             if node_type == "task" {
                 continue;
             }
+            if *weak {
+                report.refused_weak += 1;
+                continue;
+            }
             let target_name: String = conn.query_row(
                 "SELECT name FROM nodes WHERE id = ?1",
                 params![node_id],
                 |r| r.get(0),
             )?;
-            // Already live from an earlier pass or a human? Nothing to do.
-            let live: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM fact_current
+            // **Rejection memory.** `fact`, not `fact_current`, and that is
+            // what makes a human verdict survive the next scan. A refuted
+            // association carries `invalidated_at`; a removed one carries
+            // `valid_to`; neither is live, so a `fact_current` test sees an
+            // absence and proposes it again. On a nightly that means every
+            // association a person ever rejected is re-minted forever, and
+            // each re-refutation feeds the class ledger a fresh verdict on
+            // a question already answered.
+            //
+            // This path cannot lean on `precheck`, where rejection memory
+            // normally lives, because `mint_shadow_candidate` goes straight
+            // from `propose_fact` to a live shadow fact. `link_knn` had this
+            // exact bug for a month (linkers.rs) — so the guard is: has this
+            // pair EVER been asserted, in any state?
+            let seen: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM fact
                   WHERE subject_id = ?1 AND predicate = 'about' AND object_id = ?2",
                 params![task_id, node_id],
                 |r| r.get(0),
             )?;
-            if live {
+            if seen {
                 report.already += 1;
                 continue;
             }
@@ -1451,6 +1497,50 @@ mod tests {
         );
     }
 
+    /// A task tied to someone ONLY by `waiting_on` survives its own
+    /// completion.
+    ///
+    /// The case that matters most and that the first cut got wrong: `about`
+    /// is new, so on any existing graph `waiting_on` is the only association
+    /// there is. Filtering on `fact_current` made every one of those tasks
+    /// vanish from the person at the instant it was finished — the exact
+    /// capability being added, removed by the close that enables it. Note
+    /// there is deliberately no `add_task_about` here; adding one would hide
+    /// the regression behind the other predicate, which is how the first
+    /// version of this test passed while the feature was broken.
+    #[test]
+    fn waiting_on_alone_still_finds_a_finished_task() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Send the revised figures", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap();
+        set_task_status(&conn, &id, "done").unwrap();
+
+        let found = tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a closed waiting_on is history, not absence"
+        );
+        assert_eq!(found[0].node_id, id);
+        // ...while the live column correctly shows nobody owes it any more.
+        assert_eq!(found[0].waiting_on, None, "the claim is closed even so");
+
+        // A *refuted* association is different in kind and must not come
+        // back: `invalidated_at` means it was never true.
+        let other = create_task(&conn, "Book the venue", None, None, None).unwrap();
+        add_task_about(&conn, &other, "Nadia").unwrap();
+        conn.execute(
+            "UPDATE fact SET invalidated_at = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'about'",
+            params![other],
+        )
+        .unwrap();
+        let after = tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(after.len(), 1, "a retracted association stays retracted");
+        assert_eq!(after[0].node_id, id);
+    }
+
     /// The filter unions every way a task can be tied to an entity, and ties
     /// nothing else in. The negative half matters most: a filter that returns
     /// everything is indistinguishable from one that works, on a board this
@@ -1711,6 +1801,56 @@ mod tests {
                 .is_empty(),
             "and it is idempotent"
         );
+    }
+
+    /// A human verdict survives the next scan.
+    ///
+    /// The scan's only guard was "no live `about` fact". Refuting leaves
+    /// `invalidated_at` and removing leaves `valid_to` — neither is live, so
+    /// a nightly re-minted every rejected association forever and fed the
+    /// class ledger a fresh verdict on a settled question each time.
+    #[test]
+    fn the_scan_does_not_re_propose_what_a_human_already_rejected() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let id = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+
+        assert_eq!(propose_task_entities(&conn).unwrap().minted, 1);
+
+        // A human says no — the `shadow --refute` path, which retracts as
+        // never true rather than closing valid time.
+        conn.execute(
+            "UPDATE fact SET invalidated_at = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'about'",
+            params![id],
+        )
+        .unwrap();
+        assert!(task_about(&conn, &id).unwrap().is_empty());
+
+        let again = propose_task_entities(&conn).unwrap();
+        assert_eq!(again.minted, 0, "a refusal is remembered, not re-litigated");
+        assert!(
+            task_about(&conn, &id).unwrap().is_empty(),
+            "and the association stays gone"
+        );
+
+        // The valid-time close (`remove_task_about`) is remembered too.
+        let other = create_task(&conn, "Tidelab budget review", None, None, None).unwrap();
+        add_task_about(&conn, &other, "Tidelab").unwrap();
+        remove_task_about(&conn, &other, "Tidelab").unwrap();
+        assert_eq!(propose_task_entities(&conn).unwrap().minted, 0);
+    }
+
+    /// Archived work does not collect fresh unreviewed associations.
+    #[test]
+    fn the_scan_leaves_closed_tasks_alone() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let id = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        set_task_status(&conn, &id, "done").unwrap();
+        let report = propose_task_entities(&conn).unwrap();
+        assert_eq!(report.scanned, 0, "a finished task is not a review target");
+        assert_eq!(report.minted, 0);
     }
 
     /// Task nodes are in `nodes` like anything else, so the scan has to
