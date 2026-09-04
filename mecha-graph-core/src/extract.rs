@@ -642,15 +642,21 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     // every caller, and the accept returns only a task id, so the drop was
     // invisible at the surface as well as in the row.
     let when_raw = p["when"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let mut dropped_when: Option<String> = None;
     let due_owned = match when_raw {
         Some(raw) => match crate::gtd::parse_due(raw) {
             Ok(parsed) => parsed,
             Err(e) => {
-                eprintln!(
-                    "accept_commitment: candidate {candidate_id}: unreadable `when` \
-                     {raw:?} dropped ({e}); the task is created without a due date \
-                     and the candidate payload keeps the original"
-                );
+                // **Recorded on the task, not printed.** This used to go to
+                // stderr, which the TUI's alternate screen swallows — and the
+                // TUI is where commitments are accepted, since they are held
+                // out of bulk auto-accept on purpose. A warning only the
+                // surface that never sees it receives is not a warning.
+                //
+                // The property rides on the task node beside `session` and
+                // `captured_from`, so it reaches every reader of the task
+                // rather than whoever happened to be watching a stream.
+                dropped_when = Some(format!("{raw} ({e})"));
                 None
             }
         },
@@ -701,6 +707,14 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     let mut task = graph::Node::new(&task_id, "task", what);
     task.source = "llm:commitment".into();
     graph::upsert_node(conn, &task)?;
+    if let Some(raw) = &dropped_when {
+        conn.execute(
+            "UPDATE nodes SET properties = json_set(
+                 COALESCE(properties, '{}'), '$.unreadable_when', ?2)
+              WHERE id = ?1",
+            params![task_id, raw],
+        )?;
+    }
     conn.execute(
         "INSERT INTO task_detail (node_id, status, task_type, due_at)
          VALUES (?1, ?2, ?3, ?4)",

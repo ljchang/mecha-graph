@@ -1933,6 +1933,11 @@ fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
         "due_at": t.due_at, "defer_until": t.defer_until,
         "context": t.context_tag, "project": t.project,
         "waiting_on": t.waiting_on, "about": t.about,
+        // Why a task with no live association is on this entity's card.
+        "previously_waiting_on": t.previously_waiting_on,
+        // Present only when the extractor's date could not be read, which is
+        // why this task has no due date.
+        "unreadable_when": t.unreadable_when,
         "session": t.session, "completed_at": t.completed_at,
         "captured_from": t.captured_from,
         "overdue": overdue

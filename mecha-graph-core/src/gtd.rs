@@ -23,6 +23,23 @@ pub struct TaskItem {
     pub project: Option<String>,
     /// Who this waits on (live `waiting_on` fact), if anyone.
     pub waiting_on: Option<String>,
+    /// Who held it before — names from `waiting_on` facts that have been
+    /// closed in valid time, newest first.
+    ///
+    /// Without this a task on somebody's card through a *closed* claim
+    /// renders with `waiting_on: null` and `about: []`, so nothing on it says
+    /// why it is there. That is the case the entity filter exists for: on any
+    /// graph that predates `about`, a closed `waiting_on` is the only reason
+    /// a finished task appears under anyone. A row whose presence has no
+    /// visible cause reads like a bug in the filter.
+    pub previously_waiting_on: Vec<String>,
+    /// The model's `when` when it could not be read as a date, verbatim.
+    ///
+    /// The task exists and has no due date; this says why, on the task, where
+    /// whoever accepted it will see it. It was an `eprintln!`, which the TUI's
+    /// alternate screen swallows — and the TUI is the surface that accepts
+    /// commitments.
+    pub unreadable_when: Option<String>,
     /// The agent conversation that worked this task, if one has.
     ///
     /// An **attribute, not an edge**, and the distinction was argued rather
@@ -166,6 +183,7 @@ fn list_tasks_filtered(
                 td.context_tag, td.completed_at,
                 json_extract(n.properties, '$.session'),
                 json_extract(n.properties, '$.captured_from'),
+                json_extract(n.properties, '$.unreadable_when'),
                 (SELECT p.name FROM nodes p WHERE p.id = td.parent_id),
                 (SELECT pn.name FROM fact_current f JOIN nodes pn ON pn.id = f.object_id
                  WHERE f.subject_id = n.id AND f.predicate = 'waiting_on' LIMIT 1),
@@ -174,7 +192,18 @@ fn list_tasks_filtered(
                 (SELECT group_concat(an.name || char(30) || af.tier, char(31))
                  FROM fact_current af
                  JOIN nodes an ON an.id = af.object_id
-                 WHERE af.subject_id = n.id AND af.predicate = 'about')
+                 WHERE af.subject_id = n.id AND af.predicate = 'about'),
+                -- Closed-but-true `waiting_on`, which is why a finished task
+                -- is on somebody's card at all. `invalidated_at IS NULL`
+                -- keeps a retracted claim out: that one was corrected, and
+                -- naming the person it was corrected away from would put
+                -- them back on the card the retraction removed them from.
+                (SELECT group_concat(pn.name, char(31)) FROM fact pf
+                 JOIN nodes pn ON pn.id = pf.object_id
+                 WHERE pf.subject_id = n.id AND pf.predicate = 'waiting_on'
+                   AND pf.polarity = 'positive'
+                   AND pf.valid_to IS NOT NULL AND pf.invalidated_at IS NULL
+                 ORDER BY pf.valid_to DESC)
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?2 IS NULL
@@ -244,10 +273,11 @@ fn list_tasks_filtered(
                 captured_from: r
                     .get::<_, Option<String>>(9)?
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
-                project: r.get(10)?,
-                waiting_on: r.get(11)?,
+                unreadable_when: r.get(10)?,
+                project: r.get(11)?,
+                waiting_on: r.get(12)?,
                 about: r
-                    .get::<_, Option<String>>(12)?
+                    .get::<_, Option<String>>(13)?
                     .map(|joined| {
                         joined
                             .split(NAME_SEP)
@@ -267,6 +297,10 @@ fn list_tasks_filtered(
                             })
                             .collect()
                     })
+                    .unwrap_or_default(),
+                previously_waiting_on: r
+                    .get::<_, Option<String>>(14)?
+                    .map(|joined| joined.split(NAME_SEP).map(str::to_string).collect())
                     .unwrap_or_default(),
             })
         })?
@@ -814,28 +848,12 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // hand-off chain retracts the whole chain rather than the last link. Both
     // are rarer than a mis-set name, and a wrong claim about a real person
     // that no command can remove is the worse failure.
-    if target.is_none() {
-        // A clear reaches rows that are already CLOSED as well as live ones,
-        // which `retire_task_facts` deliberately does not — its `WHERE` is
-        // the live set, because every other caller means "stop what is
-        // currently true". Correcting a name means reaching back past a
-        // hand-off, so those uids are collected separately and retracted
-        // through the same primitive.
-        let mut stmt = conn.prepare(
-            "SELECT uid FROM fact
-              WHERE subject_id = ?1 AND predicate = 'waiting_on'
-                AND polarity = 'positive' AND invalidated_at IS NULL",
-        )?;
-        let uids: Vec<String> = stmt
-            .query_map(params![node_id], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(stmt);
-        for uid in &uids {
-            crate::fact::invalidate_never_true(conn, uid)?;
-        }
+    let how = if target.is_none() {
+        Retire::NeverTrue
     } else {
-        retire_task_facts(conn, node_id, "waiting_on", Retire::Ended)?;
-    }
+        Retire::Ended
+    };
+    retire_task_facts(conn, node_id, "waiting_on", how)?;
 
     let Some(target) = target else {
         return Ok(None);
@@ -1075,11 +1093,15 @@ pub fn propose_task_entities(
             if node_type == "task" {
                 continue;
             }
-            if *weak {
-                report.refused_weak += 1;
+            // Deduped before counting, for the same reason the node-type
+            // check was hoisted above this: a node reachable through several
+            // weak aliases is ONE refusal, not one per spelling, and this
+            // number is meant to be read.
+            if !seen_targets.insert((task_id.clone(), node_id.clone())) {
                 continue;
             }
-            if !seen_targets.insert((task_id.clone(), node_id.clone())) {
+            if *weak {
+                report.refused_weak += 1;
                 continue;
             }
             let target_name: String = conn.query_row(
@@ -1196,13 +1218,24 @@ fn retire_task_facts(
 ) -> Result<usize> {
     // Positive only, on every path: a live negative is a recorded denial,
     // and none of these operations is a licence to retract one.
+    //
+    // **Scope follows the verb.** `Ended` means "stop what is currently
+    // true", so it takes only live rows. `NeverTrue` is a correction, and a
+    // correction has to reach rows that a hand-off already closed — the
+    // common way to fix a wrong name is to name the right person, which
+    // leaves the wrong one closed-but-positive and still on their card. An
+    // earlier cut wrote that second case as inline SQL beside this helper,
+    // which left `NeverTrue` unconstructed (rustc said so) and re-derived
+    // the exact thing the doc above warns against.
+    let live_only = matches!(how, Retire::Ended);
     let mut stmt = conn.prepare(
         "SELECT uid FROM fact
           WHERE subject_id = ?1 AND predicate = ?2 AND polarity = 'positive'
-            AND valid_to IS NULL AND invalidated_at IS NULL",
+            AND invalidated_at IS NULL
+            AND (?3 = 0 OR valid_to IS NULL)",
     )?;
     let uids: Vec<String> = stmt
-        .query_map(params![node_id, predicate], |r| r.get(0))?
+        .query_map(params![node_id, predicate, live_only as i64], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
     for uid in &uids {
@@ -2217,6 +2250,93 @@ mod tests {
             "a hand-off is not a retraction"
         );
         assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+    }
+
+    /// A task on somebody's card through a CLOSED claim says so on the task.
+    ///
+    /// Otherwise it renders `waiting_on: null`, `about: []` and nothing else
+    /// — a row whose presence has no visible cause, which reads like a bug in
+    /// the filter rather than the feature working. And this is the case the
+    /// filter exists for: before `about`, a closed `waiting_on` was the only
+    /// reason a finished task appeared under anyone.
+    #[test]
+    fn a_closed_claim_explains_itself_on_the_task() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap();
+        set_task_status(&conn, &id, "done").unwrap();
+
+        let found = tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].waiting_on, None, "nobody owes a finished task");
+        assert!(
+            found[0].about.is_empty(),
+            "and it was never filed under her"
+        );
+        assert_eq!(
+            found[0].previously_waiting_on,
+            vec!["Nadia".to_string()],
+            "so this is the only thing that says why it is on her card"
+        );
+
+        // A RETRACTED claim must not reappear here — the correction removed
+        // her from the card, and naming her would put her back on it.
+        let other = create_task(&conn, "Book the venue", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &other, "Nadia").unwrap();
+        set_task_waiting_on(&conn, &other, "").unwrap();
+        assert!(
+            list_tasks(&conn, true)
+                .unwrap()
+                .iter()
+                .find(|t| t.node_id == other)
+                .unwrap()
+                .previously_waiting_on
+                .is_empty(),
+            "a retraction is not a history"
+        );
+    }
+
+    /// An unreadable date says so on the task, not on a stream nobody reads.
+    #[test]
+    fn an_unreadable_when_is_recorded_where_the_accepter_will_see_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let propose = |when: &str| {
+            conn.execute(
+                "INSERT INTO fact_candidate (payload, status, proposed_by)
+                 VALUES (?1, 'proposed', 'llm')",
+                params![serde_json::json!({
+                    "kind": "commitment", "what": format!("thing {when}"),
+                    "who": "Nadia", "when": when, "direction": "owed_to_me",
+                })
+                .to_string()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let junk = crate::extract::accept_commitment(&conn, propose("sometime soon")).unwrap();
+        let fine = crate::extract::accept_commitment(&conn, propose("2026-09-15")).unwrap();
+
+        let by_id = |id: &str| {
+            list_tasks(&conn, true)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.node_id == id)
+                .unwrap()
+        };
+        let bad = by_id(&junk);
+        assert_eq!(bad.due_at, None, "no date was stored");
+        let note = bad.unreadable_when.expect("and the task says why");
+        assert!(
+            note.contains("sometime soon"),
+            "quoting what arrived: {note}"
+        );
+        assert_eq!(
+            by_id(&fine).unreadable_when,
+            None,
+            "a task with a readable date carries no complaint"
+        );
     }
 
     /// A retracted claim is gone from the bi-temporal record too, not just
