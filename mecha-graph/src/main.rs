@@ -2245,9 +2245,44 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         }
         Command::RepairDates { apply } => {
             let report = gtd::repair_unparseable_dates(&conn, apply)?;
+            // Second class, same command: not a malformed value but a
+            // well-formed one in the wrong column — a due date standing in
+            // for a valid time. Reported separately because the remedy is
+            // different (rewrite to the episode's time, not null).
+            let (conflated, corrected) = gtd::repair_commitment_valid_from(&conn, apply)?;
             if want_json(cli_json, cli_text) {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else if report.found.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "unparseable": report,
+                        "due_date_as_valid_time": {
+                            "found": conflated, "corrected": corrected
+                        }
+                    }))?
+                );
+                return Ok(());
+            }
+            if !conflated.is_empty() {
+                println!(
+                    "{} commitment fact(s) hold a DUE date in `valid_from` where the \
+                     episode's time belongs:",
+                    conflated.len()
+                );
+                for c in &conflated {
+                    println!(
+                        "  {}  valid_from {} -> {}",
+                        &c.statement[..70.min(c.statement.len())],
+                        c.valid_from,
+                        c.occurred_at
+                    );
+                }
+                if apply {
+                    println!("corrected {corrected}\n");
+                } else {
+                    println!("dry run — re-run with --apply to correct them\n");
+                }
+            }
+            if report.found.is_empty() {
                 println!("no malformed dates");
             } else {
                 for b in &report.found {

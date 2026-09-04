@@ -375,6 +375,71 @@ pub fn repair_unparseable_dates(conn: &Connection, apply: bool) -> Result<DateRe
     Ok(report)
 }
 
+/// A commitment fact whose `valid_from` holds the task's deadline instead of
+/// the moment the commitment was made.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflatedDate {
+    pub fact_uid: String,
+    pub statement: String,
+    /// What is stored now — the due date.
+    pub valid_from: String,
+    /// What it should be: the episode's `occurred_at`.
+    pub occurred_at: String,
+}
+
+/// Find (and optionally correct) commitment facts that took a **due date** as
+/// their **valid time**.
+///
+/// The two answer different questions and `accept_commitment` used to pass one
+/// as the other: `when` says when the work is owed, `valid_from` says when the
+/// belief started holding. "X is waiting on Nadia" became true when the
+/// commitment was made — the episode's `occurred_at` — not on the deadline.
+///
+/// `facts_as_of` filters `valid_from <= as_of`, so a commitment accepted in
+/// September and due in December is a belief no as-of query answers until
+/// December: invisible for exactly the months somebody might have wanted
+/// reminding. A past deadline back-dates it to before anyone held it.
+///
+/// Only rows whose episode is still present can be corrected, because the
+/// episode is where the right answer lives. Reports by default, like its
+/// neighbour — this rewrites bi-temporal history, which is not something to
+/// do to a person who ran a survey.
+pub fn repair_commitment_valid_from(
+    conn: &Connection,
+    apply: bool,
+) -> Result<(Vec<ConflatedDate>, usize)> {
+    let mut stmt = conn.prepare(
+        "SELECT f.uid, f.statement, f.valid_from, e.occurred_at
+           FROM fact f JOIN episode e ON e.id = f.episode_id
+          WHERE f.extractor = 'llm:commitment'
+            AND f.valid_from IS NOT NULL
+            AND e.occurred_at IS NOT NULL
+            AND date(f.valid_from) <> date(e.occurred_at)",
+    )?;
+    let rows: Vec<ConflatedDate> = stmt
+        .query_map([], |r| {
+            Ok(ConflatedDate {
+                fact_uid: r.get(0)?,
+                statement: r.get(1)?,
+                valid_from: r.get(2)?,
+                occurred_at: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+
+    let mut fixed = 0usize;
+    if apply {
+        for row in &rows {
+            fixed += conn.execute(
+                "UPDATE fact SET valid_from = ?2 WHERE uid = ?1",
+                params![row.fact_uid, row.occurred_at],
+            )?;
+        }
+    }
+    Ok((rows, fixed))
+}
+
 /// Parse a human due-date: `YYYY-MM-DD`, `today`, `tomorrow`, or `+Nd`.
 /// Returns None for empty input; Err for anything unparseable (better to
 /// bounce the form than silently store garbage in task_detail.due_at).
@@ -2102,6 +2167,158 @@ mod tests {
             "a hand-off is not a retraction"
         );
         assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+    }
+
+    /// A due date and a valid time are different questions, and accepting a
+    /// commitment must not answer one with the other.
+    ///
+    /// `when` says when the work is owed; `valid_from` says when the belief
+    /// started holding, which is when the commitment was made. Passing the
+    /// deadline as the valid time made `facts_as_of` — which filters
+    /// `valid_from <= as_of` — refuse to answer with the obligation until the
+    /// day it came due.
+    #[test]
+    fn a_due_date_is_not_a_valid_time() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let (ep_id, _) = crate::episode::upsert_episode(
+            &conn,
+            &crate::episode::Episode {
+                id: 0,
+                uid: String::new(),
+                source: "agent:mecha".into(),
+                source_id: "sess-commit".into(),
+                source_ref: None,
+                body: "Nadia agreed to send the revised figures by December.".into(),
+                occurred_at: "2026-09-04 10:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: "personal".into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fact_candidate (payload, status, proposed_by, episode_id)
+             VALUES (?1, 'proposed', 'llm', ?2)",
+            params![
+                serde_json::json!({
+                    "kind": "commitment", "what": "Send the revised figures",
+                    "who": "Nadia", "when": "2026-12-01", "direction": "owed_to_me",
+                })
+                .to_string(),
+                ep_id
+            ],
+        )
+        .unwrap();
+        let cid = conn.last_insert_rowid();
+        let task = crate::extract::accept_commitment(&conn, cid).unwrap();
+
+        // The deadline goes where deadlines go.
+        let due: Option<String> = conn
+            .query_row(
+                "SELECT due_at FROM task_detail WHERE node_id = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            due.as_deref(),
+            Some("2026-12-01"),
+            "the task is due in December"
+        );
+
+        // The belief started when the commitment was made, not in December.
+        let mut stmt = conn
+            .prepare("SELECT predicate, valid_from FROM fact WHERE subject_id = ?1")
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(params![task], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!rows.is_empty(), "the accept asserts facts at all");
+        for (predicate, valid_from) in &rows {
+            let vf = valid_from.as_deref().unwrap_or_default();
+            assert!(
+                vf.starts_with("2026-09-04"),
+                "{predicate} should hold from the episode's time, got {vf:?}"
+            );
+            assert!(
+                !vf.starts_with("2026-12"),
+                "{predicate} must not take the deadline as its valid time"
+            );
+        }
+
+        // ...so an as-of query today answers with the obligation, rather than
+        // hiding it until it is already due.
+        let today = crate::fact::facts_as_of(&conn, "p-nadia", "2026-09-05", 10).unwrap();
+        assert!(
+            today.iter().any(|f| f.predicate == "waiting_on"),
+            "an obligation is visible while it is still outstanding"
+        );
+
+        // And the repair finds nothing to do, because the writer is right.
+        let (conflated, _) = repair_commitment_valid_from(&conn, false).unwrap();
+        assert!(conflated.is_empty());
+    }
+
+    /// The repair rewrites a deadline that was stored as a valid time, and
+    /// reports before it writes.
+    #[test]
+    fn the_repair_puts_a_misfiled_deadline_back() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let (ep_id, _) = crate::episode::upsert_episode(
+            &conn,
+            &crate::episode::Episode {
+                id: 0,
+                uid: String::new(),
+                source: "agent:mecha".into(),
+                source_id: "sess-old".into(),
+                source_ref: None,
+                body: "An older commitment.".into(),
+                occurred_at: "2026-09-04 10:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: "personal".into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            },
+        )
+        .unwrap();
+        // What the old writer produced: the deadline in the valid-time column.
+        crate::fact::assert_fact(
+            &conn,
+            "p-nadia",
+            "waiting_on",
+            None,
+            Some("x"),
+            "an old commitment belief",
+            Some(ep_id),
+            Some("2026-12-01"),
+            0.8,
+            "llm:commitment",
+        )
+        .unwrap();
+
+        let (found, fixed) = repair_commitment_valid_from(&conn, false).unwrap();
+        assert_eq!(found.len(), 1, "the survey sees it");
+        assert_eq!(fixed, 0, "and does not write");
+
+        let (_, fixed) = repair_commitment_valid_from(&conn, true).unwrap();
+        assert_eq!(fixed, 1);
+        let (after, _) = repair_commitment_valid_from(&conn, false).unwrap();
+        assert!(after.is_empty(), "and it is idempotent");
     }
 
     /// Correcting a mis-set `waiting_on` by naming the right person, then

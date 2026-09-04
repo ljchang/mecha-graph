@@ -76,6 +76,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without closing this would have made the repair a treadmill: idempotent in
   its own test, dirty again by morning.
 
+- **A due date is no longer stored as a valid time.** `accept_commitment`
+  passed the commitment's `when` to three columns: `task_detail.due_at`,
+  where it belongs, and the `valid_from` of both facts it asserts, where it
+  does not. `when` says when the work is *owed*; `valid_from` says when the
+  belief became *true in the world*, and "X is waiting on Nadia" became true
+  when the commitment was made — the episode's `occurred_at`, which the same
+  file already uses correctly for ordinary extracted facts.
+
+  Not cosmetic: `facts_as_of` filters `valid_from <= as_of`, so a commitment
+  accepted in September and due in December was a belief no as-of query would
+  answer until December — invisible for exactly the months somebody might
+  have wanted reminding of it. A past deadline back-dated the belief to
+  before anyone held it. `repair-dates` now finds and corrects rows already
+  written that way, rewriting `valid_from` to the episode's time rather than
+  nulling it, and reports before it writes.
+
 - **A model's `when` is parsed before it is stored.** `accept_commitment`
   wrote the extractor's raw string into three date columns —
   `task_detail.due_at` and the `valid_from` of both facts it asserts. A

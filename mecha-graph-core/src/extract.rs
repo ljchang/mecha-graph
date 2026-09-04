@@ -642,7 +642,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     // every caller, and the accept returns only a task id, so the drop was
     // invisible at the surface as well as in the row.
     let when_raw = p["when"].as_str().map(str::trim).filter(|s| !s.is_empty());
-    let when_owned = match when_raw {
+    let due_owned = match when_raw {
         Some(raw) => match crate::gtd::parse_due(raw) {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -656,7 +656,46 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
         },
         None => None,
     };
-    let when = when_owned.as_deref();
+    /// **A due date is not a valid time, and this function used to pass one
+    /// as the other.**
+    ///
+    /// `when` says when the work is *owed*. `valid_from` says when the belief
+    /// became *true in the world* — and "X is waiting on Nadia" became true
+    /// when the commitment was made, which is the episode's `occurred_at`,
+    /// not the deadline. The same file gets this right 130 lines up, where
+    /// ordinary extracted facts take `valid_from: Some(occurred_at)`.
+    ///
+    /// The consequence was not cosmetic. `facts_as_of` filters
+    /// `valid_from <= as_of`, so a commitment accepted in September and due
+    /// in December wrote a belief that no as-of query would answer until
+    /// December — the obligation was invisible for exactly the months during
+    /// which somebody might have wanted to be reminded of it. A deadline in
+    /// the past had the mirror problem, back-dating the belief to before
+    /// anyone held it.
+    ///
+    /// Two dates, two columns, and nothing reads across: `due_at` is the
+    /// deadline, `valid_from` is when the claim started holding.
+    fn commitment_valid_from(conn: &Connection, episode_id: Option<i64>) -> Result<Option<String>> {
+        match episode_id {
+            Some(eid) => Ok(conn
+                .query_row(
+                    "SELECT occurred_at FROM episode WHERE id = ?1",
+                    params![eid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()),
+            // No episode to date it from. `assert_fact` records `ingested_at`
+            // regardless, so system time is not lost — this only declines to
+            // invent a valid time, which is the honest answer rather than
+            // borrowing the deadline because it happens to be a date.
+            None => Ok(None),
+        }
+    }
+    let valid_from_owned = commitment_valid_from(conn, episode_id)?;
+
+    let due = due_owned.as_deref();
+    let valid_from = valid_from_owned.as_deref();
 
     let task_id = format!("task-{}", uuid_suffix());
     let mut task = graph::Node::new(&task_id, "task", what);
@@ -669,7 +708,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
             task_id,
             if owed_to_me { "waiting" } else { "next" },
             if owed_to_me { "waiting" } else { "action" },
-            when
+            due
         ],
     )?;
 
@@ -684,7 +723,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
                 None,
                 &format!("\"{what}\" is waiting on {}", person.name),
                 episode_id,
-                when,
+                valid_from,
                 0.8,
                 "llm:commitment",
             )?;
@@ -704,7 +743,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
             Some(&ep_uid),
             &format!("Task \"{what}\" originated in episode {ep_uid}"),
             Some(ep_id),
-            when,
+            valid_from,
             0.9,
             "llm:commitment",
         )?;
