@@ -814,22 +814,27 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // hand-off chain retracts the whole chain rather than the last link. Both
     // are rarer than a mis-set name, and a wrong claim about a real person
     // that no command can remove is the worse failure.
-    let clearing = target.is_none();
-    if clearing {
-        conn.execute(
-            "UPDATE fact SET invalidated_at = datetime('now')
+    if target.is_none() {
+        // A clear reaches rows that are already CLOSED as well as live ones,
+        // which `retire_task_facts` deliberately does not — its `WHERE` is
+        // the live set, because every other caller means "stop what is
+        // currently true". Correcting a name means reaching back past a
+        // hand-off, so those uids are collected separately and retracted
+        // through the same primitive.
+        let mut stmt = conn.prepare(
+            "SELECT uid FROM fact
               WHERE subject_id = ?1 AND predicate = 'waiting_on'
                 AND polarity = 'positive' AND invalidated_at IS NULL",
-            params![node_id],
         )?;
+        let uids: Vec<String> = stmt
+            .query_map(params![node_id], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        for uid in &uids {
+            crate::fact::invalidate_never_true(conn, uid)?;
+        }
     } else {
-        conn.execute(
-            "UPDATE fact SET valid_to = datetime('now')
-              WHERE subject_id = ?1 AND predicate = 'waiting_on'
-                AND polarity = 'positive'
-                AND valid_to IS NULL AND invalidated_at IS NULL",
-            params![node_id],
-        )?;
+        retire_task_facts(conn, node_id, "waiting_on", Retire::Ended)?;
     }
 
     let Some(target) = target else {
@@ -1163,6 +1168,52 @@ pub fn task_about(conn: &Connection, node_id: &str) -> Result<Vec<(String, Strin
     Ok(rows)
 }
 
+/// How a task's association stops applying.
+#[derive(Debug, Clone, Copy)]
+enum Retire {
+    /// True then, false now — the work finished, or the ball moved on.
+    Ended,
+    /// It should not have been said. Retracts.
+    NeverTrue,
+}
+
+/// Retire a task's live facts for one predicate, **through the shared
+/// primitives** rather than with SQL of our own.
+///
+/// Four hand-written `UPDATE fact SET …` statements had accumulated here,
+/// and one of them was wrong in a way that only the primitive knows about:
+/// `facts_as_of` filters on valid time ALONE and never reads
+/// `invalidated_at`, so setting that column by itself retracts a claim from
+/// every live surface while leaving it answering every as-of date before
+/// now. `invalidate_never_true` exists because of that, and collapses valid
+/// time to a zero-length window as well. Re-deriving a primitive's SQL is
+/// how you get its `WHERE` clause and miss its reasoning.
+fn retire_task_facts(
+    conn: &Connection,
+    node_id: &str,
+    predicate: &str,
+    how: Retire,
+) -> Result<usize> {
+    // Positive only, on every path: a live negative is a recorded denial,
+    // and none of these operations is a licence to retract one.
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM fact
+          WHERE subject_id = ?1 AND predicate = ?2 AND polarity = 'positive'
+            AND valid_to IS NULL AND invalidated_at IS NULL",
+    )?;
+    let uids: Vec<String> = stmt
+        .query_map(params![node_id, predicate], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    for uid in &uids {
+        match how {
+            Retire::Ended => crate::fact::close_valid_time(conn, uid, None)?,
+            Retire::NeverTrue => crate::fact::invalidate_never_true(conn, uid)?,
+        }
+    }
+    Ok(uids.len())
+}
+
 /// Guard shared by every task mutator: the id must actually be a task.
 ///
 /// Factored out of [`set_task_waiting_on`], which had it inline. Two copies
@@ -1217,16 +1268,15 @@ pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     if matches!(status, "done" | "dropped") {
-        conn.execute(
+        retire_task_facts(
+            conn,
             // Positive only, same reason as `remove_task_about`: a live
             // negative `waiting_on` is a recorded denial that nobody owes
             // this, and finishing the task does not make that denial stop
             // being true.
-            "UPDATE fact SET valid_to = datetime('now')
-              WHERE subject_id = ?1 AND predicate = 'waiting_on'
-                AND polarity = 'positive'
-                AND valid_to IS NULL AND invalidated_at IS NULL",
-            params![node_id],
+            node_id,
+            "waiting_on",
+            Retire::Ended,
         )?;
     }
     Ok(())
@@ -2167,6 +2217,44 @@ mod tests {
             "a hand-off is not a retraction"
         );
         assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+    }
+
+    /// A retracted claim is gone from the bi-temporal record too, not just
+    /// from the live one.
+    ///
+    /// `facts_as_of` filters on valid time ALONE — it never reads
+    /// `invalidated_at`, deliberately, because supersession sets both
+    /// timelines. So retracting by setting that column by itself removes the
+    /// claim from every live surface while leaving it answering every as-of
+    /// date before now: the person is off her board and still on her
+    /// timeline. `invalidate_never_true` collapses valid time to a
+    /// zero-length window for exactly this reason, and hand-written SQL that
+    /// reproduces its `WHERE` clause does not reproduce its reasoning.
+    #[test]
+    fn clearing_a_claim_removes_it_from_as_of_queries_too() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap();
+
+        let seen_before = crate::fact::facts_as_of(&conn, "p-nadia", "2099-01-01", 10).unwrap();
+        assert!(
+            seen_before.iter().any(|f| f.predicate == "waiting_on"),
+            "non-vacuous: the claim is on her timeline to begin with"
+        );
+
+        set_task_waiting_on(&conn, &id, "").unwrap();
+
+        assert!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().is_empty(),
+            "gone from the board"
+        );
+        let after = crate::fact::facts_as_of(&conn, "p-nadia", "2099-01-01", 10).unwrap();
+        assert!(
+            !after.iter().any(|f| f.predicate == "waiting_on"),
+            "and gone from the timeline — a retraction that only hides it \
+             from live reads is half a retraction"
+        );
     }
 
     /// A due date and a valid time are different questions, and accepting a
