@@ -637,8 +637,25 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     // against *now*, not against the episode the commitment came from, so a
     // relative date accepted late lands late. Still strictly better than
     // storing the word, and it keeps one date parser rather than two.
-    let when_raw = p["when"].as_str();
-    let when_owned = when_raw.and_then(|raw| crate::gtd::parse_due(raw).ok().flatten());
+    // Reported, not merely swallowed. `.ok().flatten()` alone made "the model
+    // gave no date" and "the model gave something unreadable" identical to
+    // every caller, and the accept returns only a task id, so the drop was
+    // invisible at the surface as well as in the row.
+    let when_raw = p["when"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let when_owned = match when_raw {
+        Some(raw) => match crate::gtd::parse_due(raw) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!(
+                    "accept_commitment: candidate {candidate_id}: unreadable `when` \
+                     {raw:?} dropped ({e}); the task is created without a due date \
+                     and the candidate payload keeps the original"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let when = when_owned.as_deref();
 
     let task_id = format!("task-{}", uuid_suffix());

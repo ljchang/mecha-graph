@@ -539,7 +539,10 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
 
     let node = matches.remove(0);
     graph::increment_node_access(conn, &node.id)?;
-    let facts: Vec<Value> = fact::facts_for_node(conn, &node.id, 25)?
+    // The variant that drops task associations, because this response is the
+    // one surface that serves them properly, in its own `tasks` block below.
+    // Every other caller of `facts_for_node` still sees them.
+    let facts: Vec<Value> = fact::facts_for_node_without_task_links(conn, &node.id, 25)?
         .into_iter()
         .map(|f| {
             json!({
@@ -1838,7 +1841,10 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(name) => Some(graph::resolve_entity(conn, name)?.ok_or_else(|| {
+        // `gtd::resolve_about`, not `resolve_entity`: the sentinel writes but
+        // did not read, so `entity: "@owner"` failed with "no node matches"
+        // on a graph that has one.
+        Some(name) => Some(gtd::resolve_about(conn, name)?.ok_or_else(|| {
             mecha_graph_core::Error::Other(format!(
                 "no node matches '{name}' — kg_entity resolves names, and \
                  an unknown one is not an empty task list"

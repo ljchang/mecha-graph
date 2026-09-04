@@ -688,11 +688,33 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // happened. `polarity = 'positive'` for the same reason as the other two
     // closes: a live negative is a recorded denial, and reassignment is not
     // this function's licence to retract it.
+    // **Clearing is editorial; re-pointing is temporal.** `waiting_on: ""`
+    // is the only way to undo a wrongly-set claim, and there is no other
+    // route to it — `about_remove` cannot reach this predicate. Closing it in
+    // valid time like a reassignment would leave the task on that person's
+    // board and card permanently, with no correction available, which is the
+    // same defect an explicit `remove_task_about` was fixed for one predicate
+    // over. So a clear retracts (`invalidated_at`) and a hand-off closes
+    // (`valid_to`).
+    //
+    // The cost, stated rather than discovered: "they held it, then nobody
+    // did" is recorded as if they never held it. That case is rare — work
+    // normally completes or moves, and both of those keep their history —
+    // whereas a mis-set name is ordinary, and leaving it uncorrectable is
+    // worse than losing a rare true history.
+    let clearing = target.is_none();
+    let close_column = if clearing {
+        "invalidated_at"
+    } else {
+        "valid_to"
+    };
     conn.execute(
-        "UPDATE fact SET valid_to = datetime('now')
-          WHERE subject_id = ?1 AND predicate = 'waiting_on'
-            AND polarity = 'positive'
-            AND valid_to IS NULL AND invalidated_at IS NULL",
+        &format!(
+            "UPDATE fact SET {close_column} = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                AND polarity = 'positive'
+                AND valid_to IS NULL AND invalidated_at IS NULL"
+        ),
         params![node_id],
     )?;
 
@@ -830,12 +852,17 @@ pub struct TaskScanReport {
     /// per-pair guard decides what to propose, so a task already filed under
     /// a project is still read in case a second entity now matches.
     pub scanned: usize,
-    /// Associations proposed and minted live at tier `shadow`.
+    /// Associations that would be (or were) minted live at tier `shadow`.
+    /// Counted identically on a survey and an apply, so the dry run's number
+    /// is the one the apply produces.
     pub minted: usize,
     /// Strong matches already asserted; the scan is re-runnable.
     pub already: usize,
     /// Weak matches (a bare first name) refused for want of corroboration.
     pub refused_weak: usize,
+    /// The `limit` stopped the pass before it ran out of matches, so
+    /// `minted` is a floor rather than the total.
+    pub capped: bool,
 }
 
 /// Scan task titles for entities the graph already knows, and mint the
@@ -858,7 +885,19 @@ pub struct TaskScanReport {
 ///
 /// Tasks are excluded as *targets*: their names live in `nodes` like any
 /// other, so without this every task links to every task sharing a word.
-pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
+/// `apply = false` surveys without writing; `limit` caps how many
+/// associations one pass will mint (0 = no cap).
+///
+/// Both borrowed from the two neighbours that already had them —
+/// [`repair_unparseable_dates`]'s opt-in and `convert_pending_to_shadow`'s
+/// bound. Without either, one invocation mints every matching pair on the
+/// graph as a live shadow fact and reports the counts afterwards, which is
+/// the wrong order for a command whose output a human is meant to judge.
+pub fn propose_task_entities(
+    conn: &Connection,
+    apply: bool,
+    limit: usize,
+) -> Result<TaskScanReport> {
     let mut report = TaskScanReport::default();
     let pairs = crate::episode::alias_pairs(conn)?;
 
@@ -939,6 +978,17 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
                 report.already += 1;
                 continue;
             }
+            // Counted whether or not it is written, so the survey's number is
+            // the number the apply will produce.
+            report.minted += 1;
+            if !apply {
+                continue;
+            }
+            if limit > 0 && report.minted > limit {
+                report.minted -= 1;
+                report.capped = true;
+                return Ok(report);
+            }
             let proposed = crate::fact::ProposedFact {
                 subject: task_name.clone(),
                 predicate: "about".into(),
@@ -957,7 +1007,6 @@ pub fn propose_task_entities(conn: &Connection) -> Result<TaskScanReport> {
             };
             let cid = crate::fact::propose_fact(conn, &proposed, "linker:task-title", None)?;
             crate::fact::mint_shadow_candidate(conn, cid)?;
-            report.minted += 1;
         }
     }
     Ok(report)
@@ -1770,7 +1819,7 @@ mod tests {
         let weak = create_task(&conn, "Call wren about the forms", None, None, None).unwrap();
         create_task(&conn, "Renew the parking permit", None, None, None).unwrap();
 
-        let report = propose_task_entities(&conn).unwrap();
+        let report = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(report.scanned, 3);
         assert_eq!(
             report.minted, 1,
@@ -1805,7 +1854,7 @@ mod tests {
         // not as a claim about a schedule: nothing wires `scan-tasks` into
         // `scripts/nightly.sh` today, and whether it belongs there is a
         // separate decision from whether repeating it is safe.
-        let again = propose_task_entities(&conn).unwrap();
+        let again = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(again.minted, 0, "already-associated tasks are skipped");
     }
 
@@ -1943,6 +1992,70 @@ mod tests {
         assert_eq!(found[0].node_id, finished);
     }
 
+    /// Clearing `waiting_on` is the correction path, so it must actually
+    /// correct — while handing the task on must not.
+    ///
+    /// Both write through the same function and used to write the same close,
+    /// so a wrongly-set name left the task on that person's board with no way
+    /// to get it off: `about_remove` cannot reach this predicate, and nothing
+    /// else clears it.
+    #[test]
+    fn clearing_waiting_on_retracts_but_handing_it_on_does_not() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+
+        // Set in error, then cleared: it should be as if it never was.
+        let mistake = create_task(&conn, "Book the venue", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &mistake, "Nadia").unwrap();
+        assert_eq!(tasks_for_entity(&conn, "p-nadia", true).unwrap().len(), 1);
+        set_task_waiting_on(&conn, &mistake, "").unwrap();
+        assert!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().is_empty(),
+            "clearing a wrongly-set claim has to be able to undo it"
+        );
+
+        // Handed on: she did hold it, and history keeps that.
+        let handed = create_task(&conn, "Collect the forms", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &handed, "Nadia").unwrap();
+        set_task_waiting_on(&conn, &handed, "Wren").unwrap();
+        assert_eq!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().len(),
+            1,
+            "a hand-off is not a retraction"
+        );
+        assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+    }
+
+    /// The scan surveys before it writes, and the survey's count is the
+    /// apply's count.
+    #[test]
+    fn the_scan_is_dry_by_default_and_bounded_when_asked() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        upsert_node(&conn, &Node::new("proj-flow", "project", "Flowmail")).unwrap();
+        create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        create_task(&conn, "Fix the Flowmail sync", None, None, None).unwrap();
+
+        let dry = propose_task_entities(&conn, false, 0).unwrap();
+        assert_eq!(dry.minted, 2, "the survey counts what an apply would write");
+        assert!(
+            list_tasks(&conn, true)
+                .unwrap()
+                .iter()
+                .all(|t| t.about.is_empty()),
+            "and writes none of it"
+        );
+
+        let capped = propose_task_entities(&conn, true, 1).unwrap();
+        assert_eq!(capped.minted, 1);
+        assert!(capped.capped, "a bounded pass says it stopped early");
+
+        let rest = propose_task_entities(&conn, true, 0).unwrap();
+        assert_eq!(rest.minted, 1, "the second pass finishes the job");
+        assert!(!rest.capped);
+    }
+
     /// Handing a task on keeps it on the board of whoever had it before.
     ///
     /// Reassignment used to invalidate — "never true" — so a task passed from
@@ -1998,13 +2111,13 @@ mod tests {
         let b = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
         assert_ne!(a, b, "two distinct tasks that happen to read the same");
 
-        let report = propose_task_entities(&conn).unwrap();
+        let report = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(report.minted, 2, "one association each");
         assert_eq!(task_about(&conn, &a).unwrap().len(), 1, "the first task");
         assert_eq!(task_about(&conn, &b).unwrap().len(), 1, "and the second");
 
         // And the guard now recognises both, so a re-run is quiet.
-        let again = propose_task_entities(&conn).unwrap();
+        let again = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(again.minted, 0, "no re-mint on the next pass");
         assert_eq!(again.already, 2);
     }
@@ -2123,7 +2236,7 @@ mod tests {
         upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
         let id = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
 
-        assert_eq!(propose_task_entities(&conn).unwrap().minted, 1);
+        assert_eq!(propose_task_entities(&conn, true, 0).unwrap().minted, 1);
 
         // A human says no — the `shadow --refute` path, which retracts as
         // never true rather than closing valid time.
@@ -2135,7 +2248,7 @@ mod tests {
         .unwrap();
         assert!(task_about(&conn, &id).unwrap().is_empty());
 
-        let again = propose_task_entities(&conn).unwrap();
+        let again = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(again.minted, 0, "a refusal is remembered, not re-litigated");
         assert_eq!(
             again.already, 1,
@@ -2150,7 +2263,7 @@ mod tests {
         let other = create_task(&conn, "Tidelab budget review", None, None, None).unwrap();
         add_task_about(&conn, &other, "Tidelab").unwrap();
         remove_task_about(&conn, &other, "Tidelab").unwrap();
-        assert_eq!(propose_task_entities(&conn).unwrap().minted, 0);
+        assert_eq!(propose_task_entities(&conn, true, 0).unwrap().minted, 0);
     }
 
     /// Archived work does not collect fresh unreviewed associations.
@@ -2160,7 +2273,7 @@ mod tests {
         upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
         let id = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
         set_task_status(&conn, &id, "done").unwrap();
-        let report = propose_task_entities(&conn).unwrap();
+        let report = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(report.scanned, 0, "a finished task is not a review target");
         assert_eq!(report.minted, 0);
     }
@@ -2173,7 +2286,7 @@ mod tests {
         let conn = open_memory().unwrap();
         create_task(&conn, "Review the Tidelab budget", None, None, None).unwrap();
         create_task(&conn, "Review the Tidelab budget again", None, None, None).unwrap();
-        let report = propose_task_entities(&conn).unwrap();
+        let report = propose_task_entities(&conn, true, 0).unwrap();
         assert_eq!(
             report.minted, 0,
             "tasks are not entities to file each other under"

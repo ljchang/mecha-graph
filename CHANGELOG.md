@@ -37,9 +37,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nodes are excluded as targets, or every task files itself under every task
   sharing a word. Rejection memory keys on whether the pair was ever
   asserted in any state, so a refuted association is not re-minted nightly.
+  Dry by default (`--apply` writes, `--limit` bounds a pass), because a
+  command whose output a human is meant to judge should not have written
+  everything before it prints the count.
 
 - **`mecha-graph repair-dates`** finds date columns holding text that is not
   a date, and clears them with `--apply`. Reports by default.
+
+### Changed (beyond the task board)
+
+- **Accepting a candidate now honours `subject_node`/`object_node`.**
+  `resolve_candidate_parts` re-resolved both endpoints from the display
+  strings and never read the ids, so producers that derived a pair *from
+  nodes* — `linkers` and `rules` have been setting these fields all along —
+  had that thrown away at accept time, and two same-named entities collapsed
+  onto whichever the lookup returned first. An explicit id now wins, falling
+  back to the name when the id no longer resolves (a merge deletes the losing
+  row, so the name is still reachable). This changes what accepting an
+  already-queued kNN or rule candidate resolves to.
 
 ### Changed
 

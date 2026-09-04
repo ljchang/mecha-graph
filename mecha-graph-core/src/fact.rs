@@ -1059,18 +1059,47 @@ pub fn get_fact_by_uid(conn: &Connection, uid: &str) -> Result<Option<Fact>> {
 /// block, with status and dates a fact statement cannot carry, and by
 /// `kg_task_list` with `entity` in full.
 pub fn facts_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result<Vec<Fact>> {
+    facts_for_node_opts(conn, node_id, limit, false)
+}
+
+/// [`facts_for_node`], minus the task associations pointing AT this node.
+///
+/// **Opt-in, because the exclusion is only safe where something replaces it.**
+/// A first cut applied it inside `facts_for_node` itself, which silently took
+/// `waiting_on` off four other surfaces that have no `tasks` block to
+/// compensate — the context pack, the scope summaries behind the `MEMORY.md`
+/// boot digest, the TUI entity screen and `mecha-graph entity`. `about` was
+/// new so nothing regressed there, but a live "X is waiting on her" had been
+/// on those surfaces all along, and afterwards it was on none of them with
+/// nothing else saying she owed it. A fix for one caller's crowding is not a
+/// licence to change what every other caller is told.
+pub fn facts_for_node_without_task_links(
+    conn: &Connection,
+    node_id: &str,
+    limit: i64,
+) -> Result<Vec<Fact>> {
+    facts_for_node_opts(conn, node_id, limit, true)
+}
+
+fn facts_for_node_opts(
+    conn: &Connection,
+    node_id: &str,
+    limit: i64,
+    drop_task_links: bool,
+) -> Result<Vec<Fact>> {
     let mut stmt = conn.prepare_cached(
         "SELECT f.* FROM fact f
          WHERE (f.subject_id = ?1 OR f.object_id = ?1)
            AND f.valid_to IS NULL AND f.invalidated_at IS NULL
-           AND NOT (f.object_id = ?1
+           AND NOT (?3
+                    AND f.object_id = ?1
                     AND f.predicate IN ('about','waiting_on','assigned_to')
                     AND EXISTS (SELECT 1 FROM task_detail td
                                 WHERE td.node_id = f.subject_id))
          ORDER BY f.weight DESC, f.observation_count DESC, f.ingested_at DESC LIMIT ?2",
     )?;
     let facts = stmt
-        .query_map(params![node_id, limit], row_to_fact)?
+        .query_map(params![node_id, limit, drop_task_links], row_to_fact)?
         .collect::<std::result::Result<_, _>>()?;
     Ok(facts)
 }

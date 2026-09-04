@@ -811,8 +811,15 @@ enum Command {
         entity: Option<String>,
     },
     /// Scan task titles for entities the graph already knows, filing matches
-    /// as unreviewed (`shadow`) `about` associations
-    ScanTasks,
+    /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
+    ScanTasks {
+        /// Actually mint the associations; omit to survey only
+        #[arg(long)]
+        apply: bool,
+        /// Stop after this many associations (0 = no cap)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
     /// Report date columns holding text that is not a date (a model's `when`
     /// written verbatim). Dry unless --apply, which nulls them
     RepairDates {
@@ -2256,21 +2263,27 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
             }
         }
-        Command::ScanTasks => {
-            let report = gtd::propose_task_entities(&conn)?;
+        Command::ScanTasks { apply, limit } => {
+            let report = gtd::propose_task_entities(&conn, apply, limit)?;
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
+                let verb = if apply { "filed as shadow" } else { "to file" };
                 println!(
-                    "scanned {} open task(s): {} association(s) filed as shadow, \
-                     {} already live, {} weak first-name match(es) refused",
+                    "scanned {} open task(s): {} association(s) {verb}, \
+                     {} already known, {} weak first-name match(es) refused",
                     report.scanned, report.minted, report.already, report.refused_weak
                 );
-                if report.minted > 0 {
+                if report.capped {
+                    println!("stopped at --limit {limit}; re-run to continue");
+                }
+                if report.minted > 0 && apply {
                     println!(
                         "these are UNREVIEWED — they earn a verdict when a query serves one \
                          (`mecha-graph shadow`)"
                     );
+                } else if report.minted > 0 {
+                    println!("dry run — re-run with --apply to file them");
                 }
             }
         }
@@ -2279,7 +2292,8 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             // which reads as "this person has no tasks".
             let tasks = match entity.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(name) => {
-                    let node = graph::resolve_entity(&conn, name)?.ok_or_else(|| {
+                    // `resolve_about` so `--entity @owner` works here too.
+                    let node = gtd::resolve_about(&conn, name)?.ok_or_else(|| {
                         mecha_graph_core::Error::Other(format!("no node matches '{name}'"))
                     })?;
                     gtd::tasks_for_entity(&conn, &node.id, all)?
