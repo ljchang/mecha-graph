@@ -1653,25 +1653,46 @@ fn resolve_candidate_parts(
             "candidate {candidate_id} has no subject — bind one (review `b`/edit) before accepting"
         )));
     }
-    let subject = match crate::graph::resolve_entity(conn, &proposed.subject)? {
-        Some(node) => node,
-        None if create_missing_subject && !proposed.subject.trim().is_empty() => {
-            let id = format!("topic-{}", crate::ids::new_uid());
-            let mut node = crate::graph::Node::new(&id, "topic", proposed.subject.trim());
-            node.source = "review".into();
-            crate::graph::upsert_node(conn, &node)?;
-            crate::graph::get_node(conn, &id)?.expect("just created")
-        }
-        None => {
-            return Err(Error::Other(format!(
-                "cannot resolve subject '{}'",
-                proposed.subject
-            )))
+    // **An explicit node id beats a name lookup.** `subject_node`/`object_node`
+    // are set only by producers that derived the pair FROM nodes, so when one
+    // is present the producer is not describing an entity, it is naming one —
+    // and re-deriving it from the display name throws that away. Names are not
+    // unique, which is the whole reason these fields exist: two open tasks
+    // with the same title both resolve to whichever the lookup returns first,
+    // so one of them silently acquires the other's facts and the second gets
+    // none. A stale id (its node merged away) falls back to the name rather
+    // than failing, since a merge leaves the name resolvable.
+    let by_id = |id: &Option<String>| -> Result<Option<crate::graph::Node>> {
+        match id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => crate::graph::get_node(conn, id),
+            None => Ok(None),
         }
     };
-    let object_node = match &proposed.object {
-        Some(o) => crate::graph::resolve_entity(conn, o)?,
-        None => None,
+    let subject = match by_id(&proposed.subject_node)? {
+        Some(node) => node,
+        None => match crate::graph::resolve_entity(conn, &proposed.subject)? {
+            Some(node) => node,
+            None if create_missing_subject && !proposed.subject.trim().is_empty() => {
+                let id = format!("topic-{}", crate::ids::new_uid());
+                let mut node = crate::graph::Node::new(&id, "topic", proposed.subject.trim());
+                node.source = "review".into();
+                crate::graph::upsert_node(conn, &node)?;
+                crate::graph::get_node(conn, &id)?.expect("just created")
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "cannot resolve subject '{}'",
+                    proposed.subject
+                )))
+            }
+        },
+    };
+    let object_node = match by_id(&proposed.object_node)? {
+        Some(node) => Some(node),
+        None => match &proposed.object {
+            Some(o) => crate::graph::resolve_entity(conn, o)?,
+            None => None,
+        },
     };
     // If an object was named but didn't resolve to a node, keep it as a literal.
     let object_value = match (&proposed.object, &object_node) {

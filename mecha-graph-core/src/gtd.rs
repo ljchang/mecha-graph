@@ -308,6 +308,21 @@ pub fn parse_due(input: &str) -> Result<Option<String>> {
     if s.is_empty() {
         return Ok(None);
     }
+    // An RFC 3339 instant keeps its date half rather than being refused.
+    // The extraction prompt asks for `YYYY-MM-DD`, so this is not the shape
+    // to design around — but a model that answers `2026-09-15T17:00:00Z` is
+    // telling us the day, and rejecting the whole value would make the parse
+    // stricter than the raw write it replaced. Losing the time is a real
+    // narrowing; `due_at` is a date column, and every other writer of it
+    // stores a day.
+    let s = match s.split_once('t') {
+        Some((date, rest))
+            if date.len() == 10 && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
+        {
+            date.to_string()
+        }
+        _ => s,
+    };
     let today = chrono::Utc::now().date_naive();
     let date = if s == "today" {
         today
@@ -675,25 +690,39 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
 /// (subject, predicate, object), so re-adding the same association returns
 /// the existing name rather than failing; a caller re-running a scan should
 /// not have to care.
+/// Resolve an `about` target, honouring the [`OWNER`] sentinel.
+///
+/// One definition, used by add, remove and every guard in front of them —
+/// so a caller cannot be told a name is fine by one and rejected by the
+/// other. `@owner` on a graph with no owner set is an error rather than a
+/// miss, because the two mean different things to the caller.
+pub fn resolve_about(conn: &Connection, what: &str) -> Result<Option<crate::graph::Node>> {
+    let what = what.trim();
+    if what == OWNER {
+        return Ok(Some(crate::graph::owner_node(conn)?.ok_or_else(|| {
+            Error::Other(
+                "this graph has no owner set, so `@owner` names nobody — \
+                 `mecha-graph owner <node>` marks one"
+                    .into(),
+            )
+        })?));
+    }
+    crate::graph::resolve_entity(conn, what)
+}
+
 pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<String> {
     require_task(conn, node_id)?;
     let what = what.trim();
     if what.is_empty() {
         return Err(Error::Other("about needs a name".into()));
     }
-    let target = match what {
-        OWNER => crate::graph::owner_node(conn)?.ok_or_else(|| {
-            Error::Other(
-                "this graph has no owner set, so `@owner` names nobody — \
-                 `mecha-graph owner <node>` marks one"
-                    .into(),
-            )
-        })?,
-        _ => crate::graph::resolve_entity(conn, what)?.ok_or_else(|| {
-            Error::Other(format!(
+    let target = match resolve_about(conn, what)? {
+        Some(node) => node,
+        None => {
+            return Err(Error::Other(format!(
                 "no node matches '{what}' — about must name something the graph already knows"
-            ))
-        })?,
+            )))
+        }
     };
     let task_name: String = conn.query_row(
         "SELECT name FROM nodes WHERE id = ?1",
@@ -729,7 +758,7 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
 /// success for a removal that never happened.
 pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<bool> {
     require_task(conn, node_id)?;
-    let target = crate::graph::resolve_entity(conn, what.trim())?.ok_or_else(|| {
+    let target = resolve_about(conn, what)?.ok_or_else(|| {
         Error::Other(format!(
             "no node matches '{}' — nothing was removed",
             what.trim()
@@ -753,7 +782,9 @@ pub fn remove_task_about(conn: &Connection, node_id: &str, what: &str) -> Result
 /// What one pass of [`propose_task_entities`] did.
 #[derive(Debug, Default, Serialize)]
 pub struct TaskScanReport {
-    /// Tasks examined — those with no `about` association yet.
+    /// Open tasks examined. Every one of them, associated or not — the
+    /// per-pair guard decides what to propose, so a task already filed under
+    /// a project is still read in case a second entity now matches.
     pub scanned: usize,
     /// Associations proposed and minted live at tier `shadow`.
     pub minted: usize,
@@ -1832,6 +1863,55 @@ mod tests {
                 .found
                 .is_empty(),
             "and it is idempotent"
+        );
+    }
+
+    /// Two open tasks with the same title each get their own association.
+    ///
+    /// The shadow mint re-resolved subject and object by NAME, ignoring the
+    /// `subject_node`/`object_node` the scan had set. Two tasks sharing a
+    /// title both landed on whichever node the lookup returned first: one
+    /// collected both associations, the other got none, and because the
+    /// `seen` guard keys on the scan's ids rather than the resolved ones it
+    /// never matched — so every run re-minted, forever. Exactly the failure
+    /// the rejection-memory comment claims to prevent.
+    #[test]
+    fn same_titled_tasks_do_not_collapse_onto_one_node() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let a = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        let b = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        assert_ne!(a, b, "two distinct tasks that happen to read the same");
+
+        let report = propose_task_entities(&conn).unwrap();
+        assert_eq!(report.minted, 2, "one association each");
+        assert_eq!(task_about(&conn, &a).unwrap().len(), 1, "the first task");
+        assert_eq!(task_about(&conn, &b).unwrap().len(), 1, "and the second");
+
+        // And the guard now recognises both, so a re-run is quiet.
+        let again = propose_task_entities(&conn).unwrap();
+        assert_eq!(again.minted, 0, "no re-mint on the next pass");
+        assert_eq!(again.already, 2);
+    }
+
+    /// An RFC 3339 instant keeps its date rather than being thrown away.
+    #[test]
+    fn parse_due_keeps_the_date_half_of_a_timestamp() {
+        assert_eq!(
+            parse_due("2026-09-15T17:00:00Z").unwrap().as_deref(),
+            Some("2026-09-15"),
+            "the one input shape where refusing would lose a real date"
+        );
+        assert_eq!(
+            parse_due("2026-09-15").unwrap().as_deref(),
+            Some("2026-09-15")
+        );
+        // Still not a date, and still refused rather than half-read.
+        assert!(parse_due("null").is_err());
+        assert!(parse_due("sometime").is_err());
+        assert!(
+            parse_due("tomorrowT12").is_err(),
+            "the split is not a licence"
         );
     }
 

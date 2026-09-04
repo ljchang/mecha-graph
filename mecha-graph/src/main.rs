@@ -2262,7 +2262,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "scanned {} unassociated task(s): {} association(s) filed as shadow, \
+                    "scanned {} open task(s): {} association(s) filed as shadow, \
                      {} already live, {} weak first-name match(es) refused",
                     report.scanned, report.minted, report.already, report.refused_weak
                 );

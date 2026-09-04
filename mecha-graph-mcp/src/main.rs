@@ -609,9 +609,15 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         .format("%Y-%m-%d")
         .to_string();
     let all_tasks = gtd::tasks_for_entity(conn, &node.id, true)?;
-    let (closed, open): (Vec<_>, Vec<_>) = all_tasks
+    let (mut closed, open): (Vec<_>, Vec<_>) = all_tasks
         .iter()
         .partition(|t| matches!(t.status.as_str(), "done" | "dropped"));
+    // The board's ordering sorts `due_at` ahead of `completed_at`, which is
+    // right for work you still have to do and wrong for the first caller that
+    // takes a *prefix* of the finished pile: it would keep the 15 with the
+    // earliest deadlines rather than the 15 most recently finished. "What did
+    // we just wrap up" is the only question this half of the block answers.
+    closed.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
     // Capped, like every other block on this card (`facts` 25, `episodes` 8,
     // `context` 1500 tokens). Closed tasks only ever accumulate, and a
     // project node collects every task ever filed under it, so an uncapped
@@ -1696,6 +1702,24 @@ fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
 }
 
+/// Resolve an `about` name the way [`gtd::add_task_about`] will.
+///
+/// Exists because pre-validating with a bare `resolve_entity` made the
+/// `@owner` sentinel unreachable: the writer understands it, the check in
+/// front of the writer did not, so `@owner` was refused before it could get
+/// there — while `waiting_on`'s own tool description advertises it. Two
+/// notions of "can this name be resolved" is how a guard starts rejecting
+/// what the thing it guards would have accepted.
+fn resolve_about_target(
+    conn: &Connection,
+    name: &str,
+) -> mecha_graph_core::Result<Option<mecha_graph_core::graph::Node>> {
+    if name.trim() == gtd::OWNER {
+        return graph::owner_node(conn);
+    }
+    graph::resolve_entity(conn, name.trim())
+}
+
 /// One task as the board renders it. Shared by `kg_task_list` and the
 /// `tasks` block on `kg_entity`, so the two surfaces cannot disagree about
 /// what a task looks like or when one is overdue.
@@ -1763,12 +1787,31 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // spellings — return an error carrying no task id, for a task that now
     // exists. The caller corrects the name, retries, and there are two.
     // Checking first makes the call all-or-nothing.
-    let about_names: Vec<&str> = args["about"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|n| n.as_str()).collect())
-        .unwrap_or_default();
+    // Refused, not filtered. `"about": "Wren"` — a bare string where an array
+    // is specified — is the commonest shape an LLM gets wrong here, and
+    // `filter_map(as_str)` over a non-array yielded an empty list: the task
+    // was created with no associations and the call answered `created`. A
+    // shape error must fail the call, exactly as an unknown name does.
+    let about_names: Vec<String> = match &args["about"] {
+        Value::Null => Vec::new(),
+        Value::Array(a) => a
+            .iter()
+            .map(|n| {
+                n.as_str().map(str::to_string).ok_or_else(|| {
+                    mecha_graph_core::Error::Other(format!(
+                        "`about` takes an array of names, got {n} inside it"
+                    ))
+                })
+            })
+            .collect::<mecha_graph_core::Result<Vec<_>>>()?,
+        other => {
+            return Err(mecha_graph_core::Error::Other(format!(
+                "`about` takes an array of names, got {other} — no task was created"
+            )))
+        }
+    };
     for name in &about_names {
-        if graph::resolve_entity(conn, name.trim())?.is_none() {
+        if resolve_about_target(conn, name)?.is_none() {
             return Err(mecha_graph_core::Error::Other(format!(
                 "no node matches '{name}' — no task was created; \
                  `about` must name something the graph already knows"
@@ -1830,7 +1873,7 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     let to_add = names("about_add")?;
     let to_remove = names("about_remove")?;
     for name in to_add.iter().chain(to_remove.iter()) {
-        if graph::resolve_entity(conn, name.trim())?.is_none() {
+        if resolve_about_target(conn, name)?.is_none() {
             return Err(mecha_graph_core::Error::Other(format!(
                 "no node matches '{name}' — nothing was changed"
             )));
