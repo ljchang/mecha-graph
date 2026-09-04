@@ -1431,6 +1431,81 @@ mod tests {
         assert_eq!(gtd::list_tasks(&conn, true).unwrap().len(), before + 1);
     }
 
+    /// A bare string where an array is specified fails, on both tools.
+    ///
+    /// `as_array()` returns None for it, and a `let … else` turned that into
+    /// an empty list — so the commonest shape mistake here answered
+    /// `created`/`updated` having written nothing.
+    #[test]
+    fn a_bare_string_where_an_array_belongs_is_refused_on_both_tools() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+
+        assert!(
+            kg_task_create(&conn, &json!({ "name": "x", "about": "Nadia" })).is_err(),
+            "create refuses the shape"
+        );
+        assert!(
+            gtd::list_tasks(&conn, true).unwrap().is_empty(),
+            "and writes no task while doing so"
+        );
+
+        let id = kg_task_create(&conn, &json!({ "name": "x" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            kg_task_update(&conn, &json!({ "task": id, "about_add": "Nadia" })).is_err(),
+            "and update refuses it identically"
+        );
+        assert!(gtd::task_about(&conn, &id).unwrap().is_empty());
+
+        // The right shape still works.
+        kg_task_update(&conn, &json!({ "task": id, "about_add": ["Nadia"] })).unwrap();
+        assert_eq!(gtd::task_about(&conn, &id).unwrap().len(), 1);
+    }
+
+    /// A person's `facts` block is about them, not about their to-do list.
+    #[test]
+    fn task_associations_do_not_crowd_the_entity_fact_block() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("org-lab", "org", "The Lab")).unwrap();
+        mecha_graph_core::fact::assert_fact(
+            &conn,
+            "p-nadia",
+            "member_of",
+            Some("org-lab"),
+            None,
+            "Nadia is a member of The Lab",
+            None,
+            None,
+            1.0,
+            "manual",
+        )
+        .unwrap();
+        for i in 0..30 {
+            kg_task_create(
+                &conn,
+                &json!({ "name": format!("task {i}"), "about": ["Nadia"] }),
+            )
+            .unwrap();
+        }
+
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Nadia" })).unwrap();
+        let facts = card["facts"].as_array().unwrap();
+        assert!(
+            facts.iter().all(|f| f["predicate"] != "about"),
+            "30 task associations must not fill a 25-row block"
+        );
+        assert!(
+            facts.iter().any(|f| f["predicate"] == "member_of"),
+            "and the fact that says who she is survives"
+        );
+        // They are not lost — the tasks block is where they belong.
+        assert_eq!(card["tasks"]["open"]["total"], 30);
+    }
+
     /// The card's task block is capped, and says so.
     ///
     /// The block exists because a silent 25-fact cut hid a person's tasks.
@@ -1702,22 +1777,31 @@ fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
 }
 
-/// Resolve an `about` name the way [`gtd::add_task_about`] will.
+/// A list-of-names argument, refused rather than coerced.
 ///
-/// Exists because pre-validating with a bare `resolve_entity` made the
-/// `@owner` sentinel unreachable: the writer understands it, the check in
-/// front of the writer did not, so `@owner` was refused before it could get
-/// there — while `waiting_on`'s own tool description advertises it. Two
-/// notions of "can this name be resolved" is how a guard starts rejecting
-/// what the thing it guards would have accepted.
-fn resolve_about_target(
-    conn: &Connection,
-    name: &str,
-) -> mecha_graph_core::Result<Option<mecha_graph_core::graph::Node>> {
-    if name.trim() == gtd::OWNER {
-        return graph::owner_node(conn);
+/// Absent is an empty list; an array of strings is itself; **anything else is
+/// an error**, including the bare string that an array was specified for.
+/// `as_array()` returning `None` for `"about": "Nadia"` made the commonest
+/// shape mistake here answer `created`/`updated` having written nothing —
+/// once on each of the two tools, because the guard was written at one call
+/// site instead of in one function.
+fn name_array(args: &Value, key: &str) -> mecha_graph_core::Result<Vec<String>> {
+    match &args[key] {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => a
+            .iter()
+            .map(|n| {
+                n.as_str().map(str::to_string).ok_or_else(|| {
+                    mecha_graph_core::Error::Other(format!(
+                        "`{key}` takes an array of names, got {n} inside it"
+                    ))
+                })
+            })
+            .collect(),
+        other => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` takes an array of names, got {other} — nothing was changed"
+        ))),
     }
-    graph::resolve_entity(conn, name.trim())
 }
 
 /// One task as the board renders it. Shared by `kg_task_list` and the
@@ -1787,31 +1871,12 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // spellings — return an error carrying no task id, for a task that now
     // exists. The caller corrects the name, retries, and there are two.
     // Checking first makes the call all-or-nothing.
-    // Refused, not filtered. `"about": "Wren"` — a bare string where an array
-    // is specified — is the commonest shape an LLM gets wrong here, and
-    // `filter_map(as_str)` over a non-array yielded an empty list: the task
-    // was created with no associations and the call answered `created`. A
-    // shape error must fail the call, exactly as an unknown name does.
-    let about_names: Vec<String> = match &args["about"] {
-        Value::Null => Vec::new(),
-        Value::Array(a) => a
-            .iter()
-            .map(|n| {
-                n.as_str().map(str::to_string).ok_or_else(|| {
-                    mecha_graph_core::Error::Other(format!(
-                        "`about` takes an array of names, got {n} inside it"
-                    ))
-                })
-            })
-            .collect::<mecha_graph_core::Result<Vec<_>>>()?,
-        other => {
-            return Err(mecha_graph_core::Error::Other(format!(
-                "`about` takes an array of names, got {other} — no task was created"
-            )))
-        }
-    };
+    // Shape and names both checked before anything is written — see
+    // `name_array`, which is shared with `kg_task_update` so the two tools
+    // cannot disagree about what a list of names is.
+    let about_names = name_array(args, "about")?;
     for name in &about_names {
-        if resolve_about_target(conn, name)?.is_none() {
+        if gtd::resolve_about(conn, name)?.is_none() {
             return Err(mecha_graph_core::Error::Other(format!(
                 "no node matches '{name}' — no task was created; \
                  `about` must name something the graph already knows"
@@ -1858,22 +1923,11 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     //
     // A non-string entry is refused rather than skipped: dropping it silently
     // reports success for a name nobody applied.
-    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> {
-        let Some(arr) = args[key].as_array() else {
-            return Ok(Vec::new());
-        };
-        arr.iter()
-            .map(|n| {
-                n.as_str().map(str::to_string).ok_or_else(|| {
-                    mecha_graph_core::Error::Other(format!("{key} takes strings, got {n}"))
-                })
-            })
-            .collect()
-    };
+    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> { name_array(args, key) };
     let to_add = names("about_add")?;
     let to_remove = names("about_remove")?;
     for name in to_add.iter().chain(to_remove.iter()) {
-        if resolve_about_target(conn, name)?.is_none() {
+        if gtd::resolve_about(conn, name)?.is_none() {
             return Err(mecha_graph_core::Error::Other(format!(
                 "no node matches '{name}' — nothing was changed"
             )));

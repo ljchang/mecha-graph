@@ -1040,12 +1040,34 @@ pub fn get_fact_by_uid(conn: &Connection, uid: &str) -> Result<Option<Fact>> {
 /// 2026-08-13, alongside `hybrid_facts`, which serves negations for the
 /// same reason). Callers that mean "positive beliefs" must say so:
 /// filter on `polarity`, or read `fact_current` directly.
+/// Live facts touching a node, either end, best first.
+///
+/// **Task associations are excluded from the ENTITY's side only** — asking a
+/// task for its own facts still returns its `waiting_on` and `about`, because
+/// there the association is the subject of the question rather than noise
+/// crowding out everything else. The exclusion is what keeps an entity's
+/// block about the entity rather than about its to-do list. `about` is a
+/// permanent live edge whose object is the entity, this query is
+/// bidirectional, and its ordering collapses to newest-first in practice —
+/// nothing writes `weight`, and a fresh fact has `observation_count = 1`. So
+/// a project with 25 associations (which the title scan can produce on its
+/// own, and which nothing ever closes) returned a `facts` block that was
+/// entirely task rows, with `works_on`, `member_of` and every recorded denial
+/// pushed off the bottom silently.
+///
+/// Nothing is lost: the same associations are served by the caller's `tasks`
+/// block, with status and dates a fact statement cannot carry, and by
+/// `kg_task_list` with `entity` in full.
 pub fn facts_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result<Vec<Fact>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT * FROM fact
-         WHERE (subject_id = ?1 OR object_id = ?1)
-           AND valid_to IS NULL AND invalidated_at IS NULL
-         ORDER BY weight DESC, observation_count DESC, ingested_at DESC LIMIT ?2",
+        "SELECT f.* FROM fact f
+         WHERE (f.subject_id = ?1 OR f.object_id = ?1)
+           AND f.valid_to IS NULL AND f.invalidated_at IS NULL
+           AND NOT (f.object_id = ?1
+                    AND f.predicate IN ('about','waiting_on','assigned_to')
+                    AND EXISTS (SELECT 1 FROM task_detail td
+                                WHERE td.node_id = f.subject_id))
+         ORDER BY f.weight DESC, f.observation_count DESC, f.ingested_at DESC LIMIT ?2",
     )?;
     let facts = stmt
         .query_map(params![node_id, limit], row_to_fact)?

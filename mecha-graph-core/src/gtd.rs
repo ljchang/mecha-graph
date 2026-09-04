@@ -74,6 +74,25 @@ pub struct TaskItem {
 /// for Nadia" does not mean "…but only the ones where she holds the ball".
 pub const TASK_ENTITY_PREDICATES: &[&str] = &["about", "waiting_on", "assigned_to"];
 
+/// The subset whose *history* counts, not just its live rows.
+///
+/// The filter has to treat a closed `waiting_on` and a closed `about`
+/// differently, because the same mechanism (`valid_to`) is written by two
+/// operations that mean opposite things:
+///
+/// - `set_task_status` closes `waiting_on` **automatically**, because
+///   finishing the work ends the obligation. The task was still theirs, so
+///   history has to count or a finished task vanishes from the person it was
+///   finished for.
+/// - `remove_task_about` closes `about` **because a human said so** — this
+///   is not filed here. Counting that history would make an explicit unfile
+///   a no-op that still reported success.
+///
+/// So closure is temporal for one and editorial for the other, and only the
+/// temporal kind is history worth honouring. `assigned_to` sits with `about`:
+/// nothing closes it on its own, so a closed one was somebody's decision.
+const HISTORICAL_TASK_PREDICATES: &[&str] = &["waiting_on"];
+
 /// Names inside a `group_concat` are joined on ASCII unit separator rather
 /// than a comma, because a node name may contain a comma and splitting on
 /// one would quietly saw a person in half.
@@ -113,11 +132,14 @@ fn list_tasks_filtered(
     // The predicate list is interpolated rather than bound because SQLite has
     // no array parameter. It is a private `const` of string literals, never
     // caller input, so there is nothing here for a caller to inject.
-    let predicates = TASK_ENTITY_PREDICATES
-        .iter()
-        .map(|p| format!("'{p}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let quoted = |set: &[&str]| {
+        set.iter()
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let predicates = quoted(TASK_ENTITY_PREDICATES);
+    let historical = quoted(HISTORICAL_TASK_PREDICATES);
     let sql = format!(
         "SELECT n.id, n.name, td.status, td.task_type, td.due_at, td.defer_until,
                 td.context_tag, td.completed_at,
@@ -141,26 +163,37 @@ fn list_tasks_filtered(
                 -- moment it was finished. That is the capability this query
                 -- exists to provide, deleted by the close that enables it.
                 --
-                -- `invalidated_at IS NULL` is still required, and is the
-                -- other half of the same distinction: `valid_to` means the
-                -- association ENDED and history keeps it; `invalidated_at`
-                -- means it was NEVER TRUE, and a refuted association must
-                -- not go on filing the task under someone a human already
-                -- said it did not belong to.
-                -- And `polarity = 'positive'`, which is the third thing
-                -- `fact_current` was doing and the easiest to lose on the way
-                -- out of it. V013 names GTD as a consumer and says a negative
-                -- edge in graph traversal would be a bug. A correction that
-                -- denies an association with no replacement supersedes the
-                -- positive and writes a live NEGATIVE in its place — so
-                -- without this, the denial itself is what keeps the task
-                -- filed under the person it was denied for, shown next to a
-                -- `facts` block stating the denial.
+                -- ...but only for the predicates whose closure is TEMPORAL.
+                -- `valid_to` is written by two operations that mean opposite
+                -- things: completing a task closes `waiting_on` on its own
+                -- (the work ended; it was still theirs), while
+                -- `remove_task_about` closes `about` because a human said it
+                -- is not filed here. Honouring history for both made an
+                -- explicit unfile a no-op that still answered `updated`. So
+                -- an editorial close must hide the row and a temporal one
+                -- must not, and the predicate is what tells them apart.
+                --
+                -- `invalidated_at IS NULL` applies to every predicate, and is
+                -- a third case again: `valid_to` means the association ENDED,
+                -- `invalidated_at` means it was NEVER TRUE, and a refuted
+                -- association must not go on filing the task under someone a
+                -- human already said it did not belong to.
+                --
+                -- And `polarity = 'positive'`, which is what `fact_current`
+                -- was doing and the easiest thing to lose on the way out of
+                -- it. V013 names GTD as a consumer and says a negative edge
+                -- in traversal would be a bug: a correction that denies an
+                -- association with no replacement supersedes the positive and
+                -- writes a live NEGATIVE in its place, so without this the
+                -- denial itself is what keeps the task filed under the person
+                -- it was denied for.
                 OR EXISTS (SELECT 1 FROM fact ef
                            WHERE ef.subject_id = n.id AND ef.object_id = ?2
                              AND ef.invalidated_at IS NULL
                              AND ef.polarity = 'positive'
-                             AND ef.predicate IN ({predicates})))
+                             AND ef.predicate IN ({predicates})
+                             AND (ef.valid_to IS NULL
+                                  OR ef.predicate IN ({historical}))))
          ORDER BY CASE td.status WHEN 'next' THEN 0 WHEN 'inbox' THEN 1
                                  WHEN 'scheduled' THEN 2 WHEN 'waiting' THEN 3
                                  WHEN 'done' THEN 4 ELSE 5 END,
@@ -645,9 +678,20 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // Now that the answer is known, retire the old belief. Clearing and
     // re-pointing are the same operation from here, so neither can leave two
     // live claims about who owes this.
+    //
+    // A **valid-time close**, not an invalidation, and this changed with the
+    // entity filter. Handing a task from one person to another does not mean
+    // the first never had it — they did, and then it moved. Invalidating said
+    // the opposite, so a reassigned task disappeared from the first person
+    // entirely while the same task merely *finished* under them was kept: two
+    // ways of ceasing to owe something, recorded as if one of them had never
+    // happened. `polarity = 'positive'` for the same reason as the other two
+    // closes: a live negative is a recorded denial, and reassignment is not
+    // this function's licence to retract it.
     conn.execute(
-        "UPDATE fact SET invalidated_at = datetime('now')
+        "UPDATE fact SET valid_to = datetime('now')
           WHERE subject_id = ?1 AND predicate = 'waiting_on'
+            AND polarity = 'positive'
             AND valid_to IS NULL AND invalidated_at IS NULL",
         params![node_id],
     )?;
@@ -1863,6 +1907,77 @@ mod tests {
                 .found
                 .is_empty(),
             "and it is idempotent"
+        );
+    }
+
+    /// Unfiling actually unfiles, while completion still preserves history.
+    ///
+    /// These two write the *same* mechanism — `valid_to`, positive, not
+    /// invalidated — and mean opposite things, so a filter that honours one
+    /// blindly breaks the other. Ignoring `valid_to` wholesale (needed so a
+    /// finished task stays findable) made `remove_task_about` a no-op that
+    /// still answered success: the task stayed on the board, rendering with
+    /// `about: []` beside the person it claimed not to be about, because the
+    /// display column reads `fact_current` and the filter did not.
+    #[test]
+    fn an_explicit_unfile_removes_the_task_but_completion_does_not() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+
+        // Editorial close: a human says this is not filed here.
+        let unfiled = create_task(&conn, "Write the abstract", None, None, None).unwrap();
+        add_task_about(&conn, &unfiled, "Nadia").unwrap();
+        assert_eq!(tasks_for_entity(&conn, "p-nadia", true).unwrap().len(), 1);
+        assert!(remove_task_about(&conn, &unfiled, "Nadia").unwrap());
+        assert!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().is_empty(),
+            "an explicit unfile is not a no-op"
+        );
+
+        // Temporal close: the work finished, and it was still theirs.
+        let finished = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        set_task_waiting_on(&conn, &finished, "Nadia").unwrap();
+        set_task_status(&conn, &finished, "done").unwrap();
+        let found = tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(found.len(), 1, "finishing is not unfiling");
+        assert_eq!(found[0].node_id, finished);
+    }
+
+    /// Handing a task on keeps it on the board of whoever had it before.
+    ///
+    /// Reassignment used to invalidate — "never true" — so a task passed from
+    /// one person to another vanished from the first entirely, while the same
+    /// task merely *finished* under them was kept. Two ways of ceasing to owe
+    /// something, one of them recorded as if it had never happened.
+    #[test]
+    fn reassigning_waiting_on_does_not_erase_who_had_it_before() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let id = create_task(&conn, "Collect the consent forms", None, None, None).unwrap();
+
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap();
+        set_task_waiting_on(&conn, &id, "Wren").unwrap();
+
+        assert_eq!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().len(),
+            1,
+            "she did hold it, and then it moved"
+        );
+        assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
+        // Exactly one live claim, though — the point of retiring the old one.
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "no two live claims about who owes this");
+        assert_eq!(
+            list_tasks(&conn, true).unwrap()[0].waiting_on.as_deref(),
+            Some("Wren")
         );
     }
 
