@@ -803,6 +803,41 @@ enum Command {
         /// Include done/dropped
         #[arg(long)]
         all: bool,
+        /// Only tasks associated with this person, project or topic. Unions
+        /// `about`, `waiting_on` and `assigned_to`, plus tasks whose parent
+        /// project is this node. Pair with --all for everything, open and
+        /// finished, involving them.
+        #[arg(long)]
+        entity: Option<String>,
+    },
+    /// File or unfile a task under a person, project or topic — the direct
+    /// correction channel for what `scan-tasks` proposes
+    TaskAbout {
+        /// The task's node id, e.g. 'task-1a2b3c4d'
+        task: String,
+        /// File it under this entity (repeatable)
+        #[arg(long)]
+        add: Vec<String>,
+        /// Stop filing it under this entity (repeatable)
+        #[arg(long)]
+        remove: Vec<String>,
+    },
+    /// Scan task titles for entities the graph already knows, filing matches
+    /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
+    ScanTasks {
+        /// Actually mint the associations; omit to survey only
+        #[arg(long)]
+        apply: bool,
+        /// Stop after this many associations (0 = no cap)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
+    /// Report date columns holding text that is not a date (a model's `when`
+    /// written verbatim). Dry unless --apply, which nulls them
+    RepairDates {
+        /// Actually null the malformed values; omit to survey only
+        #[arg(long)]
+        apply: bool,
     },
     /// List duplicate-person merge candidates (same full name)
     Dups,
@@ -2220,8 +2255,146 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
             }
         }
-        Command::Tasks { all } => {
-            let tasks = gtd::list_tasks(&conn, all)?;
+        Command::RepairDates { apply } => {
+            // **This one runs first, and the order is load-bearing.** It can
+            // restore a commitment fact's `valid_from` from the episode that
+            // produced it, including when the stored value is unreadable —
+            // but only while the value is still there. Nulling first destroys
+            // the marker that says this row was written by the commitment
+            // path with a bad date, and no later run can recover it.
+            let (conflated, corrected) = gtd::repair_commitment_valid_from(&conn, apply)?;
+            // Second class: not a well-formed value in the wrong column but a
+            // value that is not a date at all. Different remedy — null it,
+            // because there is nothing to restore it from.
+            let report = gtd::repair_unparseable_dates(&conn, apply)?;
+            if want_json(cli_json, cli_text) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "unparseable": report,
+                        "due_date_as_valid_time": {
+                            "found": conflated, "corrected": corrected
+                        }
+                    }))?
+                );
+                return Ok(());
+            }
+            if !conflated.is_empty() {
+                println!(
+                    "{} commitment fact(s) hold a DUE date in `valid_from` where the \
+                     episode's time belongs:",
+                    conflated.len()
+                );
+                for c in &conflated {
+                    println!(
+                        "  {}  valid_from {} -> {}",
+                        &c.statement[..70.min(c.statement.len())],
+                        c.valid_from,
+                        c.occurred_at
+                    );
+                }
+                if apply {
+                    println!("corrected {corrected}\n");
+                } else {
+                    println!("dry run — re-run with --apply to correct them\n");
+                }
+            }
+            if report.found.is_empty() {
+                println!("no malformed dates");
+            } else {
+                for b in &report.found {
+                    println!("{:<24} {:<12} {}", b.column, b.value, b.label);
+                }
+                if apply {
+                    println!("\nnulled {} value(s)", report.repaired);
+                } else {
+                    println!(
+                        "\n{} malformed value(s) — dry run, re-run with --apply to null them",
+                        report.found.len()
+                    );
+                }
+            }
+        }
+        Command::TaskAbout { task, add, remove } => {
+            // The direct interface is the unmediated correction channel and
+            // the audit surface for autonomy (ARCHITECTURE). `scan-tasks
+            // --apply` is a bulk auto-producer of exactly these rows, and
+            // until now the only way to correct one was to ask an agent —
+            // which is no ground-truth path at all.
+            for name in &add {
+                let filed = gtd::add_task_about(&conn, &task, name)?;
+                println!("filed under {filed}");
+            }
+            for name in &remove {
+                if gtd::remove_task_about(&conn, &task, name)? {
+                    println!("unfiled from {name}");
+                } else {
+                    println!("was not filed under {name} — nothing removed");
+                }
+            }
+            if add.is_empty() && remove.is_empty() {
+                let t = gtd::get_task(&conn, &task)?
+                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                if t.about.is_empty() {
+                    println!("{} — filed under nothing", t.name);
+                } else {
+                    println!("{}", t.name);
+                    for a in &t.about {
+                        // The tier is the point of showing this at all: an
+                        // unreviewed row is what a human is here to judge.
+                        println!(
+                            "  {}{}",
+                            a.name,
+                            if a.unreviewed { "  (unreviewed)" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
+        Command::ScanTasks { apply, limit } => {
+            let report = gtd::propose_task_entities(&conn, apply, limit)?;
+            if want_json(cli_json, cli_text) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let verb = if apply { "filed as shadow" } else { "to file" };
+                println!(
+                    "scanned {} open task(s): {} association(s) {verb}, \
+                     {} already known, {} weak first-name match(es) refused",
+                    report.scanned, report.minted, report.already, report.refused_weak
+                );
+                if report.capped {
+                    println!("stopped at --limit {limit}; re-run to continue");
+                }
+                if report.minted > 0 && apply {
+                    println!(
+                        "these are UNREVIEWED — they earn a verdict when a query serves one \
+                         (`mecha-graph shadow`)"
+                    );
+                } else if report.minted > 0 {
+                    println!("dry run — re-run with --apply to file them");
+                }
+            }
+        }
+        Command::Tasks { all, entity } => {
+            // Resolve first: an unknown name must not print an empty board,
+            // which reads as "this person has no tasks".
+            let tasks = match entity.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(name) => {
+                    // `resolve_about` so `--entity @owner` works here too.
+                    let node = gtd::resolve_about(&conn, name)?.ok_or_else(|| {
+                        mecha_graph_core::Error::Other(format!("no node matches '{name}'"))
+                    })?;
+                    // Echoed, like the MCP tool does: `resolve_entity` takes
+                    // the first match, so two people with the same name
+                    // resolve silently and the board looks like the answer to
+                    // a question about the other one.
+                    if !want_json(cli_json, cli_text) {
+                        println!("{} ({})", node.name, node.id);
+                    }
+                    gtd::tasks_for_entity(&conn, &node.id, all)?
+                }
+                None => gtd::list_tasks(&conn, all)?,
+            };
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else if tasks.is_empty() {
@@ -2235,6 +2408,35 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     }
                     if let Some(w) = &t.waiting_on {
                         extra.push(format!("waiting on {w}"));
+                    }
+                    if !t.about.is_empty() {
+                        // `?` marks an unreviewed association, so a scanned
+                        // guess does not read like something somebody filed.
+                        let about = t
+                            .about
+                            .iter()
+                            .map(|a| {
+                                if a.unreviewed {
+                                    format!("{}?", a.name)
+                                } else {
+                                    a.name.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        extra.push(format!("about {about}"));
+                    }
+                    // The field exists because a row with no visible cause
+                    // reads like a bug in the filter — and this board is that
+                    // surface. On a graph predating `about`, every finished
+                    // task under a person is there only through a closed
+                    // claim, so `--entity X --all` is exactly the view it was
+                    // written to explain.
+                    if !t.previously_waiting_on.is_empty() {
+                        extra.push(format!("was waiting on {}", t.previously_waiting_on.join(", ")));
+                    }
+                    if t.unreadable_when.is_some() {
+                        extra.push("unreadable date".into());
                     }
                     if let Some(p) = &t.project {
                         extra.push(format!("[{p}]"));

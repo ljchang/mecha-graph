@@ -617,14 +617,104 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
 
     let what = p["what"].as_str().unwrap_or("(unnamed)");
     let who = p["who"].as_str().unwrap_or("");
-    let when = p["when"].as_str();
     let direction = p["direction"].as_str().unwrap_or("owed_by_me");
     let owed_to_me = direction == "owed_to_me";
+
+    // **A model's `when` is text until it parses.** This went in raw, and it
+    // reaches three date columns — `task_detail.due_at` below, and the
+    // `valid_from` of both facts asserted further down. A model that answered
+    // the literal string "null" put that in all three: it sorts as a date,
+    // never comes out overdue, and silently joins the wrong side of every
+    // bi-temporal `--as-of` query. One row on this graph, which is exactly
+    // how long a bug like this stays invisible.
+    //
+    // Unparseable degrades to None rather than failing the accept: the
+    // commitment is real even when its date is noise, and refusing to accept
+    // it would leave a genuine obligation stuck in the queue over a word.
+    // Nothing is lost — the candidate payload keeps the raw `when` verbatim.
+    //
+    // Caveat worth knowing: `parse_due` resolves 'tomorrow' and '+3d'
+    // against *now*, not against the episode the commitment came from, so a
+    // relative date accepted late lands late. Still strictly better than
+    // storing the word, and it keeps one date parser rather than two.
+    // Reported, not merely swallowed. `.ok().flatten()` alone made "the model
+    // gave no date" and "the model gave something unreadable" identical to
+    // every caller, and the accept returns only a task id, so the drop was
+    // invisible at the surface as well as in the row.
+    let when_raw = p["when"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let mut dropped_when: Option<String> = None;
+    let due_owned = match when_raw {
+        Some(raw) => match crate::gtd::parse_due(raw) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // **Recorded on the task, not printed.** This used to go to
+                // stderr, which the TUI's alternate screen swallows — and the
+                // TUI is where commitments are accepted, since they are held
+                // out of bulk auto-accept on purpose. A warning only the
+                // surface that never sees it receives is not a warning.
+                //
+                // The property rides on the task node beside `session` and
+                // `captured_from`, so it reaches every reader of the task
+                // rather than whoever happened to be watching a stream.
+                dropped_when = Some(format!("{raw} ({e})"));
+                None
+            }
+        },
+        None => None,
+    };
+    /// **A due date is not a valid time, and this function used to pass one
+    /// as the other.**
+    ///
+    /// `when` says when the work is *owed*. `valid_from` says when the belief
+    /// became *true in the world* — and "X is waiting on Nadia" became true
+    /// when the commitment was made, which is the episode's `occurred_at`,
+    /// not the deadline. The same file gets this right 130 lines up, where
+    /// ordinary extracted facts take `valid_from: Some(occurred_at)`.
+    ///
+    /// The consequence was not cosmetic. `facts_as_of` filters
+    /// `valid_from <= as_of`, so a commitment accepted in September and due
+    /// in December wrote a belief that no as-of query would answer until
+    /// December — the obligation was invisible for exactly the months during
+    /// which somebody might have wanted to be reminded of it. A deadline in
+    /// the past had the mirror problem, back-dating the belief to before
+    /// anyone held it.
+    ///
+    /// Two dates, two columns, and nothing reads across: `due_at` is the
+    /// deadline, `valid_from` is when the claim started holding.
+    fn commitment_valid_from(conn: &Connection, episode_id: Option<i64>) -> Result<Option<String>> {
+        match episode_id {
+            Some(eid) => Ok(conn
+                .query_row(
+                    "SELECT occurred_at FROM episode WHERE id = ?1",
+                    params![eid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()),
+            // No episode to date it from. `assert_fact` records `ingested_at`
+            // regardless, so system time is not lost — this only declines to
+            // invent a valid time, which is the honest answer rather than
+            // borrowing the deadline because it happens to be a date.
+            None => Ok(None),
+        }
+    }
+    let valid_from_owned = commitment_valid_from(conn, episode_id)?;
+
+    let due = due_owned.as_deref();
+    let valid_from = valid_from_owned.as_deref();
 
     let task_id = format!("task-{}", uuid_suffix());
     let mut task = graph::Node::new(&task_id, "task", what);
     task.source = "llm:commitment".into();
     graph::upsert_node(conn, &task)?;
+    if let Some(raw) = &dropped_when {
+        conn.execute(
+            "UPDATE nodes SET properties = json_set(
+                 COALESCE(properties, '{}'), '$.unreadable_when', ?2)
+              WHERE id = ?1",
+            params![task_id, raw],
+        )?;
+    }
     conn.execute(
         "INSERT INTO task_detail (node_id, status, task_type, due_at)
          VALUES (?1, ?2, ?3, ?4)",
@@ -632,7 +722,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
             task_id,
             if owed_to_me { "waiting" } else { "next" },
             if owed_to_me { "waiting" } else { "action" },
-            when
+            due
         ],
     )?;
 
@@ -647,7 +737,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
                 None,
                 &format!("\"{what}\" is waiting on {}", person.name),
                 episode_id,
-                when,
+                valid_from,
                 0.8,
                 "llm:commitment",
             )?;
@@ -667,7 +757,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
             Some(&ep_uid),
             &format!("Task \"{what}\" originated in episode {ep_uid}"),
             Some(ep_id),
-            when,
+            valid_from,
             0.9,
             "llm:commitment",
         )?;

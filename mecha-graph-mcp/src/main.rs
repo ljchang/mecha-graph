@@ -93,7 +93,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_entity",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, and `sources` — which episode sources cover this entity, how many episodes each holds and over what span. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again.",
+            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, `sources` — which episode sources cover this entity, how many episodes each holds and over what span — and `tasks`, this entity's board split into `open` and `closed`. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again. Each entry in a task's `about` is `{name, unreviewed}` — the title scan proposes associations at tier 'shadow', and `unreviewed: true` marks one nothing has vetted, so do not report it to a person as established without saying so.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -200,7 +200,7 @@ fn tool_definitions() -> Value {
                     "object": { "type": "string" },
                     "object_value": { "type": "string" },
                     "statement": { "type": "string", "description": "Natural-language sentence form of the fact" },
-                    "valid_from": { "type": "string" },
+                    "valid_from": { "type": "string", "description": "When this became true, as YYYY-MM-DD (an RFC 3339 instant is accepted and keeps its date half). Anything else is refused rather than stored: this column is compared as a date, so prose sorts as one and silently answers the wrong side of every as_of query. Omit it when you do not know — absent is honest, a guess is not." },
                     "confidence": { "type": "number" },
                     "alias": { "type": "string", "description": "kind=alias: the alias text" },
                     "node_id": { "type": "string", "description": "kind=alias: the node it belongs to (an id, not a name)" },
@@ -236,11 +236,12 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "include_closed": { "type": "boolean", "description": "Also return done/dropped tasks (default false)" }
+                    "include_closed": { "type": "boolean", "description": "Also return done/dropped tasks (default false)" },
+                    "entity": { "type": "string", "description": "Only tasks associated with this person, project or topic, by name or node id. Unions three associations: `about` (what the task concerns — survives completion), `waiting_on` (who currently holds the ball — cleared when the task closes) and `assigned_to`, plus tasks whose parent project IS this node. An unknown name is an error, not an empty list." }
                 }
             }
         },
@@ -255,6 +256,11 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
                     "project": { "type": "string", "description": "Parent project/topic — must resolve to an existing node" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
+                    "about": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "People, projects or topics this task concerns, by name. A PERMANENT association: it survives completion, which is what makes a finished task still findable under the person it was for. Use it for 'who/what is this task about'; use waiting_on (on kg_task_update) for 'who owes me this right now', which is cleared when the task closes. Each name must already resolve to a node — an unknown one is an error, never a new node."
+                    },
                     "captured_from": {
                         "type": "object",
                         "description": "What prompted this task, so a person can read the original later — `mecha tasks source <id>` follows it. A pointer, never a copy: no bodies, no quoted text, and a key that is not listed here is refused. Set it when the task comes from something with an address; omit it entirely for one somebody typed, where the absence is the honest answer.",
@@ -283,7 +289,9 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
-                    "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'." },
+                    "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
+                    "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
+                    "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },
                     "session": { "type": "string", "description": "The agent conversation working this task. Set by the harness that starts one — do not invent a value; \"\" clears." },
                     "captured_from": { "description": "What the task was captured from — same object kg_task_create takes; \"\" clears. Set it from what you actually read, never reconstructed from the task's wording." }
                 },
@@ -531,6 +539,9 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
 
     let node = matches.remove(0);
     graph::increment_node_access(conn, &node.id)?;
+    // `facts_for_node` drops a task's `about` pointing at this node for every
+    // caller, so there is nothing to opt into here — see its doc for why the
+    // rule is scoped by predicate rather than by caller.
     let facts: Vec<Value> = fact::facts_for_node(conn, &node.id, 25)?
         .into_iter()
         .map(|f| {
@@ -588,6 +599,49 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         })
         .collect();
 
+    // The board, filtered to this entity, split by whether it is still live.
+    //
+    // A block of its own rather than more `facts` rows: the association IS
+    // in `facts` already (it is an `about`/`waiting_on` edge), but a fact
+    // statement carries no status and no due date, and the 25-row cap means
+    // a busy person's tasks fall off the bottom silently. Splitting open
+    // from closed here is what makes "and what did we finish" answerable
+    // without a second call.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let all_tasks = gtd::tasks_for_entity(conn, &node.id, true)?;
+    let (mut closed, open): (Vec<_>, Vec<_>) = all_tasks
+        .iter()
+        .partition(|t| matches!(t.status.as_str(), "done" | "dropped"));
+    // The board's ordering sorts `due_at` ahead of `completed_at`, which is
+    // right for work you still have to do and wrong for the first caller that
+    // takes a *prefix* of the finished pile: it would keep the 15 with the
+    // earliest deadlines rather than the 15 most recently finished. "What did
+    // we just wrap up" is the only question this half of the block answers.
+    closed.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+    // Capped, like every other block on this card (`facts` 25, `episodes` 8,
+    // `context` 1500 tokens). Closed tasks only ever accumulate, and a
+    // project node collects every task ever filed under it, so an uncapped
+    // block grows without bound on exactly the nodes most worth asking
+    // about. The objection that motivated this block was a cap that
+    // truncates SILENTLY — so the count and the flag are reported, and
+    // `kg_task_list` with `entity` is named as the way to see the rest.
+    const TASK_CAP: usize = 15;
+    let block = |rows: &[&gtd::TaskItem]| {
+        json!({
+            "items": rows.iter().take(TASK_CAP).map(|t| task_json(t, &today)).collect::<Vec<_>>(),
+            "total": rows.len(),
+            "truncated": rows.len() > TASK_CAP,
+        })
+    };
+    let tasks = json!({
+        "open": block(&open),
+        "closed": block(&closed),
+        "all": "kg_task_list with `entity` returns the full list, unabridged",
+    });
+
     Ok(json!({
         "v": 1, "found": true,
         "node": { "id": node.id, "name": node.name, "type": node.node_type,
@@ -596,6 +650,7 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         "interaction": pi,
         "context": ctx,
         "facts": facts,
+        "tasks": tasks,
         "sources": coverage,
         "episodes": episodes
     }))
@@ -783,7 +838,34 @@ fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         object: args["object"].as_str().map(|s| s.to_string()),
         object_value: args["object_value"].as_str().map(|s| s.to_string()),
         statement: args["statement"].as_str().unwrap_or_default().to_string(),
-        valid_from: args["valid_from"].as_str().map(|s| s.to_string()),
+        // **The second faucet.** `accept_commitment` learned to parse its
+        // date; this writes the same column and did not, and it is the
+        // higher-volume path — agents write beliefs constantly, commitments
+        // are rare — and at `confidence >= 0.9` it auto-accepts, so the value
+        // reaches `fact.valid_from` verbatim with no human in between.
+        // Shipping `repair-dates` without closing this makes the repair a
+        // treadmill: its idempotence holds in the unit test and fails on a
+        // live graph by morning. Refused rather than dropped here, unlike the
+        // commitment path — a caller staging one fact can be told about one
+        // bad field, where a batch accept cannot stop for each.
+        valid_from: match args["valid_from"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(
+                gtd::parse_due(raw)
+                    .map_err(|e| {
+                        mecha_graph_core::Error::Other(format!(
+                            "`valid_from` must be YYYY-MM-DD (or an RFC 3339 instant): {e}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        mecha_graph_core::Error::Other("`valid_from` parsed to nothing".into())
+                    })?,
+            ),
+            None => None,
+        },
         confidence: args["confidence"].as_f64(),
         tags: args["tags"].as_str().map(|s| s.to_string()),
         ..Default::default()
@@ -1292,6 +1374,454 @@ mod tests {
         assert_eq!(by_name("late")["overdue"], true);
         assert_eq!(by_name("future")["overdue"], false);
     }
+
+    /// An entity nobody has heard of is an ERROR, not an empty board.
+    ///
+    /// "No tasks for Ostrander" and "there is nobody here called Ostrander"
+    /// are opposite findings, and the caller that cannot distinguish them
+    /// will confidently report the first. Same shape as the unreadable store
+    /// that must not read as an empty queue.
+    #[test]
+    fn an_unknown_entity_is_an_error_not_an_empty_board() {
+        let conn = open_memory().unwrap();
+        kg_task_create(&conn, &json!({ "name": "something" })).unwrap();
+        let err = kg_task_list(&conn, &json!({ "entity": "Nobody At All" }));
+        assert!(err.is_err(), "an unresolvable name must not answer with []");
+
+        // And the real thing resolves, echoing who it resolved to so the
+        // caller can see which of two same-named people it got.
+        upsert_node(&conn, &Node::new("p-ostrander", "person", "Ostrander")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "write it up" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": id, "about_add": ["Ostrander"] })).unwrap();
+        let board = kg_task_list(&conn, &json!({ "entity": "Ostrander" })).unwrap();
+        assert_eq!(board["items"].as_array().unwrap().len(), 1);
+        assert_eq!(board["entity"]["name"], "Ostrander");
+        assert_eq!(board["items"][0]["about"][0]["name"], "Ostrander");
+        assert_eq!(
+            board["items"][0]["about"][0]["unreviewed"], false,
+            "a hand-set association is not a guess, and the surface says which"
+        );
+    }
+
+    /// The entity's card carries its board, split by whether it is still
+    /// live — the second surface, and the one a "tell me about X" lands on.
+    #[test]
+    fn an_entity_card_carries_its_open_and_closed_tasks() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let open = kg_task_create(&conn, &json!({ "name": "open one", "about": ["Wren"] }))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let done = kg_task_create(&conn, &json!({ "name": "done one", "about": ["Wren"] }))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": done, "status": "done" })).unwrap();
+
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Wren" })).unwrap();
+        let tasks = &card["tasks"];
+        assert_eq!(tasks["open"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["closed"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks["open"]["items"][0]["id"], open);
+        assert_eq!(tasks["closed"]["items"][0]["id"], done);
+        assert_eq!(tasks["open"]["truncated"], false);
+        assert!(
+            tasks["closed"]["items"][0]["completed_at"].is_string(),
+            "a closed task carries when it closed"
+        );
+    }
+
+    /// A bad `about` name creates no task at all.
+    ///
+    /// Resolving after the create returned an error carrying no id, for a
+    /// task that existed — so the caller fixed the spelling, retried, and
+    /// made a second one. The near-miss name is the common case, because the
+    /// caller is guessing at spellings.
+    #[test]
+    fn an_unresolvable_about_name_creates_no_task() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let before = gtd::list_tasks(&conn, true).unwrap().len();
+
+        let err = kg_task_create(
+            &conn,
+            &json!({ "name": "write it up", "about": ["Wren", "Wrenn"] }),
+        );
+        assert!(err.is_err(), "a name that does not resolve fails the call");
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before,
+            "and leaves no orphan behind for the retry to duplicate"
+        );
+
+        // The good spelling works and associates both nothing-left-behind.
+        kg_task_create(&conn, &json!({ "name": "write it up", "about": ["Wren"] })).unwrap();
+        assert_eq!(gtd::list_tasks(&conn, true).unwrap().len(), before + 1);
+    }
+
+    /// A bare string where an array is specified fails, on both tools.
+    ///
+    /// `as_array()` returns None for it, and a `let … else` turned that into
+    /// an empty list — so the commonest shape mistake here answered
+    /// `created`/`updated` having written nothing.
+    #[test]
+    fn a_bare_string_where_an_array_belongs_is_refused_on_both_tools() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+
+        assert!(
+            kg_task_create(&conn, &json!({ "name": "x", "about": "Nadia" })).is_err(),
+            "create refuses the shape"
+        );
+        assert!(
+            gtd::list_tasks(&conn, true).unwrap().is_empty(),
+            "and writes no task while doing so"
+        );
+
+        let id = kg_task_create(&conn, &json!({ "name": "x" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            kg_task_update(&conn, &json!({ "task": id, "about_add": "Nadia" })).is_err(),
+            "and update refuses it identically"
+        );
+        assert!(gtd::task_about(&conn, &id).unwrap().is_empty());
+
+        // The right shape still works.
+        kg_task_update(&conn, &json!({ "task": id, "about_add": ["Nadia"] })).unwrap();
+        assert_eq!(gtd::task_about(&conn, &id).unwrap().len(), 1);
+    }
+
+    /// Finishing a task and naming who owed it, in ONE call, still leaves
+    /// nobody owing it.
+    ///
+    /// `status` was applied first, so the close ran before the claim existed
+    /// and then the claim was asserted onto an already-finished task — with
+    /// nothing left to close it, ever. The single call most likely to hit it
+    /// is the natural one: recording who owed a thing at the moment you
+    /// record that it is done.
+    #[test]
+    fn closing_and_naming_the_owed_party_in_one_call_leaves_no_live_claim() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "the thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 0,
+            "nobody owes a finished task, whatever the field order"
+        );
+
+        // And she still has it on her card, through the closed claim.
+        let found = gtd::tasks_for_entity(&conn, "p-nadia", true).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].previously_waiting_on, vec!["Nadia".to_string()]);
+    }
+
+    /// Reopening a task and naming who owes it, in one call, leaves a LIVE
+    /// claim — the mirror of the closing case.
+    ///
+    /// Both directions in one test on purpose. The two cases were fixed in
+    /// separate rounds and the second fix broke the first, because each was
+    /// an ordering tweak and the order can only satisfy one at a time.
+    /// Asserting them together is what stops a third reorder passing.
+    #[test]
+    fn status_and_waiting_on_in_one_call_agree_in_both_directions() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let live = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Closing direction: done + a name leaves nobody owing it.
+        let a = kg_task_create(&conn, &json!({ "name": "a" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(
+            &conn,
+            &json!({ "task": a, "status": "done", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+        assert_eq!(live(&a), 0, "a finished task holds nobody");
+
+        // Reopening direction, on a task that was already done: the claim
+        // must survive, or you get an open `waiting` task nobody owes.
+        let b = kg_task_create(&conn, &json!({ "name": "b" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": b, "status": "done" })).unwrap();
+        kg_task_update(
+            &conn,
+            &json!({ "task": b, "status": "waiting", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+        assert_eq!(
+            live(&b),
+            1,
+            "a reopened waiting task has somebody to wait on"
+        );
+        assert_eq!(
+            gtd::get_task(&conn, &b)
+                .unwrap()
+                .unwrap()
+                .waiting_on
+                .as_deref(),
+            Some("Nadia")
+        );
+    }
+
+    /// A pre-flight check has to enforce everything the writer does, or it
+    /// lets the write begin and then refuses.
+    #[test]
+    fn the_about_precheck_is_not_weaker_than_the_writer() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("wren-a", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("wren-b", "person", "Wren")).unwrap();
+        let before = gtd::list_tasks(&conn, true).unwrap().len();
+
+        // Ambiguous: resolvable, so the old resolve-only guard passed it.
+        assert!(
+            kg_task_create(&conn, &json!({ "name": "x", "about": ["Wren"] })).is_err(),
+            "an ambiguous name must not get past the pre-check"
+        );
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before,
+            "and must leave no task behind for the retry to duplicate"
+        );
+
+        // A task target: also resolvable, also refused by the writer.
+        let t = kg_task_create(&conn, &json!({ "name": "a real task" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(kg_task_create(&conn, &json!({ "name": "y", "about": ["a real task"] })).is_err());
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before + 1,
+            "only the one legitimate task exists"
+        );
+        assert!(gtd::task_about(&conn, &t).unwrap().is_empty());
+    }
+
+    /// Re-stating the current holder changes nothing, however many times.
+    #[test]
+    fn re_setting_the_same_waiting_on_does_not_make_them_their_own_predecessor() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "the thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for _ in 0..3 {
+            kg_task_update(&conn, &json!({ "task": id, "waiting_on": "Nadia" })).unwrap();
+        }
+        let t = gtd::list_tasks(&conn, true).unwrap().remove(0);
+        assert_eq!(t.waiting_on.as_deref(), Some("Nadia"));
+        assert!(
+            t.previously_waiting_on.is_empty(),
+            "the current holder is not their own history, and repeats do not stack"
+        );
+    }
+
+    /// The create echo uses the same association shape as every other
+    /// surface, so a caller can tell a vetted link from a guess.
+    #[test]
+    fn create_echoes_about_in_the_shape_the_tool_descriptions_promise() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let out = kg_task_create(&conn, &json!({ "name": "x", "about": ["Nadia"] })).unwrap();
+        assert_eq!(out["about"][0]["name"], "Nadia");
+        assert_eq!(
+            out["about"][0]["unreviewed"], false,
+            "a hand-set association, and the shape says so"
+        );
+    }
+
+    /// The update response says what the associations now are, so a removal
+    /// that removed nothing is visible.
+    #[test]
+    fn the_update_response_echoes_about() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "x", "about": ["Nadia"] })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Removing something that was never there resolves fine and does
+        // nothing — the echo is the only way a caller finds out.
+        let out = kg_task_update(&conn, &json!({ "task": id, "about_remove": ["Wren"] })).unwrap();
+        let about = out["task"]["about"].as_array().unwrap();
+        assert_eq!(about.len(), 1, "Nadia is still there");
+        assert_eq!(about[0]["name"], "Nadia");
+
+        let out = kg_task_update(&conn, &json!({ "task": id, "about_remove": ["Nadia"] })).unwrap();
+        assert!(
+            out["task"]["about"].as_array().unwrap().is_empty(),
+            "and a removal that did happen shows as one"
+        );
+    }
+
+    /// `kg_upsert` cannot write prose into a date column.
+    #[test]
+    fn valid_from_must_be_a_date() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let bad = kg_upsert(
+            &conn,
+            &json!({
+                "kind": "fact", "subject": "Nadia", "predicate": "works_on",
+                "statement": "Nadia works on the pilot",
+                "valid_from": "sometime in 2019", "confidence": 0.95
+            }),
+        );
+        assert!(
+            bad.is_err(),
+            "prose in a date column is refused at the door"
+        );
+
+        // A real date, an RFC 3339 instant, and the space-separated form the
+        // graph itself writes (`occurred_at`, `now_ts`) all land — an agent
+        // copying an episode's own timestamp must not lose the fact.
+        for v in ["2019-04-01", "2019-04-01T09:00:00Z", "2019-04-01 09:00:00"] {
+            kg_upsert(
+                &conn,
+                &json!({
+                    "kind": "fact", "subject": "Nadia", "predicate": "works_on",
+                    "statement": format!("Nadia works on the pilot since {v}"),
+                    "valid_from": v, "confidence": 0.5
+                }),
+            )
+            .unwrap();
+        }
+        // And the repair pass has nothing to do afterwards, which is the
+        // property that makes it a repair rather than a treadmill.
+        let report = gtd::repair_unparseable_dates(&conn, false).unwrap();
+        assert!(report.found.is_empty());
+    }
+
+    /// A person's `facts` block is about them, not about their to-do list.
+    #[test]
+    fn task_associations_do_not_crowd_the_entity_fact_block() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("org-lab", "org", "The Lab")).unwrap();
+        mecha_graph_core::fact::assert_fact(
+            &conn,
+            "p-nadia",
+            "member_of",
+            Some("org-lab"),
+            None,
+            "Nadia is a member of The Lab",
+            None,
+            None,
+            1.0,
+            "manual",
+        )
+        .unwrap();
+        for i in 0..30 {
+            kg_task_create(
+                &conn,
+                &json!({ "name": format!("task {i}"), "about": ["Nadia"] }),
+            )
+            .unwrap();
+        }
+
+        let waiting = kg_task_create(&conn, &json!({ "name": "owed thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": waiting, "waiting_on": "Nadia" })).unwrap();
+
+        // The SHARED reader, which the context pack, the boot digest, the TUI
+        // and `mecha-graph entity` all use. Scoping the fix to one caller left
+        // those four showing a block that was entirely her to-do titles.
+        let shared = mecha_graph_core::fact::facts_for_node(&conn, "p-nadia", 25).unwrap();
+        assert!(
+            shared.iter().all(|f| f.predicate != "about"),
+            "the fix reaches every caller, not just kg_entity"
+        );
+        assert!(
+            shared.iter().any(|f| f.predicate == "waiting_on"),
+            "while waiting_on stays — it was on those surfaces all along"
+        );
+
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Nadia" })).unwrap();
+        let facts = card["facts"].as_array().unwrap();
+        assert!(
+            facts.iter().all(|f| f["predicate"] != "about"),
+            "30 task associations must not fill a 25-row block"
+        );
+        assert!(
+            facts.iter().any(|f| f["predicate"] == "member_of"),
+            "and the fact that says who she is survives"
+        );
+        // They are not lost — the tasks block is where they belong: the 30
+        // `about` tasks plus the one she is waiting on.
+        assert_eq!(card["tasks"]["open"]["total"], 31);
+    }
+
+    /// The card's task block is capped, and says so.
+    ///
+    /// The block exists because a silent 25-fact cut hid a person's tasks.
+    /// Replacing it with an unbounded list would trade that for an entity
+    /// card that grows forever on exactly the nodes worth asking about, so
+    /// the cap is real and the truncation is reported rather than inferred.
+    #[test]
+    fn the_entity_cards_task_block_is_capped_and_says_so() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        for i in 0..20 {
+            kg_task_create(
+                &conn,
+                &json!({ "name": format!("task {i}"), "about": ["Wren"] }),
+            )
+            .unwrap();
+        }
+        let card = kg_entity(&conn, &json!({ "name_or_id": "Wren" })).unwrap();
+        let open = &card["tasks"]["open"];
+        assert_eq!(open["items"].as_array().unwrap().len(), 15, "capped");
+        assert_eq!(open["total"], 20, "and the real count is still reported");
+        assert_eq!(open["truncated"], true, "a cut the reader can see");
+
+        // The uncapped route is the one the card points at.
+        let full = kg_task_list(&conn, &json!({ "entity": "Wren" })).unwrap();
+        assert_eq!(full["items"].as_array().unwrap().len(), 20);
+    }
 }
 
 /// The Verifier's deterministic tier, over MCP.
@@ -1536,30 +2066,93 @@ fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
     Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
 }
 
+/// A list-of-names argument, refused rather than coerced.
+///
+/// Absent is an empty list; an array of strings is itself; **anything else is
+/// an error**, including the bare string that an array was specified for.
+/// `as_array()` returning `None` for `"about": "Nadia"` made the commonest
+/// shape mistake here answer `created`/`updated` having written nothing —
+/// once on each of the two tools, because the guard was written at one call
+/// site instead of in one function.
+fn name_array(args: &Value, key: &str) -> mecha_graph_core::Result<Vec<String>> {
+    match &args[key] {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => a
+            .iter()
+            .map(|n| {
+                n.as_str().map(str::to_string).ok_or_else(|| {
+                    mecha_graph_core::Error::Other(format!(
+                        "`{key}` takes an array of names, got {n} inside it"
+                    ))
+                })
+            })
+            .collect(),
+        other => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` takes an array of names, got {other} — nothing was changed"
+        ))),
+    }
+}
+
+/// One task as the board renders it. Shared by `kg_task_list` and the
+/// `tasks` block on `kg_entity`, so the two surfaces cannot disagree about
+/// what a task looks like or when one is overdue.
+fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
+    let overdue = t
+        .due_at
+        .as_deref()
+        .is_some_and(|d| d < today && t.completed_at.is_none());
+    json!({
+        "id": t.node_id, "name": t.name, "status": t.status,
+        "due_at": t.due_at, "defer_until": t.defer_until,
+        "context": t.context_tag, "project": t.project,
+        "waiting_on": t.waiting_on, "about": t.about,
+        // Why a task with no live association is on this entity's card.
+        "previously_waiting_on": t.previously_waiting_on,
+        // Present only when the extractor's date could not be read, which is
+        // why this task has no due date.
+        "unreadable_when": t.unreadable_when,
+        "session": t.session, "completed_at": t.completed_at,
+        "captured_from": t.captured_from,
+        "overdue": overdue
+    })
+}
+
 fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let include_closed = args["include_closed"].as_bool().unwrap_or(false);
     let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let items: Vec<Value> = gtd::list_tasks(conn, include_closed)?
-        .into_iter()
-        .map(|t| {
-            let overdue = t
-                .due_at
-                .as_deref()
-                .is_some_and(|d| d < today.as_str() && t.completed_at.is_none());
-            json!({
-                "id": t.node_id, "name": t.name, "status": t.status,
-                "due_at": t.due_at, "defer_until": t.defer_until,
-                "context": t.context_tag, "project": t.project,
-                "waiting_on": t.waiting_on, "session": t.session, "completed_at": t.completed_at,
-                "captured_from": t.captured_from,
-                "overdue": overdue
-            })
-        })
-        .collect();
-    Ok(json!({ "v": 1, "items": items, "today": today, "truncated": false }))
+    // An unresolvable entity is an ERROR, never an empty board. "No tasks
+    // for Nadia" and "there is nobody here called Nadia" are opposite
+    // findings, and a caller that cannot tell them apart will report the
+    // first when the truth is the second.
+    let entity = match args["entity"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // `gtd::resolve_about`, not `resolve_entity`: the sentinel writes but
+        // did not read, so `entity: "@owner"` failed with "no node matches"
+        // on a graph that has one.
+        Some(name) => Some(gtd::resolve_about(conn, name)?.ok_or_else(|| {
+            mecha_graph_core::Error::Other(format!(
+                "no node matches '{name}' — kg_entity resolves names, and \
+                 an unknown one is not an empty task list"
+            ))
+        })?),
+        None => None,
+    };
+    let tasks = match &entity {
+        Some(node) => gtd::tasks_for_entity(conn, &node.id, include_closed)?,
+        None => gtd::list_tasks(conn, include_closed)?,
+    };
+    let items: Vec<Value> = tasks.iter().map(|t| task_json(t, &today)).collect();
+    let mut out = json!({ "v": 1, "items": items, "today": today, "truncated": false });
+    if let Some(node) = entity {
+        out["entity"] = json!({ "id": node.id, "name": node.name });
+    }
+    Ok(out)
 }
 
 fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -1568,6 +2161,25 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         Some(raw) => gtd::parse_due(raw)?,
         None => None,
     };
+    // **Resolve every `about` name before creating anything.** The same rule
+    // `set_task_waiting_on` states as "resolve before retiring anything",
+    // for the same reason one step earlier: resolving afterwards makes a
+    // near-miss name — the common failure, since the caller is guessing at
+    // spellings — return an error carrying no task id, for a task that now
+    // exists. The caller corrects the name, retries, and there are two.
+    // Checking first makes the call all-or-nothing.
+    // Shape and names both checked before anything is written — see
+    // `name_array`, which is shared with `kg_task_update` so the two tools
+    // cannot disagree about what a list of names is.
+    let about_names = name_array(args, "about")?;
+    for name in &about_names {
+        // The FULL rule the writer applies, not a subset of it — see
+        // `validate_about_target`. A guard weaker than the thing it guards
+        // lets the create run and then refuses, which is the half-write this
+        // pre-check exists to prevent.
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
+    }
     let task_id = gtd::create_task(
         conn,
         name,
@@ -1584,7 +2196,24 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if !args["captured_from"].is_null() {
         gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
     }
-    Ok(json!({ "v": 1, "status": "created", "id": task_id, "due_at": due }))
+    // Every name here already resolved above, so these cannot fail on a
+    // lookup and the task cannot be left half-associated.
+    for name in &about_names {
+        gtd::add_task_about(conn, &task_id, name)?;
+    }
+    // Echoed in the SAME shape every other surface uses — `{name, unreviewed}`,
+    // read back from the store rather than from the names that went in. Bare
+    // strings here made this the one response where a caller could not tell a
+    // vetted association from a guess, contradicting the tool descriptions
+    // this PR wrote; and reading it back means the echo reflects what was
+    // actually recorded, including a pre-existing shadow row upgraded to
+    // reviewed by this very call.
+    let about = gtd::get_task(conn, &task_id)?
+        .map(|t| t.about)
+        .unwrap_or_default();
+    Ok(json!({
+        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about
+    }))
 }
 
 fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -1592,6 +2221,37 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         .as_str()
         .ok_or_else(|| mecha_graph_core::Error::Other("kg_task_update needs `task`".into()))?;
 
+    // **Validate the `about` names before the first write, not beside their
+    // own.** This function applies its fields in sequence, so a name checked
+    // where it is used would refuse the association *after* the status change
+    // and the reschedule had already landed — and the error would say nothing
+    // about which of them stuck. Checked here, "nothing was changed" is true.
+    //
+    // A non-string entry is refused rather than skipped: dropping it silently
+    // reports success for a name nobody applied.
+    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> { name_array(args, key) };
+    let to_add = names("about_add")?;
+    let to_remove = names("about_remove")?;
+    for name in to_add.iter().chain(to_remove.iter()) {
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+
+    // **Status goes FIRST, so every field after it sees the status the
+    // caller is actually setting.**
+    //
+    // It briefly went last, to stop `{status: "done", waiting_on: "Nadia"}`
+    // asserting a live obligation onto a finished task. That was the right
+    // bug and the wrong layer: the guard now lives on `set_task_waiting_on`,
+    // which closes the claim itself when the task is done, so no call shape
+    // can route around it — and the reorder became not merely redundant but
+    // harmful. `set_task_waiting_on` reads the status from the row, so with
+    // status applied last it read the PRE-call value: `{status: "waiting",
+    // waiting_on: "Nadia"}` on a done task asserted the claim, immediately
+    // closed it because the row still said done, and only then reopened the
+    // task — an open `waiting` task that nobody owes. Two ordering fixes for
+    // the same field cancelled each other; the invariant on the writer is
+    // what actually holds, and this order is what lets it see the truth.
     if let Some(status) = args["status"].as_str() {
         gtd::set_task_status(conn, task, status)?;
     }
@@ -1628,6 +2288,18 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if let Some(session) = args["session"].as_str() {
         gtd::set_task_session(conn, task, session)?;
     }
+    // Add and remove rather than set, because `about` is multi-valued: a
+    // `set` would make "also file this under Nadia" silently drop whoever
+    // was already there.
+    //
+    // Both lists were resolved at the top of this function, so neither loop
+    // can fail on a lookup and leave the edit half applied.
+    for name in &to_add {
+        gtd::add_task_about(conn, task, name)?;
+    }
+    for name in &to_remove {
+        gtd::remove_task_about(conn, task, name)?;
+    }
     // An object sets it; `""` clears it, which is the tri-state every other
     // field here speaks. `null` cannot mean "clear" — an absent key
     // deserialises to exactly that, so the two would be the same call and
@@ -1640,21 +2312,18 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
     }
 
-    let updated = gtd::list_tasks(conn, true)?
-        .into_iter()
-        .find(|t| t.node_id == task)
-        .map(|t| {
-            json!({
-                "id": t.node_id, "name": t.name, "status": t.status,
-                "due_at": t.due_at, "defer_until": t.defer_until,
-                "context": t.context_tag, "completed_at": t.completed_at,
-                // Reported back because the caller cannot otherwise tell a
-                // successful set from a silently-ignored one — the field is
-                // written as a fact, not a column, so it does not turn up in
-                // the row by itself.
-                "waiting_on": t.waiting_on, "session": t.session,
-                "captured_from": t.captured_from
-            })
-        });
+    // `task_json`, not a second literal. The reason this response echoes
+    // `waiting_on` at all — a caller cannot otherwise tell a successful set
+    // from a silently ignored one, because the field is a fact rather than a
+    // column — is exactly as true of `about`, and the hand-written copy
+    // omitted it. `about_remove` on a task that was never filed there updates
+    // nothing and reports `updated`, so the echo is the only way a caller
+    // learns the unfiling did not happen. One renderer means the two
+    // responses cannot drift again.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let updated = gtd::get_task(conn, task)?.map(|t| task_json(&t, &today));
     Ok(json!({ "v": 1, "status": "updated", "task": updated }))
 }

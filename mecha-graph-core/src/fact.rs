@@ -1040,12 +1040,43 @@ pub fn get_fact_by_uid(conn: &Connection, uid: &str) -> Result<Option<Fact>> {
 /// 2026-08-13, alongside `hybrid_facts`, which serves negations for the
 /// same reason). Callers that mean "positive beliefs" must say so:
 /// filter on `polarity`, or read `fact_current` directly.
+/// Live facts touching a node, either end, best first.
+///
+/// **A task's `about` pointing AT this node is excluded**, on every caller.
+///
+/// Scoped by predicate rather than by caller, and that is the second attempt.
+/// The first excluded all three task predicates but only for `kg_entity`,
+/// reasoning that the other four callers — the context pack, the scope
+/// summaries behind the `MEMORY.md` digest, the TUI entity screen and
+/// `mecha-graph entity` — have no `tasks` block to compensate. True of
+/// `waiting_on`, which had been on those surfaces all along and must stay.
+/// Not true of `about`, which is new and had nothing to regress, and which
+/// the title scan produces in bulk with nothing ever closing it. So opting
+/// four callers out of the fix left them showing a block that is entirely
+/// somebody's to-do titles, with `member_of` and every recorded denial off
+/// the bottom.
+///
+/// The narrower rule fixes all five at once and changes what none of them
+/// used to show. Ordering is why it matters: nothing writes `weight` and a
+/// fresh fact has `observation_count = 1`, so this collapses to newest-first
+/// and a bulk producer takes the whole window.
+///
+/// Asking a TASK for its own facts still returns its `about` — there the
+/// association is the subject of the question, not noise crowding it out.
 pub fn facts_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result<Vec<Fact>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT * FROM fact
-         WHERE (subject_id = ?1 OR object_id = ?1)
-           AND valid_to IS NULL AND invalidated_at IS NULL
-         ORDER BY weight DESC, observation_count DESC, ingested_at DESC LIMIT ?2",
+        "SELECT f.* FROM fact f
+         WHERE (f.subject_id = ?1 OR f.object_id = ?1)
+           AND f.valid_to IS NULL AND f.invalidated_at IS NULL
+           -- `IS`, not `=`: a literal-object fact has `object_id` NULL, and
+           -- `NULL = ?1` is NULL, so `NOT (…)` is NULL and SQLite drops the
+           -- row. That silently hid exactly the rows the paragraph above
+           -- promises to keep — a task's own literal-valued associations.
+           AND NOT (f.predicate = 'about'
+                    AND f.object_id IS ?1
+                    AND EXISTS (SELECT 1 FROM task_detail td
+                                WHERE td.node_id = f.subject_id))
+         ORDER BY f.weight DESC, f.observation_count DESC, f.ingested_at DESC LIMIT ?2",
     )?;
     let facts = stmt
         .query_map(params![node_id, limit], row_to_fact)?
@@ -1653,25 +1684,46 @@ fn resolve_candidate_parts(
             "candidate {candidate_id} has no subject — bind one (review `b`/edit) before accepting"
         )));
     }
-    let subject = match crate::graph::resolve_entity(conn, &proposed.subject)? {
-        Some(node) => node,
-        None if create_missing_subject && !proposed.subject.trim().is_empty() => {
-            let id = format!("topic-{}", crate::ids::new_uid());
-            let mut node = crate::graph::Node::new(&id, "topic", proposed.subject.trim());
-            node.source = "review".into();
-            crate::graph::upsert_node(conn, &node)?;
-            crate::graph::get_node(conn, &id)?.expect("just created")
-        }
-        None => {
-            return Err(Error::Other(format!(
-                "cannot resolve subject '{}'",
-                proposed.subject
-            )))
+    // **An explicit node id beats a name lookup.** `subject_node`/`object_node`
+    // are set only by producers that derived the pair FROM nodes, so when one
+    // is present the producer is not describing an entity, it is naming one —
+    // and re-deriving it from the display name throws that away. Names are not
+    // unique, which is the whole reason these fields exist: two open tasks
+    // with the same title both resolve to whichever the lookup returns first,
+    // so one of them silently acquires the other's facts and the second gets
+    // none. A stale id (its node merged away) falls back to the name rather
+    // than failing, since a merge leaves the name resolvable.
+    let by_id = |id: &Option<String>| -> Result<Option<crate::graph::Node>> {
+        match id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => crate::graph::get_node(conn, id),
+            None => Ok(None),
         }
     };
-    let object_node = match &proposed.object {
-        Some(o) => crate::graph::resolve_entity(conn, o)?,
-        None => None,
+    let subject = match by_id(&proposed.subject_node)? {
+        Some(node) => node,
+        None => match crate::graph::resolve_entity(conn, &proposed.subject)? {
+            Some(node) => node,
+            None if create_missing_subject && !proposed.subject.trim().is_empty() => {
+                let id = format!("topic-{}", crate::ids::new_uid());
+                let mut node = crate::graph::Node::new(&id, "topic", proposed.subject.trim());
+                node.source = "review".into();
+                crate::graph::upsert_node(conn, &node)?;
+                crate::graph::get_node(conn, &id)?.expect("just created")
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "cannot resolve subject '{}'",
+                    proposed.subject
+                )))
+            }
+        },
+    };
+    let object_node = match by_id(&proposed.object_node)? {
+        Some(node) => Some(node),
+        None => match &proposed.object {
+            Some(o) => crate::graph::resolve_entity(conn, o)?,
+            None => None,
+        },
     };
     // If an object was named but didn't resolve to a node, keep it as a literal.
     let object_value = match (&proposed.object, &object_node) {
