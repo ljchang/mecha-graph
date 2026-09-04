@@ -1543,8 +1543,10 @@ mod tests {
             "prose in a date column is refused at the door"
         );
 
-        // A real date, and an instant, both land.
-        for v in ["2019-04-01", "2019-04-01T09:00:00Z"] {
+        // A real date, an RFC 3339 instant, and the space-separated form the
+        // graph itself writes (`occurred_at`, `now_ts`) all land — an agent
+        // copying an episode's own timestamp must not lose the fact.
+        for v in ["2019-04-01", "2019-04-01T09:00:00Z", "2019-04-01 09:00:00"] {
             kg_upsert(
                 &conn,
                 &json!({

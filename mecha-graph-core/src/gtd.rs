@@ -198,12 +198,18 @@ fn list_tasks_filtered(
                 -- keeps a retracted claim out: that one was corrected, and
                 -- naming the person it was corrected away from would put
                 -- them back on the card the retraction removed them from.
-                (SELECT group_concat(pn.name, char(31)) FROM fact pf
-                 JOIN nodes pn ON pn.id = pf.object_id
-                 WHERE pf.subject_id = n.id AND pf.predicate = 'waiting_on'
-                   AND pf.polarity = 'positive'
-                   AND pf.valid_to IS NOT NULL AND pf.invalidated_at IS NULL
-                 ORDER BY pf.valid_to DESC)
+                -- The ORDER BY has to be INSIDE a subquery, not beside the
+                -- aggregate: an ORDER BY next to `group_concat` orders the
+                -- one result row, which is a no-op, so the newest-first the
+                -- doc promises was not happening and only a second closed
+                -- claim would have shown it.
+                (SELECT group_concat(name, char(31)) FROM (
+                   SELECT pn.name AS name FROM fact pf
+                   JOIN nodes pn ON pn.id = pf.object_id
+                   WHERE pf.subject_id = n.id AND pf.predicate = 'waiting_on'
+                     AND pf.polarity = 'positive'
+                     AND pf.valid_to IS NOT NULL AND pf.invalidated_at IS NULL
+                   ORDER BY pf.valid_to DESC))
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?2 IS NULL
@@ -448,7 +454,15 @@ pub fn repair_commitment_valid_from(
           WHERE f.extractor = 'llm:commitment'
             AND f.valid_from IS NOT NULL
             AND e.occurred_at IS NOT NULL
-            AND date(f.valid_from) <> date(e.occurred_at)",
+            -- `date(…) IS NULL` catches an UNREADABLE valid_from as well as a
+            -- merely wrong one, and both have the same right answer here: the
+            -- episode's time. Without it the two repairs raced — the null-out
+            -- pass would clear a commitment fact holding \"null\", and clearing
+            -- it removed the only evidence that this pass could have restored
+            -- it from, permanently, because a NULL `valid_from` is
+            -- indistinguishable from one that was always absent.
+            AND (date(f.valid_from) IS NULL
+                 OR date(f.valid_from) <> date(e.occurred_at))",
     )?;
     let rows: Vec<ConflatedDate> = stmt
         .query_map([], |r| {
@@ -482,14 +496,21 @@ pub fn parse_due(input: &str) -> Result<Option<String>> {
     if s.is_empty() {
         return Ok(None);
     }
-    // An RFC 3339 instant keeps its date half rather than being refused.
-    // The extraction prompt asks for `YYYY-MM-DD`, so this is not the shape
-    // to design around — but a model that answers `2026-09-15T17:00:00Z` is
-    // telling us the day, and rejecting the whole value would make the parse
-    // stricter than the raw write it replaced. Losing the time is a real
-    // narrowing; `due_at` is a date column, and every other writer of it
-    // stores a day.
-    let s = match s.split_once('t') {
+    // A timestamp keeps its date half rather than being refused, on **both**
+    // separators. `T` is RFC 3339; the space is SQLite's, and it is the shape
+    // this graph writes everywhere — `ids::now_ts()`, every source's
+    // `occurred_at`, and `commitment_valid_from` in this very PR. Accepting
+    // one and not the other made `kg_upsert` reject the format the store
+    // itself produces, so an agent copying an episode's `occurred_at` into
+    // `valid_from` lost the whole fact to a hard error — while
+    // `repair_unparseable_dates` went on certifying that exact value as a
+    // good date. A writer and its repair disagreeing about what a date is is
+    // worse than either rule alone.
+    //
+    // The extraction prompt still asks for `YYYY-MM-DD`, so this is not the
+    // shape to design around; losing the time is a real narrowing, and
+    // `due_at` is a date column every other writer fills with a day.
+    let s = match s.split_once(['t', ' ']) {
         Some((date, rest))
             if date.len() == 10 && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
         {
@@ -582,6 +603,17 @@ pub fn update_task_schedule(
     )?;
     if n == 0 {
         return Err(Error::Other(format!("{node_id} is not a task")));
+    }
+    // Setting a real due date retires the note explaining why there was not
+    // one. Nothing cleared it, so a task could render a deadline beside a
+    // complaint that it has none — a stale explanation is worse than no
+    // explanation, because it describes a state the row is no longer in.
+    if matches!(due, Some(Some(_))) {
+        conn.execute(
+            "UPDATE nodes SET properties = json_remove(properties, '$.unreadable_when')
+              WHERE id = ?1 AND properties IS NOT NULL",
+            params![node_id],
+        )?;
     }
     Ok(())
 }
@@ -2691,9 +2723,20 @@ mod tests {
         assert_eq!(again.already, 2);
     }
 
-    /// An RFC 3339 instant keeps its date rather than being thrown away.
+    /// A timestamp keeps its date, on both separators.
+    ///
+    /// The space form is the one this graph writes everywhere —
+    /// `ids::now_ts()`, every `occurred_at`, and `commitment_valid_from` —
+    /// so refusing it made `kg_upsert` reject the format the store itself
+    /// produces, while `repair_unparseable_dates` went on certifying that
+    /// exact value as a good date.
     #[test]
     fn parse_due_keeps_the_date_half_of_a_timestamp() {
+        assert_eq!(
+            parse_due("2026-09-15 17:00:00").unwrap().as_deref(),
+            Some("2026-09-15"),
+            "SQLite's own datetime shape, which the graph writes everywhere"
+        );
         assert_eq!(
             parse_due("2026-09-15T17:00:00Z").unwrap().as_deref(),
             Some("2026-09-15"),

@@ -2244,12 +2244,17 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
         }
         Command::RepairDates { apply } => {
-            let report = gtd::repair_unparseable_dates(&conn, apply)?;
-            // Second class, same command: not a malformed value but a
-            // well-formed one in the wrong column — a due date standing in
-            // for a valid time. Reported separately because the remedy is
-            // different (rewrite to the episode's time, not null).
+            // **This one runs first, and the order is load-bearing.** It can
+            // restore a commitment fact's `valid_from` from the episode that
+            // produced it, including when the stored value is unreadable —
+            // but only while the value is still there. Nulling first destroys
+            // the marker that says this row was written by the commitment
+            // path with a bad date, and no later run can recover it.
             let (conflated, corrected) = gtd::repair_commitment_valid_from(&conn, apply)?;
+            // Second class: not a well-formed value in the wrong column but a
+            // value that is not a date at all. Different remedy — null it,
+            // because there is nothing to restore it from.
+            let report = gtd::repair_unparseable_dates(&conn, apply)?;
             if want_json(cli_json, cli_text) {
                 println!(
                     "{}",
@@ -2372,6 +2377,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                             .collect::<Vec<_>>()
                             .join(", ");
                         extra.push(format!("about {about}"));
+                    }
+                    if t.unreadable_when.is_some() {
+                        extra.push("unreadable date".into());
                     }
                     if let Some(p) = &t.project {
                         extra.push(format!("[{p}]"));

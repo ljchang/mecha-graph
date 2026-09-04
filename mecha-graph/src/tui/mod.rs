@@ -4160,6 +4160,38 @@ fn draw_gtd(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(Color::Magenta),
                 ));
             }
+            // `about`, with `?` on an association nothing has vetted — the
+            // same mark the CLI board uses. The shadow tier's bargain is that
+            // inference is served and never asserted, and a board rendering a
+            // title-scan guess exactly like something a person filed is where
+            // that quietly breaks.
+            if !t.about.is_empty() {
+                let names = t
+                    .about
+                    .iter()
+                    .map(|a| {
+                        if a.unreviewed {
+                            format!("{}?", a.name)
+                        } else {
+                            a.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                spans.push(Span::styled(
+                    format!("  ◦ {names}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            // Why this task has no due date. `extract.rs` argues the note must
+            // ride on the task because THIS is the surface that accepts
+            // commitments — and then it reached everywhere except here.
+            if t.unreadable_when.is_some() {
+                spans.push(Span::styled(
+                    "  ⚠ unreadable date".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             if let Some(project) = &t.project {
                 spans.push(Span::styled(
                     format!("  [{project}]"),
