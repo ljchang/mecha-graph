@@ -2426,6 +2426,15 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                             .join(", ");
                         extra.push(format!("about {about}"));
                     }
+                    // The field exists because a row with no visible cause
+                    // reads like a bug in the filter — and this board is that
+                    // surface. On a graph predating `about`, every finished
+                    // task under a person is there only through a closed
+                    // claim, so `--entity X --all` is exactly the view it was
+                    // written to explain.
+                    if !t.previously_waiting_on.is_empty() {
+                        extra.push(format!("was waiting on {}", t.previously_waiting_on.join(", ")));
+                    }
                     if t.unreadable_when.is_some() {
                         extra.push("unreadable date".into());
                     }

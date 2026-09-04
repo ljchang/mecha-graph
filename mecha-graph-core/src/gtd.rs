@@ -218,12 +218,17 @@ fn list_tasks_filtered(
                 -- doc promises was not happening and only a second closed
                 -- claim would have shown it.
                 (SELECT group_concat(name, char(31)) FROM (
-                   SELECT pn.name AS name FROM fact pf
+                   SELECT pn.name AS name, MAX(pf.valid_to) AS last_held
+                   FROM fact pf
                    JOIN nodes pn ON pn.id = pf.object_id
                    WHERE pf.subject_id = n.id AND pf.predicate = 'waiting_on'
                      AND pf.polarity = 'positive'
                      AND pf.valid_to IS NOT NULL AND pf.invalidated_at IS NULL
-                   ORDER BY pf.valid_to DESC))
+                   -- One entry per person, not per closed row: a task handed
+                   -- back and forth listed the same holder repeatedly, and
+                   -- this reads as a list of people rather than of events.
+                   GROUP BY pn.id
+                   ORDER BY last_held DESC))
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?3 IS NULL OR n.id = ?3)
@@ -1017,19 +1022,29 @@ pub fn resolve_about(conn: &Connection, what: &str) -> Result<Option<crate::grap
     crate::graph::get_node(conn, what)
 }
 
-pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<String> {
-    require_task(conn, node_id)?;
+/// Every rule an `about` target must satisfy, in **one** place.
+///
+/// This is what a pre-flight guard has to call. A guard that only checked
+/// resolvability while the writer also refused ambiguity and task targets was
+/// weaker than the thing it guarded, which is worse than no guard: the check
+/// passed, `create_task` ran, and *then* the writer refused — leaving a task
+/// with no association and an error carrying no id, so the caller retried and
+/// made a second one. The whole point of checking first is that the answer
+/// binds the write that follows.
+///
+/// - **Ambiguity is surfaced, never resolved by sort order.** `about` is
+///   permanent by design, so this is where a wrong guess becomes
+///   unrecoverable, and `resolve_entity` takes `.next()` — two people called
+///   Wren meant whichever sorted first, with a byte-identical echo either
+///   way. ARCHITECTURE §2: an ambiguous name never auto-links.
+/// - **A task is not something another task is about.** The title scan
+///   excludes task nodes and `alias_pairs` warns every new caller to do the
+///   same; only the manual path did not.
+pub fn validate_about_target(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
     let what = what.trim();
     if what.is_empty() {
         return Err(Error::Other("about needs a name".into()));
     }
-    // **Ambiguity is surfaced, never resolved by sort order.** `about` is
-    // permanent by design, so the write path is the one that makes a wrong
-    // guess unrecoverable — and it was the quiet one: `resolve_entity` takes
-    // `.next()`, so two people called Wren meant whichever sorted first, and
-    // the echo is byte-identical either way. The read paths in this branch
-    // already print the node they chose; ARCHITECTURE §2 says an ambiguous
-    // name never auto-links.
     if what != OWNER {
         let matches = crate::graph::resolve_entity_all(conn, what)?;
         if matches.len() > 1 {
@@ -1045,20 +1060,11 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
             )));
         }
     }
-    let target = match resolve_about(conn, what)? {
-        Some(node) => node,
-        None => {
-            return Err(Error::Other(format!(
-                "no node matches '{what}' — about must name something the graph already knows"
-            )))
-        }
-    };
-    // A task is not something another task is *about*. The title scan
-    // excludes task nodes as targets and `alias_pairs` carries a note telling
-    // every new caller to do the same; the manual path did not, so
-    // `about_add: ["Book the venue"]` — a plausible slip for a model whose
-    // context is full of task titles — minted a task→task edge nothing in
-    // this feature expects.
+    let target = resolve_about(conn, what)?.ok_or_else(|| {
+        Error::Other(format!(
+            "no node matches '{what}' — about must name something the graph already knows"
+        ))
+    })?;
     if target.node_type == "task" {
         return Err(Error::Other(format!(
             "'{}' is a task — `about` files a task under a person, project or \
@@ -1066,6 +1072,16 @@ pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<St
             target.name
         )));
     }
+    Ok(target)
+}
+
+pub fn add_task_about(conn: &Connection, node_id: &str, what: &str) -> Result<String> {
+    require_task(conn, node_id)?;
+    let what = what.trim();
+    if what.is_empty() {
+        return Err(Error::Other("about needs a name".into()));
+    }
+    let target = validate_about_target(conn, what)?;
     let task_name: String = conn.query_row(
         "SELECT name FROM nodes WHERE id = ?1",
         params![node_id],

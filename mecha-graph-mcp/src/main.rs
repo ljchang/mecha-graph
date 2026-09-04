@@ -1541,6 +1541,100 @@ mod tests {
         assert_eq!(found[0].previously_waiting_on, vec!["Nadia".to_string()]);
     }
 
+    /// Reopening a task and naming who owes it, in one call, leaves a LIVE
+    /// claim — the mirror of the closing case.
+    ///
+    /// Both directions in one test on purpose. The two cases were fixed in
+    /// separate rounds and the second fix broke the first, because each was
+    /// an ordering tweak and the order can only satisfy one at a time.
+    /// Asserting them together is what stops a third reorder passing.
+    #[test]
+    fn status_and_waiting_on_in_one_call_agree_in_both_directions() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let live = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM fact_current
+                  WHERE subject_id = ?1 AND predicate = 'waiting_on'",
+                mecha_graph_core::rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Closing direction: done + a name leaves nobody owing it.
+        let a = kg_task_create(&conn, &json!({ "name": "a" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(
+            &conn,
+            &json!({ "task": a, "status": "done", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+        assert_eq!(live(&a), 0, "a finished task holds nobody");
+
+        // Reopening direction, on a task that was already done: the claim
+        // must survive, or you get an open `waiting` task nobody owes.
+        let b = kg_task_create(&conn, &json!({ "name": "b" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": b, "status": "done" })).unwrap();
+        kg_task_update(
+            &conn,
+            &json!({ "task": b, "status": "waiting", "waiting_on": "Nadia" }),
+        )
+        .unwrap();
+        assert_eq!(
+            live(&b),
+            1,
+            "a reopened waiting task has somebody to wait on"
+        );
+        assert_eq!(
+            gtd::get_task(&conn, &b)
+                .unwrap()
+                .unwrap()
+                .waiting_on
+                .as_deref(),
+            Some("Nadia")
+        );
+    }
+
+    /// A pre-flight check has to enforce everything the writer does, or it
+    /// lets the write begin and then refuses.
+    #[test]
+    fn the_about_precheck_is_not_weaker_than_the_writer() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("wren-a", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("wren-b", "person", "Wren")).unwrap();
+        let before = gtd::list_tasks(&conn, true).unwrap().len();
+
+        // Ambiguous: resolvable, so the old resolve-only guard passed it.
+        assert!(
+            kg_task_create(&conn, &json!({ "name": "x", "about": ["Wren"] })).is_err(),
+            "an ambiguous name must not get past the pre-check"
+        );
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before,
+            "and must leave no task behind for the retry to duplicate"
+        );
+
+        // A task target: also resolvable, also refused by the writer.
+        let t = kg_task_create(&conn, &json!({ "name": "a real task" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(kg_task_create(&conn, &json!({ "name": "y", "about": ["a real task"] })).is_err());
+        assert_eq!(
+            gtd::list_tasks(&conn, true).unwrap().len(),
+            before + 1,
+            "only the one legitimate task exists"
+        );
+        assert!(gtd::task_about(&conn, &t).unwrap().is_empty());
+    }
+
     /// Re-stating the current holder changes nothing, however many times.
     #[test]
     fn re_setting_the_same_waiting_on_does_not_make_them_their_own_predecessor() {
@@ -2079,12 +2173,12 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // cannot disagree about what a list of names is.
     let about_names = name_array(args, "about")?;
     for name in &about_names {
-        if gtd::resolve_about(conn, name)?.is_none() {
-            return Err(mecha_graph_core::Error::Other(format!(
-                "no node matches '{name}' — no task was created; \
-                 `about` must name something the graph already knows"
-            )));
-        }
+        // The FULL rule the writer applies, not a subset of it — see
+        // `validate_about_target`. A guard weaker than the thing it guards
+        // lets the create run and then refuses, which is the half-write this
+        // pre-check exists to prevent.
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
     }
     let task_id = gtd::create_task(
         conn,
@@ -2139,11 +2233,27 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     let to_add = names("about_add")?;
     let to_remove = names("about_remove")?;
     for name in to_add.iter().chain(to_remove.iter()) {
-        if gtd::resolve_about(conn, name)?.is_none() {
-            return Err(mecha_graph_core::Error::Other(format!(
-                "no node matches '{name}' — nothing was changed"
-            )));
-        }
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+
+    // **Status goes FIRST, so every field after it sees the status the
+    // caller is actually setting.**
+    //
+    // It briefly went last, to stop `{status: "done", waiting_on: "Nadia"}`
+    // asserting a live obligation onto a finished task. That was the right
+    // bug and the wrong layer: the guard now lives on `set_task_waiting_on`,
+    // which closes the claim itself when the task is done, so no call shape
+    // can route around it — and the reorder became not merely redundant but
+    // harmful. `set_task_waiting_on` reads the status from the row, so with
+    // status applied last it read the PRE-call value: `{status: "waiting",
+    // waiting_on: "Nadia"}` on a done task asserted the claim, immediately
+    // closed it because the row still said done, and only then reopened the
+    // task — an open `waiting` task that nobody owes. Two ordering fixes for
+    // the same field cancelled each other; the invariant on the writer is
+    // what actually holds, and this order is what lets it see the truth.
+    if let Some(status) = args["status"].as_str() {
+        gtd::set_task_status(conn, task, status)?;
     }
 
     // Absent field → untouched; "" → cleared — the same tri-state
@@ -2200,18 +2310,6 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             gtd::set_task_captured_from(conn, task, None)?;
         }
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
-    }
-
-    // **Status goes LAST, and the order is the guarantee.** Applied first, a
-    // single `{status: "done", waiting_on: "Nadia"}` closed nothing — there
-    // was nothing to close yet — and then asserted a live obligation onto a
-    // task that was already finished, which nothing afterwards would ever
-    // close. That is precisely the state this branch exists to make
-    // impossible, reachable through the one call a caller is most likely to
-    // make: recording who owed a thing at the same moment they record that
-    // it is done. Closing runs after every field that could open a claim.
-    if let Some(status) = args["status"].as_str() {
-        gtd::set_task_status(conn, task, status)?;
     }
 
     // `task_json`, not a second literal. The reason this response echoes
