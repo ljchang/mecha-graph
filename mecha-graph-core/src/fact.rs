@@ -1042,64 +1042,44 @@ pub fn get_fact_by_uid(conn: &Connection, uid: &str) -> Result<Option<Fact>> {
 /// filter on `polarity`, or read `fact_current` directly.
 /// Live facts touching a node, either end, best first.
 ///
-/// **Task associations are excluded from the ENTITY's side only** — asking a
-/// task for its own facts still returns its `waiting_on` and `about`, because
-/// there the association is the subject of the question rather than noise
-/// crowding out everything else. The exclusion is what keeps an entity's
-/// block about the entity rather than about its to-do list. `about` is a
-/// permanent live edge whose object is the entity, this query is
-/// bidirectional, and its ordering collapses to newest-first in practice —
-/// nothing writes `weight`, and a fresh fact has `observation_count = 1`. So
-/// a project with 25 associations (which the title scan can produce on its
-/// own, and which nothing ever closes) returned a `facts` block that was
-/// entirely task rows, with `works_on`, `member_of` and every recorded denial
-/// pushed off the bottom silently.
+/// **A task's `about` pointing AT this node is excluded**, on every caller.
 ///
-/// Nothing is lost: the same associations are served by the caller's `tasks`
-/// block, with status and dates a fact statement cannot carry, and by
-/// `kg_task_list` with `entity` in full.
+/// Scoped by predicate rather than by caller, and that is the second attempt.
+/// The first excluded all three task predicates but only for `kg_entity`,
+/// reasoning that the other four callers — the context pack, the scope
+/// summaries behind the `MEMORY.md` digest, the TUI entity screen and
+/// `mecha-graph entity` — have no `tasks` block to compensate. True of
+/// `waiting_on`, which had been on those surfaces all along and must stay.
+/// Not true of `about`, which is new and had nothing to regress, and which
+/// the title scan produces in bulk with nothing ever closing it. So opting
+/// four callers out of the fix left them showing a block that is entirely
+/// somebody's to-do titles, with `member_of` and every recorded denial off
+/// the bottom.
+///
+/// The narrower rule fixes all five at once and changes what none of them
+/// used to show. Ordering is why it matters: nothing writes `weight` and a
+/// fresh fact has `observation_count = 1`, so this collapses to newest-first
+/// and a bulk producer takes the whole window.
+///
+/// Asking a TASK for its own facts still returns its `about` — there the
+/// association is the subject of the question, not noise crowding it out.
 pub fn facts_for_node(conn: &Connection, node_id: &str, limit: i64) -> Result<Vec<Fact>> {
-    facts_for_node_opts(conn, node_id, limit, false)
-}
-
-/// [`facts_for_node`], minus the task associations pointing AT this node.
-///
-/// **Opt-in, because the exclusion is only safe where something replaces it.**
-/// A first cut applied it inside `facts_for_node` itself, which silently took
-/// `waiting_on` off four other surfaces that have no `tasks` block to
-/// compensate — the context pack, the scope summaries behind the `MEMORY.md`
-/// boot digest, the TUI entity screen and `mecha-graph entity`. `about` was
-/// new so nothing regressed there, but a live "X is waiting on her" had been
-/// on those surfaces all along, and afterwards it was on none of them with
-/// nothing else saying she owed it. A fix for one caller's crowding is not a
-/// licence to change what every other caller is told.
-pub fn facts_for_node_without_task_links(
-    conn: &Connection,
-    node_id: &str,
-    limit: i64,
-) -> Result<Vec<Fact>> {
-    facts_for_node_opts(conn, node_id, limit, true)
-}
-
-fn facts_for_node_opts(
-    conn: &Connection,
-    node_id: &str,
-    limit: i64,
-    drop_task_links: bool,
-) -> Result<Vec<Fact>> {
     let mut stmt = conn.prepare_cached(
         "SELECT f.* FROM fact f
          WHERE (f.subject_id = ?1 OR f.object_id = ?1)
            AND f.valid_to IS NULL AND f.invalidated_at IS NULL
-           AND NOT (?3
-                    AND f.object_id = ?1
-                    AND f.predicate IN ('about','waiting_on','assigned_to')
+           -- `IS`, not `=`: a literal-object fact has `object_id` NULL, and
+           -- `NULL = ?1` is NULL, so `NOT (…)` is NULL and SQLite drops the
+           -- row. That silently hid exactly the rows the paragraph above
+           -- promises to keep — a task's own literal-valued associations.
+           AND NOT (f.predicate = 'about'
+                    AND f.object_id IS ?1
                     AND EXISTS (SELECT 1 FROM task_detail td
                                 WHERE td.node_id = f.subject_id))
          ORDER BY f.weight DESC, f.observation_count DESC, f.ingested_at DESC LIMIT ?2",
     )?;
     let facts = stmt
-        .query_map(params![node_id, limit, drop_task_links], row_to_fact)?
+        .query_map(params![node_id, limit], row_to_fact)?
         .collect::<std::result::Result<_, _>>()?;
     Ok(facts)
 }

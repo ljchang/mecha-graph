@@ -2296,6 +2296,13 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     let node = gtd::resolve_about(&conn, name)?.ok_or_else(|| {
                         mecha_graph_core::Error::Other(format!("no node matches '{name}'"))
                     })?;
+                    // Echoed, like the MCP tool does: `resolve_entity` takes
+                    // the first match, so two people with the same name
+                    // resolve silently and the board looks like the answer to
+                    // a question about the other one.
+                    if !want_json(cli_json, cli_text) {
+                        println!("{} ({})", node.name, node.id);
+                    }
                     gtd::tasks_for_entity(&conn, &node.id, all)?
                 }
                 None => gtd::list_tasks(&conn, all)?,

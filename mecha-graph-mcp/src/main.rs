@@ -539,10 +539,10 @@ fn kg_entity(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
 
     let node = matches.remove(0);
     graph::increment_node_access(conn, &node.id)?;
-    // The variant that drops task associations, because this response is the
-    // one surface that serves them properly, in its own `tasks` block below.
-    // Every other caller of `facts_for_node` still sees them.
-    let facts: Vec<Value> = fact::facts_for_node_without_task_links(conn, &node.id, 25)?
+    // `facts_for_node` drops a task's `about` pointing at this node for every
+    // caller, so there is nothing to opt into here — see its doc for why the
+    // rule is scoped by predicate rather than by caller.
+    let facts: Vec<Value> = fact::facts_for_node(conn, &node.id, 25)?
         .into_iter()
         .map(|f| {
             json!({
@@ -1588,6 +1588,25 @@ mod tests {
             .unwrap();
         }
 
+        let waiting = kg_task_create(&conn, &json!({ "name": "owed thing" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kg_task_update(&conn, &json!({ "task": waiting, "waiting_on": "Nadia" })).unwrap();
+
+        // The SHARED reader, which the context pack, the boot digest, the TUI
+        // and `mecha-graph entity` all use. Scoping the fix to one caller left
+        // those four showing a block that was entirely her to-do titles.
+        let shared = mecha_graph_core::fact::facts_for_node(&conn, "p-nadia", 25).unwrap();
+        assert!(
+            shared.iter().all(|f| f.predicate != "about"),
+            "the fix reaches every caller, not just kg_entity"
+        );
+        assert!(
+            shared.iter().any(|f| f.predicate == "waiting_on"),
+            "while waiting_on stays — it was on those surfaces all along"
+        );
+
         let card = kg_entity(&conn, &json!({ "name_or_id": "Nadia" })).unwrap();
         let facts = card["facts"].as_array().unwrap();
         assert!(
@@ -1598,8 +1617,9 @@ mod tests {
             facts.iter().any(|f| f["predicate"] == "member_of"),
             "and the fact that says who she is survives"
         );
-        // They are not lost — the tasks block is where they belong.
-        assert_eq!(card["tasks"]["open"]["total"], 30);
+        // They are not lost — the tasks block is where they belong: the 30
+        // `about` tasks plus the one she is waiting on.
+        assert_eq!(card["tasks"]["open"]["total"], 31);
     }
 
     /// The card's task block is capped, and says so.

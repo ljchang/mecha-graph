@@ -949,6 +949,13 @@ pub fn propose_task_entities(
 ) -> Result<TaskScanReport> {
     let mut report = TaskScanReport::default();
     let pairs = crate::episode::alias_pairs(conn)?;
+    // One entry per (task, TARGET NODE), not per matching name. `alias_pairs`
+    // groups by name, so a node answering to several of them contributes a
+    // row each; a title containing two of one node's names was minted once —
+    // the pair guard sees the second — but counted twice, so the survey
+    // promised more than the apply delivered.
+    let mut seen_targets: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     // Every OPEN task, including ones that already carry an association.
     //
@@ -966,15 +973,19 @@ pub fn propose_task_entities(
     // spends a human's review budget on things nobody will act on. Closed
     // tasks that are already associated remain findable — this declines to
     // invent new claims about them, not to remember old ones.
+    // `ORDER BY` because a capped survey and the apply after it must walk the
+    // tasks in the same order, or the preview describes a different five.
     let mut stmt = conn.prepare(
         "SELECT n.id, n.name FROM nodes n JOIN task_detail td ON td.node_id = n.id
-          WHERE td.status NOT IN ('done','dropped')",
+          WHERE td.status NOT IN ('done','dropped')
+          ORDER BY n.created_at ASC, n.id ASC",
     )?;
     let tasks: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
+    let mut scanned_fully = 0usize;
     for (task_id, task_name) in tasks {
         report.scanned += 1;
         let lower = task_name.to_lowercase();
@@ -996,6 +1007,9 @@ pub fn propose_task_entities(
             }
             if *weak {
                 report.refused_weak += 1;
+                continue;
+            }
+            if !seen_targets.insert((task_id.clone(), node_id.clone())) {
                 continue;
             }
             let target_name: String = conn.query_row(
@@ -1034,6 +1048,12 @@ pub fn propose_task_entities(
             // the number the apply produces.
             if limit > 0 && report.minted == limit {
                 report.capped = true;
+                // `scanned` counts tasks READ, and the early return happens
+                // partway through one — so without this the report says it
+                // scanned three tasks when it read three and stopped inside
+                // the third. A count that stops mid-item is off by one in the
+                // direction that looks like less work was done.
+                report.scanned = scanned_fully;
                 return Ok(report);
             }
             report.minted += 1;
@@ -1059,6 +1079,7 @@ pub fn propose_task_entities(
             let cid = crate::fact::propose_fact(conn, &proposed, "linker:task-title", None)?;
             crate::fact::mint_shadow_candidate(conn, cid)?;
         }
+        scanned_fully += 1;
     }
     Ok(report)
 }
