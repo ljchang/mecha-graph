@@ -69,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`kg_upsert` now refuses a `valid_from` that is not a date.** It wrote the
+  string verbatim, and at `confidence >= 0.9` auto-accepts, so prose reached
+  `fact.valid_from` with no human in between — the same defect as the
+  commitment path below, on the higher-volume route. Shipping `repair-dates`
+  without closing this would have made the repair a treadmill: idempotent in
+  its own test, dirty again by morning.
+
 - **A model's `when` is parsed before it is stored.** `accept_commitment`
   wrote the extractor's raw string into three date columns —
   `task_detail.due_at` and the `valid_from` of both facts it asserts. A

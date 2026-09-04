@@ -2315,7 +2315,21 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         extra.push(format!("waiting on {w}"));
                     }
                     if !t.about.is_empty() {
-                        extra.push(format!("about {}", t.about.join(", ")));
+                        // `?` marks an unreviewed association, so a scanned
+                        // guess does not read like something somebody filed.
+                        let about = t
+                            .about
+                            .iter()
+                            .map(|a| {
+                                if a.unreviewed {
+                                    format!("{}?", a.name)
+                                } else {
+                                    a.name.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        extra.push(format!("about {about}"));
                     }
                     if let Some(p) = &t.project {
                         extra.push(format!("[{p}]"));

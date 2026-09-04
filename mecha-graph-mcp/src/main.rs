@@ -93,7 +93,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_entity",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, `sources` — which episode sources cover this entity, how many episodes each holds and over what span — and `tasks`, this entity's board split into `open` and `closed`. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again. A task in `tasks` may carry an unreviewed association: the title scan proposes `about` links at tier 'shadow', so check the fact's tier before treating 'this task is about X' as established.",
+            "description": "Resolve a name/alias/email to an entity and return its current facts, per-channel interaction recency, scope context, recent episodes, `sources` — which episode sources cover this entity, how many episodes each holds and over what span — and `tasks`, this entity's board split into `open` and `closed`. Multiple matches are returned for disambiguation. Facts carry a `polarity`: 'negative' is a recorded denial — this was already asked and answered no, so treat it as settled and do not propose it again. Each entry in a task's `about` is `{name, unreviewed}` — the title scan proposes associations at tier 'shadow', and `unreviewed: true` marks one nothing has vetted, so do not report it to a person as established without saying so.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -200,7 +200,7 @@ fn tool_definitions() -> Value {
                     "object": { "type": "string" },
                     "object_value": { "type": "string" },
                     "statement": { "type": "string", "description": "Natural-language sentence form of the fact" },
-                    "valid_from": { "type": "string" },
+                    "valid_from": { "type": "string", "description": "When this became true, as YYYY-MM-DD (an RFC 3339 instant is accepted and keeps its date half). Anything else is refused rather than stored: this column is compared as a date, so prose sorts as one and silently answers the wrong side of every as_of query. Omit it when you do not know — absent is honest, a guess is not." },
                     "confidence": { "type": "number" },
                     "alias": { "type": "string", "description": "kind=alias: the alias text" },
                     "node_id": { "type": "string", "description": "kind=alias: the node it belongs to (an id, not a name)" },
@@ -236,7 +236,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about`, and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -838,7 +838,34 @@ fn kg_upsert(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value>
         object: args["object"].as_str().map(|s| s.to_string()),
         object_value: args["object_value"].as_str().map(|s| s.to_string()),
         statement: args["statement"].as_str().unwrap_or_default().to_string(),
-        valid_from: args["valid_from"].as_str().map(|s| s.to_string()),
+        // **The second faucet.** `accept_commitment` learned to parse its
+        // date; this writes the same column and did not, and it is the
+        // higher-volume path — agents write beliefs constantly, commitments
+        // are rare — and at `confidence >= 0.9` it auto-accepts, so the value
+        // reaches `fact.valid_from` verbatim with no human in between.
+        // Shipping `repair-dates` without closing this makes the repair a
+        // treadmill: its idempotence holds in the unit test and fails on a
+        // live graph by morning. Refused rather than dropped here, unlike the
+        // commitment path — a caller staging one fact can be told about one
+        // bad field, where a batch accept cannot stop for each.
+        valid_from: match args["valid_from"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(
+                gtd::parse_due(raw)
+                    .map_err(|e| {
+                        mecha_graph_core::Error::Other(format!(
+                            "`valid_from` must be YYYY-MM-DD (or an RFC 3339 instant): {e}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        mecha_graph_core::Error::Other("`valid_from` parsed to nothing".into())
+                    })?,
+            ),
+            None => None,
+        },
         confidence: args["confidence"].as_f64(),
         tags: args["tags"].as_str().map(|s| s.to_string()),
         ..Default::default()
@@ -1372,7 +1399,11 @@ mod tests {
         let board = kg_task_list(&conn, &json!({ "entity": "Ostrander" })).unwrap();
         assert_eq!(board["items"].as_array().unwrap().len(), 1);
         assert_eq!(board["entity"]["name"], "Ostrander");
-        assert_eq!(board["items"][0]["about"][0], "Ostrander");
+        assert_eq!(board["items"][0]["about"][0]["name"], "Ostrander");
+        assert_eq!(
+            board["items"][0]["about"][0]["unreviewed"], false,
+            "a hand-set association is not a guess, and the surface says which"
+        );
     }
 
     /// The entity's card carries its board, split by whether it is still
@@ -1466,6 +1497,68 @@ mod tests {
         // The right shape still works.
         kg_task_update(&conn, &json!({ "task": id, "about_add": ["Nadia"] })).unwrap();
         assert_eq!(gtd::task_about(&conn, &id).unwrap().len(), 1);
+    }
+
+    /// The update response says what the associations now are, so a removal
+    /// that removed nothing is visible.
+    #[test]
+    fn the_update_response_echoes_about() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let id = kg_task_create(&conn, &json!({ "name": "x", "about": ["Nadia"] })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Removing something that was never there resolves fine and does
+        // nothing — the echo is the only way a caller finds out.
+        let out = kg_task_update(&conn, &json!({ "task": id, "about_remove": ["Wren"] })).unwrap();
+        let about = out["task"]["about"].as_array().unwrap();
+        assert_eq!(about.len(), 1, "Nadia is still there");
+        assert_eq!(about[0]["name"], "Nadia");
+
+        let out = kg_task_update(&conn, &json!({ "task": id, "about_remove": ["Nadia"] })).unwrap();
+        assert!(
+            out["task"]["about"].as_array().unwrap().is_empty(),
+            "and a removal that did happen shows as one"
+        );
+    }
+
+    /// `kg_upsert` cannot write prose into a date column.
+    #[test]
+    fn valid_from_must_be_a_date() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let bad = kg_upsert(
+            &conn,
+            &json!({
+                "kind": "fact", "subject": "Nadia", "predicate": "works_on",
+                "statement": "Nadia works on the pilot",
+                "valid_from": "sometime in 2019", "confidence": 0.95
+            }),
+        );
+        assert!(
+            bad.is_err(),
+            "prose in a date column is refused at the door"
+        );
+
+        // A real date, and an instant, both land.
+        for v in ["2019-04-01", "2019-04-01T09:00:00Z"] {
+            kg_upsert(
+                &conn,
+                &json!({
+                    "kind": "fact", "subject": "Nadia", "predicate": "works_on",
+                    "statement": format!("Nadia works on the pilot since {v}"),
+                    "valid_from": v, "confidence": 0.5
+                }),
+            )
+            .unwrap();
+        }
+        // And the repair pass has nothing to do afterwards, which is the
+        // property that makes it a repair rather than a treadmill.
+        let report = gtd::repair_unparseable_dates(&conn, false).unwrap();
+        assert!(report.found.is_empty());
     }
 
     /// A person's `facts` block is about them, not about their to-do list.
@@ -2000,21 +2093,21 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
     }
 
+    // `task_json`, not a second literal. The reason this response echoes
+    // `waiting_on` at all — a caller cannot otherwise tell a successful set
+    // from a silently ignored one, because the field is a fact rather than a
+    // column — is exactly as true of `about`, and the hand-written copy
+    // omitted it. `about_remove` on a task that was never filed there updates
+    // nothing and reports `updated`, so the echo is the only way a caller
+    // learns the unfiling did not happen. One renderer means the two
+    // responses cannot drift again.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
     let updated = gtd::list_tasks(conn, true)?
         .into_iter()
         .find(|t| t.node_id == task)
-        .map(|t| {
-            json!({
-                "id": t.node_id, "name": t.name, "status": t.status,
-                "due_at": t.due_at, "defer_until": t.defer_until,
-                "context": t.context_tag, "completed_at": t.completed_at,
-                // Reported back because the caller cannot otherwise tell a
-                // successful set from a silently-ignored one — the field is
-                // written as a fact, not a column, so it does not turn up in
-                // the row by itself.
-                "waiting_on": t.waiting_on, "session": t.session,
-                "captured_from": t.captured_from
-            })
-        });
+        .map(|t| task_json(&t, &today));
     Ok(json!({ "v": 1, "status": "updated", "task": updated }))
 }

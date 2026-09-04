@@ -52,7 +52,7 @@ pub struct TaskItem {
     /// person's card carrying stale "waiting on" claims forever and their
     /// finished work becoming unfindable. Keeping them apart is what lets
     /// both be right.
-    pub about: Vec<String>,
+    pub about: Vec<TaskAbout>,
     /// What the task was captured *from* — the email that asked, the
     /// stranger's request, the conversation it fell out of. See
     /// [`set_task_captured_from`] for the shape and why it is a pointer.
@@ -63,6 +63,24 @@ pub struct TaskItem {
     /// surface shows the way back only when there is one. Same rule as
     /// [`TaskItem::session`], one field over.
     pub captured_from: Option<serde_json::Value>,
+}
+
+/// One entity a task is filed under, and whether anybody has vetted that.
+///
+/// `unreviewed` exists because the title scan files associations at tier
+/// `shadow`, and "inference is served, never asserted" is only kept if the
+/// label survives to the surface. It did not: `task_json` carried a bare
+/// name, and the `facts` block on the same response deliberately excludes
+/// these predicates, so a scanned guess and a human's assertion rendered
+/// identically with no tier anywhere in the payload. A reader cannot check
+/// what it is not told.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskAbout {
+    pub name: String,
+    /// True while the association sits at any tier other than `reviewed`.
+    /// Fail-closed, matching `Fact::is_shadow`: a tier this build has never
+    /// heard of reads as unvetted rather than as fine.
+    pub unreviewed: bool,
 }
 
 /// The predicates that associate a task with an entity, for the purposes of
@@ -97,6 +115,9 @@ const HISTORICAL_TASK_PREDICATES: &[&str] = &["waiting_on"];
 /// than a comma, because a node name may contain a comma and splitting on
 /// one would quietly saw a person in half.
 const NAME_SEP: char = '\u{1f}';
+/// And name from tier inside one entry, on record separator — same reason,
+/// one level down.
+const FIELD_SEP: char = '\u{1e}';
 
 /// All tasks, actionable statuses first then by due date. `include_closed`
 /// adds done/dropped (newest completions first within their group).
@@ -148,7 +169,10 @@ fn list_tasks_filtered(
                 (SELECT p.name FROM nodes p WHERE p.id = td.parent_id),
                 (SELECT pn.name FROM fact_current f JOIN nodes pn ON pn.id = f.object_id
                  WHERE f.subject_id = n.id AND f.predicate = 'waiting_on' LIMIT 1),
-                (SELECT group_concat(an.name, char(31)) FROM fact_current af
+                -- Name and tier together, so the reviewed flag cannot be lost
+                -- between the two columns that would otherwise carry them.
+                (SELECT group_concat(an.name || char(30) || af.tier, char(31))
+                 FROM fact_current af
                  JOIN nodes an ON an.id = af.object_id
                  WHERE af.subject_id = n.id AND af.predicate = 'about')
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
@@ -224,7 +248,25 @@ fn list_tasks_filtered(
                 waiting_on: r.get(11)?,
                 about: r
                     .get::<_, Option<String>>(12)?
-                    .map(|joined| joined.split(NAME_SEP).map(str::to_string).collect())
+                    .map(|joined| {
+                        joined
+                            .split(NAME_SEP)
+                            .map(|entry| match entry.split_once(FIELD_SEP) {
+                                // Fail-closed on the tier, like `is_shadow`:
+                                // only an explicit "reviewed" counts as
+                                // vetted, and a missing half reads unvetted
+                                // rather than fine.
+                                Some((name, tier)) => TaskAbout {
+                                    name: name.to_string(),
+                                    unreviewed: tier != "reviewed",
+                                },
+                                None => TaskAbout {
+                                    name: entry.to_string(),
+                                    unreviewed: true,
+                                },
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default(),
             })
         })?
@@ -688,35 +730,42 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // happened. `polarity = 'positive'` for the same reason as the other two
     // closes: a live negative is a recorded denial, and reassignment is not
     // this function's licence to retract it.
-    // **Clearing is editorial; re-pointing is temporal.** `waiting_on: ""`
-    // is the only way to undo a wrongly-set claim, and there is no other
-    // route to it — `about_remove` cannot reach this predicate. Closing it in
-    // valid time like a reassignment would leave the task on that person's
-    // board and card permanently, with no correction available, which is the
-    // same defect an explicit `remove_task_about` was fixed for one predicate
-    // over. So a clear retracts (`invalidated_at`) and a hand-off closes
-    // (`valid_to`).
+    // **Clearing is editorial; re-pointing is temporal.** A hand-off closes
+    // in valid time — they held it, then it moved — while `waiting_on: ""`
+    // retracts, because it is the only correction gesture this predicate has
+    // and `about_remove` cannot reach it.
+    //
+    // The clear deliberately reaches rows that are already CLOSED, not just
+    // live ones, and that is the difference between a correction and a
+    // half-correction. The common way to fix a mis-set name is to name the
+    // right person — `waiting_on: "Wren"` when the row says Nadia — which is
+    // a re-point, so Nadia's row ends up closed-positive. `waiting_on` reads
+    // through `valid_to`, so she keeps the task on her card forever, and a
+    // later clear scoped to live rows would not touch hers. An editorial
+    // close is editorial whenever you notice it.
     //
     // The cost, stated rather than discovered: "they held it, then nobody
-    // did" is recorded as if they never held it. That case is rare — work
-    // normally completes or moves, and both of those keep their history —
-    // whereas a mis-set name is ordinary, and leaving it uncorrectable is
-    // worse than losing a rare true history.
+    // did" is recorded as if they never held it, and a clear after a genuine
+    // hand-off chain retracts the whole chain rather than the last link. Both
+    // are rarer than a mis-set name, and a wrong claim about a real person
+    // that no command can remove is the worse failure.
     let clearing = target.is_none();
-    let close_column = if clearing {
-        "invalidated_at"
+    if clearing {
+        conn.execute(
+            "UPDATE fact SET invalidated_at = datetime('now')
+              WHERE subject_id = ?1 AND predicate = 'waiting_on'
+                AND polarity = 'positive' AND invalidated_at IS NULL",
+            params![node_id],
+        )?;
     } else {
-        "valid_to"
-    };
-    conn.execute(
-        &format!(
-            "UPDATE fact SET {close_column} = datetime('now')
+        conn.execute(
+            "UPDATE fact SET valid_to = datetime('now')
               WHERE subject_id = ?1 AND predicate = 'waiting_on'
                 AND polarity = 'positive'
-                AND valid_to IS NULL AND invalidated_at IS NULL"
-        ),
-        params![node_id],
-    )?;
+                AND valid_to IS NULL AND invalidated_at IS NULL",
+            params![node_id],
+        )?;
+    }
 
     let Some(target) = target else {
         return Ok(None);
@@ -978,16 +1027,18 @@ pub fn propose_task_entities(
                 report.already += 1;
                 continue;
             }
-            // Counted whether or not it is written, so the survey's number is
-            // the number the apply will produce.
+            // The cap is checked on BOTH paths, above the apply guard, or the
+            // survey counts every match while the apply files `limit` of them
+            // and the preview a human is meant to judge disagrees with the
+            // run. Counted whether or not it is written, so the dry number is
+            // the number the apply produces.
+            if limit > 0 && report.minted == limit {
+                report.capped = true;
+                return Ok(report);
+            }
             report.minted += 1;
             if !apply {
                 continue;
-            }
-            if limit > 0 && report.minted > limit {
-                report.minted -= 1;
-                report.capped = true;
-                return Ok(report);
             }
             let proposed = crate::fact::ProposedFact {
                 subject: task_name.clone(),
@@ -1621,7 +1672,12 @@ mod tests {
         assert_eq!(closed.len(), 1, "a finished task stays findable under them");
         assert_eq!(closed[0].status, "done");
         assert!(closed[0].completed_at.is_some());
-        assert_eq!(closed[0].about, vec!["Ostrander".to_string()]);
+        assert_eq!(closed[0].about.len(), 1);
+        assert_eq!(closed[0].about[0].name, "Ostrander");
+        assert!(
+            !closed[0].about[0].unreviewed,
+            "a hand-asserted association is reviewed, not a guess"
+        );
 
         // And the live claim is gone: nobody owes a finished task. This is
         // the assertion that fails loudest on the old code.
@@ -2027,6 +2083,68 @@ mod tests {
         assert_eq!(tasks_for_entity(&conn, "p-wren", true).unwrap().len(), 1);
     }
 
+    /// Correcting a mis-set `waiting_on` by naming the right person, then
+    /// clearing, actually removes it from the first person.
+    ///
+    /// The common correction gesture is "no, it's Wren" — a re-point, which
+    /// closes Nadia's row in valid time. `waiting_on` reads through
+    /// `valid_to`, so she kept the task on her card, and a clear scoped to
+    /// LIVE rows could never reach hers: no command could undo it. An
+    /// editorial close is editorial whenever you get round to it.
+    #[test]
+    fn a_wrong_name_is_recoverable_even_after_re_pointing() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let id = create_task(&conn, "Book the venue", None, None, None).unwrap();
+
+        set_task_waiting_on(&conn, &id, "Nadia").unwrap(); // wrong person
+        set_task_waiting_on(&conn, &id, "Wren").unwrap(); // the correction
+        assert_eq!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().len(),
+            1,
+            "a re-point alone still reads as history — she did hold it"
+        );
+
+        // Now say it outright: nobody owes this.
+        set_task_waiting_on(&conn, &id, "").unwrap();
+        assert!(
+            tasks_for_entity(&conn, "p-nadia", true).unwrap().is_empty(),
+            "the clear reaches an already-closed row, or nothing ever can"
+        );
+        assert!(tasks_for_entity(&conn, "p-wren", true).unwrap().is_empty());
+    }
+
+    /// An unreviewed association says so on the way out.
+    #[test]
+    fn a_scanned_association_is_labelled_unreviewed() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let scanned = create_task(&conn, "Ship the Tidelab pilot", None, None, None).unwrap();
+        let asserted = create_task(&conn, "Write the summary", None, None, None).unwrap();
+        add_task_about(&conn, &asserted, "Nadia").unwrap();
+        propose_task_entities(&conn, true, 0).unwrap();
+
+        let by_id = |id: &str| {
+            list_tasks(&conn, true)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.node_id == id)
+                .unwrap()
+        };
+        let guess = by_id(&scanned);
+        assert_eq!(guess.about.len(), 1);
+        assert!(
+            guess.about[0].unreviewed,
+            "a title-scan guess must not render like an assertion"
+        );
+        assert!(
+            !by_id(&asserted).about[0].unreviewed,
+            "and what a human filed must not render like a guess"
+        );
+    }
+
     /// The scan surveys before it writes, and the survey's count is the
     /// apply's count.
     #[test]
@@ -2039,6 +2157,11 @@ mod tests {
 
         let dry = propose_task_entities(&conn, false, 0).unwrap();
         assert_eq!(dry.minted, 2, "the survey counts what an apply would write");
+        // The cap binds on a survey too, or the preview a human judges
+        // overstates the run it is previewing.
+        let dry_capped = propose_task_entities(&conn, false, 1).unwrap();
+        assert_eq!(dry_capped.minted, 1, "the preview honours --limit");
+        assert!(dry_capped.capped);
         assert!(
             list_tasks(&conn, true)
                 .unwrap()
