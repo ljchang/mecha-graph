@@ -1230,10 +1230,30 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
             )));
         }
     }
+    // A deliberate re-file or clear is the one path that moved a parent
+    // without a record, and the likeliest of the four (found on review):
+    // the parent being left is recorded like a detachment, and — since the
+    // operator or agent chose it — marked reviewed at once, so it is a
+    // record and not a pending finding.
+    let was: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    let moving = matches!(&was, Some(old) if Some(old.as_str()) != parent_id);
     conn.execute(
         "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
         params![node_id, parent_id],
     )?;
+    if moving {
+        let old = was.expect("moving implies a former parent");
+        record_detachment(conn, node_id, &old, "re-filed")?;
+        conn.execute(
+            "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+             WHERE id = ?1",
+            params![node_id],
+        )?;
+    }
     Ok(())
 }
 

@@ -1830,6 +1830,14 @@ mod tests {
         );
         assert_eq!(row["task"]["project_id"], "proj-tide");
 
+        // A list where a string belongs refuses the call, and nothing is
+        // written — `status: ["done"]` used to answer `updated` untouched.
+        let e = kg_task_update(&conn, &json!({ "task": id, "status": ["done"] }))
+            .expect_err("a non-string status is refused");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(row["task"]["status"], "next");
+
         // A typo in waiting_on refuses the call before the status write —
         // the case that used to close the task and retire the live claim.
         let e = kg_task_update(
@@ -2447,6 +2455,20 @@ fn project_arg(args: &Value) -> mecha_graph_core::Result<Option<&str>> {
     }
 }
 
+/// A scalar field as a string, or refused: a number or a list where a
+/// string belongs is not silently the same as an absent field — `status:
+/// ["done"]` answered `updated` with nothing written (found on review;
+/// `project_arg`'s rule, for every scalar the update reads).
+fn scalar_arg<'a>(args: &'a Value, key: &str) -> mecha_graph_core::Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` must be a string, not {other} — nothing was changed"
+        ))),
+    }
+}
+
 fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let task = args["task"]
         .as_str()
@@ -2487,21 +2509,28 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // had already closed the task and retired its `waiting_on` claim — the
     // half-write the `project` pre-check closes, one field over (found on
     // review).
-    let sched = |v: &Value| -> mecha_graph_core::Result<Option<Option<String>>> {
-        match v.as_str() {
+    let sched = |key: &str| -> mecha_graph_core::Result<Option<Option<String>>> {
+        match scalar_arg(args, key)? {
             None => Ok(None),
             Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
                 mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
             })?)),
         }
     };
-    let due = sched(&args["due"])?;
-    let defer = sched(&args["defer"])?;
+    let due = sched("due")?;
+    let defer = sched("defer")?;
+    // Every scalar the writes below read, checked for shape here so a list
+    // where a string belongs refuses the call rather than skipping the
+    // field and answering `updated`.
+    let status_arg = scalar_arg(args, "status")?;
+    let context_arg = scalar_arg(args, "context")?;
+    let waiting_on_arg = scalar_arg(args, "waiting_on")?;
+    let session_arg = scalar_arg(args, "session")?;
     // And who the task waits on — resolved after the status landed, a typo
     // returned an error on a call that had already closed the task and
     // retired the live claim (found on review, the one writer the block's
     // claim had missed).
-    if let Some(who) = args["waiting_on"].as_str() {
+    if let Some(who) = waiting_on_arg {
         gtd::resolve_waiting_on(conn, who)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
     }
@@ -2538,16 +2567,14 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // task — an open `waiting` task that nobody owes. Two ordering fixes for
     // the same field cancelled each other; the invariant on the writer is
     // what actually holds, and this order is what lets it see the truth.
-    if let Some(status) = args["status"].as_str() {
+    if let Some(status) = status_arg {
         gtd::set_task_status(conn, task, status)?;
     }
 
     // Absent field → untouched; "" → cleared — the same tri-state
     // update_task_schedule speaks; the dates were parsed in the pre-flight
     // block above, before the first write.
-    let context = args["context"]
-        .as_str()
-        .map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
+    let context = context_arg.map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
     if due.is_some() || defer.is_some() || context.is_some() {
         gtd::update_task_schedule(
             conn,
@@ -2560,10 +2587,10 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
 
     // After the schedule, because both can arrive in one call and a caller
     // moving a task to `waiting` almost always names who in the same breath.
-    if let Some(who) = args["waiting_on"].as_str() {
+    if let Some(who) = waiting_on_arg {
         gtd::set_task_waiting_on(conn, task, who)?;
     }
-    if let Some(session) = args["session"].as_str() {
+    if let Some(session) = session_arg {
         gtd::set_task_session(conn, task, session)?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
