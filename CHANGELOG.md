@@ -33,7 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a container — only the type would move, or the row would land on a
   project, and the task would be a legal parent the survey could not
   see. `project_id` comes from the same join as `project`, so a parent
-  whose node row is gone is handed out by neither. `mecha-graph task-project <task>` with no
+  whose node row is gone is handed out by neither. A parent argument
+  that is a node id resolves to that node before any name, so the id
+  the board hands out always comes back to the same node. `mecha-graph task-project <task>` with no
   parent prints the current one and every detachment the store recorded.
   On `kg_task_update` the parent is resolved before anything is written,
   so a refused one changes nothing — not a status that already landed.

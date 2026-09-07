@@ -687,23 +687,26 @@ pub fn tasks_under(conn: &Connection, node_id: &str) -> Result<usize> {
 /// only other record of it would be somebody's terminal (found on review).
 /// Returns how many were detached.
 pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> Result<usize> {
-    // The record needs the parent node; the detach does not. A parent row
-    // that is gone (a store attached with foreign keys off can carry a
-    // `parent_id` whose node is not there) must still lose its children,
-    // or the pass meant to remove the unfit parent would report success
-    // and leave it (found on review). Fail closed on the write, not the
-    // record.
-    if let Some(parent) = crate::graph::get_node(conn, parent_id)? {
-        let record = detached_record(&parent.id, &parent.name, &parent.node_type, reason);
-        conn.execute(
-            &format!(
-                "UPDATE nodes SET properties = {}
-                 WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
-                APPEND_DETACHED
-            ),
-            params![parent_id, record],
-        )?;
-    }
+    // A parent row that is gone (a store attached with foreign keys off
+    // can carry a `parent_id` whose node is not there) must still lose
+    // its children, or the pass meant to remove the unfit parent would
+    // report success and leave it (found on review).
+    // A parent whose row is gone still gets a record — the id is in hand,
+    // and the name and type read `missing`, as the survey reports the same
+    // case (found on review: the one detachment that left no record was
+    // the one hardest to reconstruct).
+    let record = match crate::graph::get_node(conn, parent_id)? {
+        Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
+        None => detached_record(parent_id, "", MISSING_PARENT, reason),
+    };
+    conn.execute(
+        &format!(
+            "UPDATE nodes SET properties = {}
+             WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
+            APPEND_DETACHED
+        ),
+        params![parent_id, record],
+    )?;
     let n = conn.execute(
         "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
         params![parent_id],
@@ -856,9 +859,8 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
 
 /// The project a task is filed under, from a name, alias or node id.
 ///
-/// Names first, then the id, as `resolve_about` orders it: a name is what a
-/// caller normally has, and an id shaped like a name is not a thing here.
-/// The board hands out `project_id` beside the name, and a pointer a server
+/// The id first, then the name (see the body for why the order is the
+/// reverse of `resolve_about`'s). The board hands out `project_id` beside the name, and a pointer a server
 /// hands out must be one it accepts back — a consumer filing a task under
 /// the project it just read would otherwise be refused for citing the id it
 /// was told to cite. **Ambiguity is surfaced, never resolved by sort
@@ -869,23 +871,32 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
 /// it, the guess became a durable pointer (found on review). Now that the
 /// id path exists, "name the id instead" is advice the caller can follow.
 pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
-    let matches = crate::graph::resolve_entity_all(conn, what)?;
-    let node = match matches.len() {
-        1 => matches.into_iter().next().expect("one match"),
-        0 => match crate::graph::get_node(conn, what)? {
-            Some(node) => node,
-            None => return Err(Error::Other(format!("no node matches project '{what}'"))),
-        },
-        n => {
-            let names: Vec<String> = matches
-                .iter()
-                .map(|n| format!("{} ({})", n.name, n.id))
-                .collect();
-            return Err(Error::Other(format!(
-                "'{what}' matches {n} nodes — name the id instead, since a task's parent is \
-                 durable and echoed as `project_id`: {}",
-                names.join(", ")
-            )));
+    // The id first, exactly: the round-trip this feature sells — a pointer
+    // the server hands out is one it accepts back — holds only if an
+    // argument that *is* a node id resolves to that node, and this graph
+    // does contain nodes whose name is another node's id
+    // (`repair_node_id_payloads` exists for them). Names-first would file
+    // under the placeholder on an exact canonical match with no ambiguity
+    // to tell the two apart (found on review). A name that collides with
+    // an existing id loses to the id, by this rule.
+    let node = if let Some(node) = crate::graph::get_node(conn, what)? {
+        node
+    } else {
+        let matches = crate::graph::resolve_entity_all(conn, what)?;
+        match matches.len() {
+            1 => matches.into_iter().next().expect("one match"),
+            0 => return Err(Error::Other(format!("no node matches project '{what}'"))),
+            n => {
+                let names: Vec<String> = matches
+                    .iter()
+                    .map(|n| format!("{} ({})", n.name, n.id))
+                    .collect();
+                return Err(Error::Other(format!(
+                    "'{what}' matches {n} nodes — name the id instead, since a task's parent is \
+                     durable and echoed as `project_id`: {}",
+                    names.join(", ")
+                )));
+            }
         }
     };
     if NEVER_A_PARENT.contains(&node.node_type.as_str()) {
@@ -2351,13 +2362,10 @@ mod tests {
         assert_eq!(detach_tasks_under(&conn, "proj-ghost", "test").unwrap(), 1);
         assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
         let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
-        assert_eq!(
-            node.properties["detached_parents"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
+        let records = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(records.len(), 3, "the orphan detachment is recorded too");
+        assert_eq!(records[2]["id"], "proj-ghost");
+        assert_eq!(records[2]["type"], MISSING_PARENT);
         // And the survey sees an orphan parent too, and detaches it on apply.
         upsert_node(&conn, &Node::new("proj-gone2", "project", "Gone")).unwrap();
         set_task_project(&conn, &t, "proj-gone2").unwrap();
@@ -2407,6 +2415,30 @@ mod tests {
         )
         .unwrap();
         assert!(crate::graph::retype_node(&conn, "proj-odd", "person").is_err());
+    }
+
+    /// An argument that is a node id resolves to that node even when
+    /// another node's name is that id — the round-trip is exact.
+    #[test]
+    fn an_id_resolves_to_its_node_before_any_name_that_collides_with_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-placeholder", "project", "proj-tide"),
+        )
+        .unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, Some("proj-tide"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide"),
+            "the id, not the placeholder whose name is the id"
+        );
+        let u = create_task(&conn, "Write it up", None, Some("Tide pool study"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide")
+        );
     }
 
     /// A task cannot be merged into a container: the row would move and
