@@ -248,13 +248,13 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_create",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
-            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` must name an existing graph node — an unknown name is an error, not an implicit node.",
+            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` must name an existing project or topic node, by name or node id (the `project_id` a task row carries) — an unknown name is an error, not an implicit node, and a task is not a parent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
-                    "project": { "type": "string", "description": "Parent project/topic — must resolve to an existing node" },
+                    "project": { "type": "string", "description": "Parent project/topic, by name or node id — must resolve to an existing node, and never a task" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
                     "about": {
                         "type": "array",

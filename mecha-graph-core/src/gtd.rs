@@ -592,13 +592,31 @@ pub fn create_task(
     // orders it: a name is what a caller normally has, and an id shaped
     // like a name is not a thing here.
     let parent_id = match project_name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => match crate::graph::resolve_entity(conn, p)? {
-            Some(node) => Some(node.id),
-            None => match crate::graph::get_node(conn, p)? {
-                Some(node) => Some(node.id),
-                None => return Err(Error::Other(format!("no node matches project '{p}'"))),
-            },
-        },
+        Some(p) => {
+            let node = match crate::graph::resolve_entity(conn, p)? {
+                Some(node) => node,
+                None => match crate::graph::get_node(conn, p)? {
+                    Some(node) => node,
+                    None => return Err(Error::Other(format!("no node matches project '{p}'"))),
+                },
+            };
+            // A task is not a parent, whichever tier found it: the id path
+            // accepts every node id the server hands out, and a board row
+            // carries the task's own id beside its `project_id` — the
+            // confusion two adjacent id fields invite — so without this a
+            // follow-up filed under `task-…` would render as a project and
+            // the goal record would cite a task as one (found on review;
+            // `validate_about_target`'s rule, one field over). The type
+            // check covers the name path too.
+            if node.node_type == "task" {
+                return Err(Error::Other(format!(
+                    "'{}' is a task, not a project — a task's parent is a project or topic \
+                     node, by name or node id",
+                    node.name
+                )));
+            }
+            Some(node.id)
+        }
         None => None,
     };
     let task_id = format!("task-{}", &crate::ids::new_uid()[..8]);
@@ -1768,6 +1786,15 @@ mod tests {
             create_task(&conn, "Nowhere", None, Some("proj-nope"), None).is_err(),
             "an unknown id is still an error, not an implicit node"
         );
+        // A task is not a parent, by id or by name: the row's own id sits
+        // beside its `project_id`, and filing under the wrong one must be
+        // refused rather than rendered as a project.
+        let e = create_task(&conn, "Under a task", None, Some(&by_id.node_id), None)
+            .expect_err("a task id as a parent is refused");
+        assert!(e.to_string().contains("is a task, not a project"), "{e}");
+        let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
+            .expect_err("a task name as a parent is refused");
+        assert!(e.to_string().contains("is a task, not a project"), "{e}");
     }
 
     #[test]
