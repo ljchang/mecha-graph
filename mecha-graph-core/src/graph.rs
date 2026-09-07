@@ -909,6 +909,17 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     // keeping the id, the facts, the mentions and the `about` edges the
     // doc above says a drop-and-recreate would lose.
     let converting_task = node_type != "task" && crate::gtd::is_task(conn, node_id)?;
+    // The reverse is not a retype: a node becomes a task by capture, and a
+    // converted node retyped back to `task` would be a task-typed node on
+    // no board — refused as a parent, invisible to the survey, its row
+    // still only in `converted_task` (found on review).
+    if node_type == "task" && !crate::gtd::is_task(conn, node_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "{} has no row on the board — a node becomes a task by capture, not by retype; \
+             its conversion record, if any, is on the node (`task-project {node_id}`)",
+            node.name
+        )));
+    }
     if converting_task {
         let status: String = conn.query_row(
             "SELECT status FROM task_detail WHERE node_id = ?1",

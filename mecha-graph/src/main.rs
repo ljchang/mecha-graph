@@ -2560,15 +2560,17 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     "{} — filed under {} ({parent}){}",
                     t.name,
                     t.project.as_deref().unwrap_or("?"),
+                    // Off `vouched` alone, never a re-derivation of the
+                    // writer's predicate: a vouch attempt is a re-file to the
+                    // parent the task already had, and one that came back
+                    // without the mark did not take, whatever the reason —
+                    // a slip, a task by row, a parent whose node row is gone
+                    // (found on review).
                     if vouched {
                         " — vouched for; off the survey"
-                    } else if gtd::NEVER_A_PARENT.contains(
-                        &graph::get_node(&conn, &parent)?
-                            .map(|n| n.node_type)
-                            .unwrap_or_default()
-                            .as_str(),
-                    ) {
-                        " — a slip stays a slip: no vouch is written for this type"
+                    } else if project.trim() == parent {
+                        " — no vouch written: only a plausible old filing (a place, an event, a \
+                         series) with its node present can be vouched for"
                     } else {
                         ""
                     }
@@ -3116,6 +3118,23 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let id = resolve_one(&conn, &target)?;
             let (was, now) = graph::retype_node(&conn, &id, &node_type)?;
             println!("{id}: {was} → {now}");
+            // The one retype that shrinks the board says so: a done task
+            // converted to a container had its row removed and, if it was
+            // filed somewhere, a detachment recorded (found on review — the
+            // line above was the whole output).
+            if was == "task" {
+                if let Some(node) = graph::get_node(&conn, &id)? {
+                    let c = &node.properties["converted_task"];
+                    if !c.is_null() {
+                        println!(
+                            "  board row removed (was {}, filed under {}); the row is kept on the \
+                             node — `task-project {id}` reads it",
+                            c["row"]["status"].as_str().unwrap_or("?"),
+                            c["row"]["parent_id"].as_str().unwrap_or("no project")
+                        );
+                    }
+                }
+            }
         }
 
         Command::NewNode { node_type, name } => {

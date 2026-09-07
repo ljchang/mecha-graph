@@ -3138,6 +3138,9 @@ mod tests {
         assert_eq!((was.as_str(), now.as_str()), ("task", "project"));
         assert!(!is_task(&conn, &t).unwrap());
         assert!(get_task(&conn, &t).unwrap().is_none(), "off the board");
+        // And there is no retype back: a task is made by capture.
+        let e = crate::graph::retype_node(&conn, &t, "task").unwrap_err();
+        assert!(e.to_string().contains("by capture, not by retype"), "{e}");
         let under = create_task(&conn, "Ship the pilot", None, Some(&t), None).unwrap();
         assert_eq!(
             get_task(&conn, &under)
