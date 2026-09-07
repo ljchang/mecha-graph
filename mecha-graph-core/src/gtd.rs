@@ -840,27 +840,37 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         .collect::<std::result::Result<_, _>>()?;
     let mut report = ParentRepairReport { found, detached: 0 };
     if apply {
-        // The record of where each task was goes on the task node before
-        // the column is nulled — the store remembers, not the terminal.
+        // One transaction for the pass, and per row the detach first and
+        // the record only when it landed: a row re-filed between the survey
+        // and the apply (`AND parent_id = ?2` misses) must not gain a record
+        // of a detachment that did not happen, and a pass that fails half
+        // way must not leave some rows detached and others not (found on
+        // review). The record of where each task was goes on the task node
+        // — the store remembers, not the terminal.
+        let tx = conn.unchecked_transaction()?;
         for u in &report.found {
-            let record = detached_record(
-                &u.parent_id,
-                &u.parent_name,
-                &u.parent_type,
-                "repair_unfit_parents",
-            );
-            conn.execute(
-                &format!(
-                    "UPDATE nodes SET properties = {} WHERE id = ?1",
-                    APPEND_DETACHED
-                ),
-                params![u.task_id, record],
-            )?;
-            report.detached += conn.execute(
+            let detached = tx.execute(
                 "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1 AND parent_id = ?2",
                 params![u.task_id, u.parent_id],
             )?;
+            if detached == 1 {
+                let record = detached_record(
+                    &u.parent_id,
+                    &u.parent_name,
+                    &u.parent_type,
+                    "repair_unfit_parents",
+                );
+                tx.execute(
+                    &format!(
+                        "UPDATE nodes SET properties = {} WHERE id = ?1",
+                        APPEND_DETACHED
+                    ),
+                    params![u.task_id, record],
+                )?;
+            }
+            report.detached += detached;
         }
+        tx.commit()?;
     }
     Ok(report)
 }
@@ -1393,8 +1403,13 @@ pub fn resolve_about(conn: &Connection, what: &str) -> Result<Option<crate::grap
     }
     // A node id resolves too, and it has to: the ambiguity refusal below
     // tells the caller to name an id instead, and advice a function cannot
-    // honour is worse than no advice. Names first, because a name is what a
-    // caller normally has and an id shaped like a name is not a thing here.
+    // honour is worse than no advice. Names first here — where
+    // `resolve_parent` tries the id first, because a parent's id is what
+    // the board hands out and must come back to the same node even when
+    // another node's *name* is that id (`repair_node_id_payloads` exists
+    // for those). An `about` is normally given by name, so this order
+    // stands; the two differ on that one string, and this comment says so
+    // rather than claiming the collision does not happen.
     if let Some(node) = crate::graph::resolve_entity(conn, what)? {
         return Ok(Some(node));
     }

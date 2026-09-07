@@ -1813,6 +1813,20 @@ mod tests {
         );
         assert_eq!(row["task"]["project_id"], "proj-tide");
 
+        // A date that does not parse refuses the call before the status
+        // write, like every other pre-flight refusal.
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "due": "next thursday-ish, maybe" }),
+        )
+        .expect_err("an unparseable date refuses the call");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+
         // And the other direction: a re-file in a call that fails on a later
         // field does not land either — the parent is written last.
         upsert_node(&conn, &Node::new("proj-other", "project", "Other")).unwrap();
@@ -2432,6 +2446,22 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             })?),
             None => None,
         };
+    // And the dates, through `parse_due` so 'tomorrow' and '+3d' work,
+    // parsed here rather than beside their write: parsed after the status
+    // landed, a date that did not parse returned an error on a call that
+    // had already closed the task and retired its `waiting_on` claim — the
+    // half-write the `project` pre-check closes, one field over (found on
+    // review).
+    let sched = |v: &Value| -> mecha_graph_core::Result<Option<Option<String>>> {
+        match v.as_str() {
+            None => Ok(None),
+            Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?)),
+        }
+    };
+    let due = sched(&args["due"])?;
+    let defer = sched(&args["defer"])?;
     // And the provenance pointer, so no writer below this line can refuse.
     match args.get("captured_from") {
         None | Some(Value::Null) => {}
@@ -2463,16 +2493,8 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     }
 
     // Absent field → untouched; "" → cleared — the same tri-state
-    // update_task_schedule speaks, with dates going through parse_due so
-    // 'tomorrow' and '+3d' work here too.
-    let sched = |v: &Value| -> mecha_graph_core::Result<Option<Option<String>>> {
-        match v.as_str() {
-            None => Ok(None),
-            Some(raw) => Ok(Some(gtd::parse_due(raw)?)),
-        }
-    };
-    let due = sched(&args["due"])?;
-    let defer = sched(&args["defer"])?;
+    // update_task_schedule speaks; the dates were parsed in the pre-flight
+    // block above, before the first write.
     let context = args["context"]
         .as_str()
         .map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));

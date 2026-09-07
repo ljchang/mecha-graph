@@ -2350,8 +2350,20 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             );
             for u in &report.found {
                 println!(
-                    "  {}  {}  -> {} ({}, {})",
-                    u.task_id, u.task_name, u.parent_name, u.parent_type, u.parent_id
+                    "  {}  {}  -> {} ({}, {}){}",
+                    u.task_id,
+                    u.task_name,
+                    u.parent_name,
+                    u.parent_type,
+                    u.parent_id,
+                    // The one thing the survey knows that the reader must
+                    // weigh before --apply: a filing that was legal and may
+                    // have been meant, or a slip.
+                    if u.plausible {
+                        "  — plausible under the old rule; re-file rather than detach?"
+                    } else {
+                        ""
+                    }
                 );
             }
             if apply {
