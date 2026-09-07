@@ -2413,6 +2413,16 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             })?),
             None => None,
         };
+    // And the provenance pointer, so no writer below this line can refuse.
+    match args.get("captured_from") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.trim().is_empty() => {}
+        Some(v) => {
+            gtd::validate_captured_from(v).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?;
+        }
+    }
 
     // **Status goes FIRST, so every field after it sees the status the
     // caller is actually setting.**
