@@ -248,13 +248,13 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_create",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
-            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` names the parent — any container node (project, goal, area, topic, org…) by name or node id (the `project_id` a task row carries): an unknown name is an error, not an implicit node; a name matching several nodes is refused with their ids; and a task, person, place, event, event_series, document or artifact is never a parent.",
+            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` names the parent — any container node (project, goal, area, topic, org…) by name or node id (the `project_id` a task row carries): an unknown name is an error, not an implicit node; a name matching several nodes is refused with their ids; and a task, person, agent, place, event, event_series, document or artifact is never a parent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
-                    "project": { "type": "string", "description": "Parent, by name or node id — must resolve to exactly one existing node of a container type (project, goal, area, topic, org…); never a task, person, place, event, event_series, document or artifact" },
+                    "project": { "type": "string", "description": "Parent, by name or node id — must resolve to exactly one existing node of a container type (project, goal, area, topic, org…); never a task, person, agent, place, event, event_series, document or artifact" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
                     "about": {
                         "type": "array",
@@ -289,7 +289,7 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
-                    "project": { "type": "string", "description": "Re-file under this parent, by name or node id, resolved exactly as kg_task_create resolves it (one existing node of a container type, never a task, person, place, event, event_series, document or artifact) — and resolved before anything in this call is written, so a refused parent changes nothing; \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
+                    "project": { "type": "string", "description": "Re-file under this parent, by name or node id, resolved exactly as kg_task_create resolves it (one existing node of a container type, never a task, person, agent, place, event, event_series, document or artifact) — and resolved before anything in this call is written, so a refused parent changes nothing; \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
                     "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
                     "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
                     "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },

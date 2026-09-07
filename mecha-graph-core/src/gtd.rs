@@ -622,6 +622,12 @@ pub fn create_task(
 pub const NEVER_A_PARENT: &[&str] = &[
     "task",
     "person",
+    // The counterpart of `person`, and closed for the same reason: an
+    // `agent` is something that acts, not something work sits under — it
+    // is here so a task can *wait on* it. It ships in every graph
+    // (migration `agent_node`), so `project: "mecha"` resolves on tier one
+    // without anybody having created a node (found on review).
+    "agent",
     "place",
     "event",
     "event_series",
@@ -1941,7 +1947,7 @@ mod tests {
         assert!(e.to_string().contains("is a task, not a container"), "{e}");
         assert!(
             e.to_string()
-                .contains("task, person, place, event, event_series, document, artifact"),
+                .contains("task, person, agent, place, event, event_series, document, artifact"),
             "{e}"
         );
         let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
@@ -1954,6 +1960,17 @@ mod tests {
             .expect_err("a person as a parent is refused");
         assert!(
             e.to_string().contains("is a person, not a container"),
+            "{e}"
+        );
+        // The agent node every graph ships with is the obvious slip from
+        // the consumer that writes `waiting_on: "mecha"` on the same tool
+        // family — and not a container either. Seeded by migration, so no
+        // upsert here.
+        let e = create_task(&conn, "Draft the aims", None, Some("mecha"), None)
+            .expect_err("the agent as a parent is refused");
+        assert!(
+            e.to_string().contains("is a agent, not a container")
+                || e.to_string().contains("is an agent, not a container"),
             "{e}"
         );
         // A goal or an area is a container, and stays one.
