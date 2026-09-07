@@ -55,9 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the survey's text output says which filings are plausible; `--apply`
   runs as one transaction, recording a detachment only where it landed,
   and keeps the plausible filings unless `--include-plausible`;
-  and the survey also lists every task detached earlier — by an apply, a
-  merge, or a conversion — and not re-filed since, so a merge's silent
-  detach stays reviewable as a set; `task-project <task> ""` on a task
+  and the survey also lists every task detached earlier — by an apply or
+  a merge; a converted node has no task row and is read by `task-project`
+  — and not re-filed since, so a merge's silent detach stays reviewable
+  as a set; the JSON report echoes the flag it was computed under and
+  says per row whether the apply it previews would detach it; `task-project <task> ""` on a task
   already under nothing marks its record reviewed ("no project is
   right"), so the list is not a standing pile, and a finished task is
   not on it; a deliberate re-file or

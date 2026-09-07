@@ -855,6 +855,12 @@ pub struct UnfitParent {
     /// the write (`AND parent_id = ?2`) — so the printed list and the count
     /// cannot disagree without saying which row (found on review).
     pub detached: bool,
+    /// Whether an apply *with the flags this call was given* would detach
+    /// this row: a slip always, a plausible filing only with
+    /// `include_plausible`. Carried on the survey too, so the JSON a script
+    /// reads off a terminal reflects the flag it passed — the prose branch
+    /// alone did, and JSON is the default off a terminal (found on review).
+    pub would_detach: bool,
 }
 
 /// The parent type the survey reports for a `parent_id` whose node row is
@@ -892,11 +898,17 @@ pub struct DetachedPending {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ParentRepairReport {
+    /// The flag this report was computed under, echoed so a survey and the
+    /// apply it previews are the same document.
+    pub include_plausible: bool,
     pub found: Vec<UnfitParent>,
     /// Rows actually detached. Zero on a dry run, however many were found.
     pub detached: usize,
-    /// Tasks detached earlier and not re-filed since — nothing to apply,
-    /// something to review.
+    /// Tasks detached earlier — by an apply or a merge — and not re-filed
+    /// since: nothing to apply, something to review. A conversion's
+    /// detachment is not here: the converted node has no task row and is
+    /// not waiting to be re-filed; `task-project <node>` reads its record
+    /// (found on review — the doc had said "or a conversion").
     pub pending: Vec<DetachedPending>,
 }
 
@@ -1059,14 +1071,19 @@ pub fn repair_unfit_parents_with(
                 plausible: PLAUSIBLE_OLD_PARENTS.contains(&parent_type.as_str()),
                 parent_type,
                 detached: false,
+                would_detach: false,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
     let mut report = ParentRepairReport {
+        include_plausible,
         found,
         detached: 0,
         pending: Vec::new(),
     };
+    for u in &mut report.found {
+        u.would_detach = !u.plausible || include_plausible;
+    }
     if apply {
         // One transaction for the pass, and per row the detach first and
         // the record only when it landed: a row re-filed between the survey
@@ -3288,8 +3305,9 @@ mod tests {
         // and the plausible row leaves the survey; a slip does not, whoever
         // vouches; a move drops the mark.
         set_task_project(&conn, &a, "pl-hall").unwrap();
-        // The slip's owner may vouch too — the call succeeds and marks —
-        // but the survey does not honour it for a person.
+        // The slip's owner may try to vouch too: the call succeeds, but no
+        // mark is written for a person — failing closed at the writer, not
+        // open with a net downstream.
         set_task_project(&conn, &b, "p-wren").unwrap();
         let after = repair_unfit_parents(&conn, false).unwrap();
         assert!(
@@ -3412,6 +3430,7 @@ mod tests {
                 parent_type: "person".into(),
                 plausible: false,
                 detached: false,
+                would_detach: true,
             }]
         );
         assert_eq!(survey.detached, 0, "a survey detaches nothing");
