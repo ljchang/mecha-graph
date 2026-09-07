@@ -742,11 +742,6 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
     }
 }
 
-/// The SQL that appends one record to a task node's `detached_parents`
-/// list — a list, not a slot, because a task detached twice (surveyed
-/// under a person, re-filed, then its new parent merged into one) would
-/// otherwise keep only the second record and lose the filing that
-/// motivated the survey (found on review). `?2` is the record.
 /// How many detachment records a task node keeps. `kg_task_update` puts
 /// re-filing in an agent's hands, and every move appends one record, so
 /// without a cap the list — printed whole by `task-project`, walked by
@@ -761,6 +756,11 @@ const TRIM_DETACHED: &str =
     "UPDATE nodes SET properties = json_remove(properties, '$.detached_parents[0]') \
      WHERE id = ?1 AND json_array_length(properties, '$.detached_parents') > ?2";
 
+/// The SQL that appends one record to a task node's `detached_parents`
+/// list — a list, not a slot, because a task detached twice (surveyed
+/// under a person, re-filed, then its new parent merged into one) would
+/// otherwise keep only the second record and lose the filing that
+/// motivated the survey (found on review). `?2` is the record.
 const APPEND_DETACHED: &str = "json_set(COALESCE(properties, '{}'), '$.detached_parents', \
      json_insert(COALESCE(json_extract(COALESCE(properties, '{}'), '$.detached_parents'), '[]'), \
      '$[#]', json(?2)))";
@@ -927,7 +927,8 @@ pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
                AND (p.id IS NULL
                     OR p.node_type IN ({placeholders})
                     OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
-               AND COALESCE(p.node_type, '') NOT IN ({plausible})"
+               AND CASE WHEN EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)
+                        THEN 'task' ELSE COALESCE(p.node_type, '') END NOT IN ({plausible})"
         ),
         [],
         |r| r.get(0),
@@ -1186,11 +1187,6 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<ParentCandidate> 
     Ok(node)
 }
 
-/// Container nodes a parent name reaches: by exact canonical name or alias,
-/// or — `fuzzy` — by substring of the canonical name. Every row that could
-/// be a parent and no other (the type not in `NEVER_A_PARENT`, no task
-/// row), and **no limit**, so a count over the result is a count over the
-/// matching set.
 /// What a parent lookup needs of a node — the three columns, without the
 /// alias load `get_node` pays: a substring that matches a thousand
 /// containers must not run two thousand statements to print ten names and
@@ -1212,6 +1208,11 @@ impl From<crate::graph::Node> for ParentCandidate {
     }
 }
 
+/// Container nodes a parent name reaches: by exact canonical name or alias,
+/// or — `fuzzy` — by substring of the canonical name. Every row that could
+/// be a parent and no other (the type not in `NEVER_A_PARENT`, no task
+/// row), and **no limit**, so a count over the result is a count over the
+/// matching set.
 fn parent_candidates(conn: &Connection, what: &str, fuzzy: bool) -> Result<Vec<ParentCandidate>> {
     let canonical = crate::ids::canonicalize(what);
     if canonical.is_empty() {
@@ -3164,6 +3165,37 @@ mod tests {
         // The health count is the slips: the plausible filing is not an
         // alert the command it names could never clear.
         assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
+        // A parent that is a task by row under a plausible declared type is
+        // a slip to the survey, and so to the count — the writer the guard
+        // does not bind (`upsert_node`'s type rewrite) makes exactly this row.
+        upsert_node(&conn, &Node::new("ev-odd", "event", "Thursday review")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('ev-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        let c = create_task(&conn, "Under the odd event", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'ev-odd' WHERE node_id = ?1",
+            params![c],
+        )
+        .unwrap();
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            2,
+            "the count reads the row, not the type"
+        );
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        let odd = survey.found.iter().find(|u| u.task_id == c).unwrap();
+        assert_eq!(odd.parent_type, "task");
+        assert!(!odd.plausible);
+        conn.execute(
+            "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1",
+            params![c],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM task_detail WHERE node_id = 'ev-odd'", [])
+            .unwrap();
         // --apply acts on the distinction: the slip goes, the plausible
         // filing stays until asked for.
         let applied = repair_unfit_parents(&conn, true).unwrap();
