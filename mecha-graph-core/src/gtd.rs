@@ -692,12 +692,12 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
     // its children, or the pass meant to remove the unfit parent would
     // report success and leave it (found on review).
     // A parent whose row is gone still gets a record — the id is in hand,
-    // and the name and type read `missing`, as the survey reports the same
-    // case (found on review: the one detachment that left no record was
+    // the name reads `(missing)` and the type `missing`, as the survey
+    // reports the same case (found on review: the one detachment that left no record was
     // the one hardest to reconstruct).
     let record = match crate::graph::get_node(conn, parent_id)? {
         Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
-        None => detached_record(parent_id, "", MISSING_PARENT, reason),
+        None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
     };
     conn.execute(
         &format!(
@@ -2384,6 +2384,7 @@ mod tests {
         assert_eq!(records.len(), 3, "the orphan detachment is recorded too");
         assert_eq!(records[2]["id"], "proj-ghost");
         assert_eq!(records[2]["type"], MISSING_PARENT);
+        assert_eq!(records[2]["name"], "(missing)");
         // And the survey sees an orphan parent too, and detaches it on apply.
         upsert_node(&conn, &Node::new("proj-gone2", "project", "Gone")).unwrap();
         set_task_project(&conn, &t, "proj-gone2").unwrap();

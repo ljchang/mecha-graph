@@ -2367,9 +2367,25 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let Some(project) = project else {
                 // The reader for the record the detach writes: the store
                 // remembers, and this is where it says so (found on
-                // review — written and read by nothing).
+                // review — written and read by nothing). JSON too, like
+                // `repair-parents`: the history is the store's only record
+                // of where a task was filed, and prose is not a record.
                 let t = gtd::get_task(&conn, &task)?
                     .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                if want_json(cli_json, cli_text) {
+                    let node = graph::get_node(&conn, &task)?
+                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "task": t.node_id, "name": t.name,
+                            "project": t.project, "project_id": t.project_id,
+                            "detached_parents": node.properties.get("detached_parents")
+                                .cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                        }))?
+                    );
+                    return Ok(());
+                }
                 match (&t.project, &t.project_id) {
                     (Some(name), Some(id)) => println!("{} — filed under {name} ({id})", t.name),
                     _ => println!("{} — filed under no project", t.name),
