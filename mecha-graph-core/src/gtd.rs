@@ -573,8 +573,8 @@ pub fn parse_due(input: &str) -> Result<Option<String>> {
 /// Create a task by hand (TUI `a` / manual capture). `project` resolves
 /// against the graph by name, alias or node id; unknown names are an error
 /// rather than an implicit node — typo protection — an ambiguous name is
-/// refused rather than guessed, and a task, person, event, document or
-/// artifact is not a parent.
+/// refused rather than guessed, and a node whose type is in
+/// [`NEVER_A_PARENT`] is not a parent.
 pub fn create_task(
     conn: &Connection,
     name: &str,
@@ -640,14 +640,8 @@ pub const NEVER_A_PARENT: &[&str] = &[
 /// parent's id, `None` when cleared.
 pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
     require_task(conn, node_id)?;
-    let parent_id = match project.trim() {
-        "" => None,
-        p => Some(resolve_parent(conn, p)?.id),
-    };
-    conn.execute(
-        "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
-        params![node_id, parent_id],
-    )?;
+    let parent_id = resolve_project_arg(conn, project)?;
+    set_task_parent_id(conn, node_id, parent_id.as_deref())?;
     Ok(parent_id)
 }
 
@@ -734,7 +728,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
 /// mints `project_id` from that guess and another repo's goal record cites
 /// it, the guess became a durable pointer (found on review). Now that the
 /// id path exists, "name the id instead" is advice the caller can follow.
-fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
+pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
     let matches = crate::graph::resolve_entity_all(conn, what)?;
     let node = match matches.len() {
         1 => matches.into_iter().next().expect("one match"),
@@ -756,13 +750,37 @@ fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
     };
     if NEVER_A_PARENT.contains(&node.node_type.as_str()) {
         return Err(Error::Other(format!(
-            "'{}' is a {}, not a container — a task's parent is a project, goal, area or \
-             topic node (never a task, person, event, document or artifact), by name or \
-             node id",
-            node.name, node.node_type
+            "'{}' is a {}, not a container — a task's parent may be any node type but \
+             these: {}; name a project, goal, area, topic or org, by name or node id",
+            node.name,
+            node.node_type,
+            NEVER_A_PARENT.join(", ")
         )));
     }
     Ok(node)
+}
+
+/// The parent a `project` argument resolves to, or `None` for `""` —
+/// resolution alone, so a caller that writes several fields can refuse
+/// before its first write (`kg_task_update`'s rule: a refused call changed
+/// nothing) and write the id afterwards with [`set_task_parent_id`].
+pub fn resolve_project_arg(conn: &Connection, project: &str) -> Result<Option<String>> {
+    match project.trim() {
+        "" => Ok(None),
+        p => Ok(Some(resolve_parent(conn, p)?.id)),
+    }
+}
+
+/// Write an already-resolved parent id, or clear it. The write half of
+/// [`set_task_project`]; takes an id `resolve_project_arg` produced, never
+/// a name.
+pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&str>) -> Result<()> {
+    require_task(conn, node_id)?;
+    conn.execute(
+        "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+        params![node_id, parent_id],
+    )?;
+    Ok(())
 }
 
 /// Edit scheduling fields on an existing task (TUI `e`). `Some("")` clears a
@@ -1921,6 +1939,11 @@ mod tests {
         let e = create_task(&conn, "Under a task", None, Some(&by_id.node_id), None)
             .expect_err("a task id as a parent is refused");
         assert!(e.to_string().contains("is a task, not a container"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("task, person, place, event, event_series, document, artifact"),
+            "{e}"
+        );
         let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
             .expect_err("a task name as a parent is refused");
         assert!(e.to_string().contains("is a task, not a container"), "{e}");

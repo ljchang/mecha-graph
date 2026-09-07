@@ -822,6 +822,16 @@ enum Command {
         #[arg(long)]
         remove: Vec<String>,
     },
+    /// Re-file a task under a project (by name or node id), or under none
+    /// with "" — the direct correction channel for a parent the board hands
+    /// out as `project_id`; `repair-parents --apply` detaches, this re-files
+    TaskProject {
+        /// The task's node id, e.g. 'task-1a2b3c4d'
+        task: String,
+        /// The parent — a project, goal, area, topic or org, by name or node
+        /// id; "" clears
+        project: String,
+    },
     /// Scan task titles for entities the graph already knows, filing matches
     /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
     ScanTasks {
@@ -2345,11 +2355,25 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
             if apply {
                 println!(
-                    "detached {} — re-file with `kg_task_update project`",
+                    "detached {} — re-file with `mecha-graph task-project <task> <project>`",
                     report.detached
                 );
             } else {
                 println!("survey only; --apply detaches them");
+            }
+        }
+        Command::TaskProject { task, project } => {
+            match gtd::set_task_project(&conn, &task, &project)? {
+                Some(parent) => {
+                    let t = gtd::get_task(&conn, &task)?
+                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                    println!(
+                        "{} — filed under {} ({parent})",
+                        t.name,
+                        t.project.as_deref().unwrap_or("?")
+                    );
+                }
+                None => println!("{task} — filed under no project"),
             }
         }
         Command::TaskAbout { task, add, remove } => {

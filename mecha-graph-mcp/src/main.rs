@@ -254,7 +254,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
-                    "project": { "type": "string", "description": "Parent project, goal, area or topic, by name or node id — must resolve to exactly one existing container node; never a task, person, place, event, document or artifact" },
+                    "project": { "type": "string", "description": "Parent, by name or node id — must resolve to exactly one existing node of a container type (project, goal, area, topic, org…); never a task, person, place, event, event_series, document or artifact" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
                     "about": {
                         "type": "array",
@@ -289,7 +289,7 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
-                    "project": { "type": "string", "description": "Re-file under this parent — a project, goal, area or topic, by name or node id, resolved exactly as kg_task_create resolves it (one existing container node, never a task, person, place, event, document or artifact); \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
+                    "project": { "type": "string", "description": "Re-file under this parent, by name or node id, resolved exactly as kg_task_create resolves it (one existing node of a container type, never a task, person, place, event, event_series, document or artifact) — and resolved before anything in this call is written, so a refused parent changes nothing; \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
                     "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
                     "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
                     "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },
@@ -1755,6 +1755,34 @@ mod tests {
             "proj-tide",
             "and the row was not touched"
         );
+
+        // A refused parent refuses the whole call before its first write:
+        // the status change in the same call does not land (found on
+        // review — it used to, retiring the live waiting_on claim on the
+        // way, which reopening does not restore).
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        for bad in [
+            json!("Wren"),
+            json!("proj-nope"),
+            json!({ "id": "proj-tide" }),
+        ] {
+            let e = kg_task_update(
+                &conn,
+                &json!({ "task": id, "status": "done", "project": bad }),
+            )
+            .expect_err("a refused parent refuses the call");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("nothing was changed") || msg.contains("must be a string"),
+                "{msg}"
+            );
+        }
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+        assert_eq!(row["task"]["project_id"], "proj-tide");
     }
 
     /// `kg_upsert` cannot write prose into a date column.
@@ -2330,6 +2358,18 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::validate_about_target(conn, name)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
     }
+    // `project` resolved here too, before the first write, for the same
+    // reason: a refused parent — ambiguous, unknown, a person, a non-string
+    // — used to return an error on a call whose status change had already
+    // landed and retired the live `waiting_on` claim, which reopening does
+    // not restore (found on review). Pure reads; the write is last.
+    let parent =
+        match project_arg(args)? {
+            Some(p) => Some(gtd::resolve_project_arg(conn, p).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?),
+            None => None,
+        };
 
     // **Status goes FIRST, so every field after it sees the status the
     // caller is actually setting.**
@@ -2382,9 +2422,9 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if let Some(session) = args["session"].as_str() {
         gtd::set_task_session(conn, task, session)?;
     }
-    // Re-file, through the same resolver as capture; `""` clears.
-    if let Some(project) = project_arg(args)? {
-        gtd::set_task_project(conn, task, project)?;
+    // Re-file, with the parent resolved above; `""` cleared it to `None`.
+    if let Some(parent) = parent {
+        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
     // `set` would make "also file this under Nadia" silently drop whoever

@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly as capture resolves it — because a pointer another repo cites
   must have a correction path that keeps the task's id; and
   `mecha-graph repair-parents` surveys the rows written before the guard
-  (a task filed under a person, say), detaching them only with `--apply`. The name is prose (spaces,
+  (a task filed under a person, say), detaching them only with `--apply`,
+  and `mecha-graph task-project` re-files one from the direct interface.
+  On `kg_task_update` the parent is resolved before anything is written,
+  so a refused one changes nothing — not a status that already landed. The name is prose (spaces,
   and two nodes can share one); a consumer recording *which* project a task
   served cites `project:<node id>` and refuses whitespace in an id, so the
   name alone could never be cited. mecha's goal record is that consumer.
