@@ -1362,8 +1362,9 @@ fn parent_candidates(conn: &Connection, what: &str, fuzzy: bool) -> Result<Vec<P
 }
 
 /// `resolve_project_arg`, with one exception a task's own parent earns:
-/// the parent the task already has — named by id or by name — resolves
-/// to itself even when the rule would refuse it as a parent now (a place,
+/// the parent the task already has — named by its id, never by name, since
+/// a name would skip the ambiguity refusal every other path gives it —
+/// resolves to itself even when the rule would refuse it as a parent now (a place,
 /// a series, from before the guard), because re-filing under the parent
 /// you already have is the "this filing was meant" gesture and nothing
 /// else could say it (found on review — the resolver refused the vouch).

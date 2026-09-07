@@ -3122,10 +3122,13 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             // converted to a container had its row removed and, if it was
             // filed somewhere, a detachment recorded (found on review — the
             // line above was the whole output).
-            if was == "task" {
-                if let Some(node) = graph::get_node(&conn, &id)? {
-                    let c = &node.properties["converted_task"];
-                    if !c.is_null() {
+            // Gated on the record this retype wrote, not on the old type:
+            // the conversion is decided by the row, and a task by row under
+            // a container type converts too (found on review).
+            if let Some(node) = graph::get_node(&conn, &id)? {
+                let c = &node.properties["converted_task"];
+                if c["converted_to"].as_str() == Some(now.as_str()) {
+                    {
                         println!(
                             "  board row removed (was {}, filed under {}); the row is kept on the \
                              node — `task-project {id}` reads it",
