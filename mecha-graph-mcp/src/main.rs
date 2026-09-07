@@ -1731,6 +1731,30 @@ mod tests {
         let alone = kg_task_create(&conn, &json!({ "name": "No project" })).unwrap();
         assert!(alone["task"]["project_id"].is_null());
         assert!(alone["task"].get("project_id").is_some());
+
+        // The row can be re-filed through the update, by id or name, and
+        // cleared; a refused parent leaves it where it was.
+        let moved = kg_task_update(&conn, &json!({ "task": id, "project": "" })).unwrap();
+        assert!(moved["task"]["project_id"].is_null());
+        let moved = kg_task_update(&conn, &json!({ "task": id, "project": "proj-tide" })).unwrap();
+        assert_eq!(moved["task"]["project_id"], "proj-tide");
+        assert!(kg_task_update(&conn, &json!({ "task": id, "project": id })).is_err());
+
+        // The object the id came in, re-sent instead of the string, is
+        // refused — never an unfiled task that answers `created`.
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship it", "project": { "id": "proj-tide" } }),
+        )
+        .expect_err("a non-string project is refused");
+        assert!(e.to_string().contains("must be a string"), "{e}");
+        assert!(kg_task_update(&conn, &json!({ "task": id, "project": 7 })).is_err());
+        assert_eq!(
+            kg_task_update(&conn, &json!({ "task": id, "status": "next" })).unwrap()["task"]
+                ["project_id"],
+            "proj-tide",
+            "and the row was not touched"
+        );
     }
 
     /// `kg_upsert` cannot write prose into a date column.
@@ -2224,7 +2248,7 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         conn,
         name,
         due.as_deref(),
-        args["project"].as_str(),
+        project_arg(args)?,
         args["context"].as_str(),
     )?;
     // A second write rather than a sixth positional argument, on the
@@ -2268,6 +2292,22 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about,
         "task": task
     }))
+}
+
+/// `project` as a string, or refused. A number or an object is not
+/// silently dropped: `project_id` is a JSON field the caller just read off
+/// a row, and re-sending the object it came in rather than the string is
+/// the obvious slip — dropping it would create an unfiled task and answer
+/// `created` (found on review; `name_array`'s rule for the same class of
+/// input).
+fn project_arg(args: &Value) -> mecha_graph_core::Result<Option<&str>> {
+    match args.get("project") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`project` must be a string — a name or a node id — not {other}"
+        ))),
+    }
 }
 
 fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -2343,7 +2383,7 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::set_task_session(conn, task, session)?;
     }
     // Re-file, through the same resolver as capture; `""` clears.
-    if let Some(project) = args["project"].as_str() {
+    if let Some(project) = project_arg(args)? {
         gtd::set_task_project(conn, task, project)?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
