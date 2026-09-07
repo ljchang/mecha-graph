@@ -1549,7 +1549,12 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         // which case they are detached with a record of where they were,
         // never re-pointed onto a parent the guard would have refused
         // (found on review).
-        if crate::gtd::NEVER_A_PARENT.contains(&keep.node_type.as_str()) {
+        // The row is the fact, as everywhere else: a kept node that is a
+        // task by row and a container by type is not a parent either
+        // (found on review).
+        if crate::gtd::NEVER_A_PARENT.contains(&keep.node_type.as_str())
+            || crate::gtd::is_task(conn, keep_id)?
+        {
             crate::gtd::detach_tasks_under(conn, dup_id, "merge_nodes")?;
         } else {
             conn.execute(

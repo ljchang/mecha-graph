@@ -811,7 +811,10 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
          JOIN nodes n ON n.id = td.node_id
          LEFT JOIN nodes p ON p.id = td.parent_id
          WHERE td.parent_id IS NOT NULL
-           AND (p.id IS NULL OR p.node_type IN ({placeholders}))
+           AND (p.id IS NULL
+                OR p.node_type IN ({placeholders})
+                -- the row is the fact: a parent that is itself on the board
+                OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
          ORDER BY td.node_id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -908,6 +911,15 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
             NEVER_A_PARENT.join(", ")
         )));
     }
+    // The row is the fact: a node on the board is a task whatever its type
+    // says (a store from before the guards, or `upsert_node`'s type
+    // rewrite), and a task is never a parent (found on review).
+    if is_task(conn, &node.id)? {
+        return Err(Error::Other(format!(
+            "'{}' is a task on the board, whatever its type says — not a parent",
+            node.name
+        )));
+    }
     Ok(node)
 }
 
@@ -936,9 +948,10 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
                 "no node with id {pid} to file a task under"
             )));
         };
-        if NEVER_A_PARENT.contains(&parent.node_type.as_str()) {
+        if NEVER_A_PARENT.contains(&parent.node_type.as_str()) || is_task(conn, pid)? {
             return Err(Error::Other(format!(
-                "'{}' is of type {}, not a container — not a parent: {}",
+                "'{}' is of type {}, not a container, or is itself a task on the board — not a \
+                 parent: {}",
                 parent.name,
                 parent.node_type,
                 NEVER_A_PARENT.join(", ")
@@ -2438,6 +2451,41 @@ mod tests {
         assert_eq!(
             get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
             Some("proj-tide")
+        );
+    }
+
+    /// A node that is a task by row and a container by type — a store from
+    /// before the guards — is never a parent, by any writer or the survey.
+    #[test]
+    fn a_task_by_row_is_not_a_parent_whatever_its_type_says() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-odd", "project", "Odd")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('proj-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        assert!(create_task(&conn, "Child", None, Some("proj-odd"), None).is_err());
+        assert!(create_task(&conn, "Child", None, Some("Odd"), None).is_err());
+        let t = create_task(&conn, "Child", None, None, None).unwrap();
+        assert!(set_task_parent_id(&conn, &t, Some("proj-odd")).is_err());
+        // A store that already has the filing: the survey sees it, and a
+        // merge onto the odd node detaches rather than re-points.
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'proj-odd' WHERE node_id = ?1",
+            params![t],
+        )
+        .unwrap();
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
+        assert_eq!(survey.found[0].parent_id, "proj-odd");
+        upsert_node(&conn, &Node::new("proj-b", "project", "Beta")).unwrap();
+        let u = create_task(&conn, "Under beta", None, Some("proj-b"), None).unwrap();
+        crate::graph::merge_nodes(&conn, "proj-odd", "proj-b").unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id,
+            None,
+            "detached, not re-pointed"
         );
     }
 
