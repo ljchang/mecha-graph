@@ -2400,7 +2400,25 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
                 match (&t.project, &t.project_id) {
                     (Some(name), Some(id)) => println!("{} — filed under {name} ({id})", t.name),
-                    _ => println!("{} — filed under no project", t.name),
+                    _ => {
+                        // The raw column, because the join hides a parent
+                        // whose node row is gone — the one state the
+                        // correction channel exists to make visible (found
+                        // on review).
+                        let raw: Option<String> = conn.query_row(
+                            "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+                            mecha_graph_core::rusqlite::params![task],
+                            |r| r.get(0),
+                        )?;
+                        match raw {
+                            Some(id) => println!(
+                                "{} — filed under {id} ({}) — `repair-parents` sees it",
+                                t.name,
+                                gtd::MISSING_PARENT
+                            ),
+                            None => println!("{} — filed under no project", t.name),
+                        }
+                    }
                 }
                 let node = graph::get_node(&conn, &task)?
                     .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;

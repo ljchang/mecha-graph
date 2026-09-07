@@ -900,10 +900,28 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
     let node = if let Some(node) = crate::graph::get_node(conn, what)? {
         node
     } else {
-        let matches = crate::graph::resolve_entity_all(conn, what)?;
+        // Only nodes that could be a parent count towards ambiguity: an
+        // institute that is both an org and a place, or a task titled after
+        // its project, would otherwise make the project un-nameable by name
+        // — a refusal for a name with exactly one legal answer (found on
+        // review). The type and the row are filtered here; the refusal below
+        // then names a genuine ambiguity between two containers.
+        let mut matches = Vec::new();
+        for n in crate::graph::resolve_entity_all(conn, what)? {
+            if NEVER_A_PARENT.contains(&n.node_type.as_str()) || is_task(conn, &n.id)? {
+                continue;
+            }
+            matches.push(n);
+        }
         match matches.len() {
             1 => matches.into_iter().next().expect("one match"),
-            0 => return Err(Error::Other(format!("no node matches project '{what}'"))),
+            0 => {
+                return Err(Error::Other(format!(
+                    "no container node matches project '{what}' (a node of a type that is never a \
+                     parent — {} — or a task by row, is not one)",
+                    NEVER_A_PARENT.join(", ")
+                )))
+            }
             n => {
                 let names: Vec<String> = matches
                     .iter()
@@ -1197,6 +1215,45 @@ pub fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::V
 /// exactly the thing a harness should not be carrying around.
 pub const OWNER: &str = "@owner";
 
+/// Who a `waiting_on` names, or `None` for `""`: the resolution half of
+/// [`set_task_waiting_on`], public so `kg_task_update` can refuse before
+/// its first write — resolved after the status landed, a typo returned an
+/// error on a call that had already closed the task and retired the live
+/// claim it was trying to set (found on review).
+pub fn resolve_waiting_on(conn: &Connection, who: &str) -> Result<Option<crate::graph::Node>> {
+    let who = who.trim();
+    let who = who.trim();
+    Ok(if who.is_empty() {
+        None
+    } else if who == OWNER {
+        // **The one name a caller cannot be expected to know.** A harness
+        // handing a task back says "this is yours now", and making it look up
+        // the owner's actual name first would mean shipping that name into
+        // config on every machine — and getting it wrong the day it changes.
+        // The graph already records who it is about (`owner_node`, an explicit
+        // mark rather than a heuristic), so this asks it.
+        match crate::graph::owner_node(conn)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(
+                    "this graph has no owner set, so `@owner` names nobody — \
+                     `mecha-graph owner <node>` marks one"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        match crate::graph::resolve_entity(conn, who)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(format!(
+                    "no node matches '{who}' — waiting_on must name someone the graph already knows"
+                )))
+            }
+        }
+    })
+}
+
 /// Point a task's `waiting_on` at a node, or clear it with `""`.
 ///
 /// `@owner` ([`OWNER`]) resolves to whoever the graph is about.
@@ -1226,36 +1283,7 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // "nobody owes me this" and the error message says nothing about what was
     // lost. Found by the test written for the typo protection, which is a
     // fair description of how that protection was incomplete.
-    let who = who.trim();
-    let target = if who.is_empty() {
-        None
-    } else if who == OWNER {
-        // **The one name a caller cannot be expected to know.** A harness
-        // handing a task back says "this is yours now", and making it look up
-        // the owner's actual name first would mean shipping that name into
-        // config on every machine — and getting it wrong the day it changes.
-        // The graph already records who it is about (`owner_node`, an explicit
-        // mark rather than a heuristic), so this asks it.
-        match crate::graph::owner_node(conn)? {
-            Some(n) => Some(n),
-            None => {
-                return Err(Error::Other(
-                    "this graph has no owner set, so `@owner` names nobody — \
-                     `mecha-graph owner <node>` marks one"
-                        .into(),
-                ))
-            }
-        }
-    } else {
-        match crate::graph::resolve_entity(conn, who)? {
-            Some(n) => Some(n),
-            None => {
-                return Err(Error::Other(format!(
-                    "no node matches '{who}' — waiting_on must name someone the graph already knows"
-                )))
-            }
-        }
-    };
+    let target = resolve_waiting_on(conn, who)?;
 
     // Now that the answer is known, retire the old belief. Clearing and
     // re-pointing are the same operation from here, so neither can leave two
@@ -2154,17 +2182,19 @@ mod tests {
                 .contains("task, person, agent, place, event, event_series, document, artifact"),
             "{e}"
         );
+        // By name, the task is filtered out before the count, so the
+        // refusal reads as no container of that name.
         let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
             .expect_err("a task name as a parent is refused");
-        assert!(
-            e.to_string().contains("is of type task, not a container"),
-            "{e}"
-        );
+        assert!(e.to_string().contains("no container node matches"), "{e}");
         // Nor is a person, an event, a document or an artifact — the same
         // mis-citation from another type.
         upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
         let e = create_task(&conn, "Send the figures", None, Some("Wren"), None)
             .expect_err("a person as a parent is refused");
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+        let e = create_task(&conn, "Send the figures", None, Some("p-wren"), None)
+            .expect_err("a person's id as a parent is refused");
         assert!(
             e.to_string().contains("is of type person, not a container"),
             "{e}"
@@ -2175,6 +2205,9 @@ mod tests {
         // upsert here.
         let e = create_task(&conn, "Draft the aims", None, Some("mecha"), None)
             .expect_err("the agent as a parent is refused");
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+        let e = create_task(&conn, "Draft the aims", None, Some("agent-mecha"), None)
+            .expect_err("the agent's id as a parent is refused");
         assert!(
             e.to_string().contains("is of type agent, not a container"),
             "{e}"
@@ -2520,6 +2553,31 @@ mod tests {
             None,
             "detached, not re-pointed"
         );
+    }
+
+    /// A name shared with a node that could never be a parent is not
+    /// ambiguous: the org wins over the place, the project over the task.
+    #[test]
+    fn a_name_shared_with_a_non_parent_still_names_the_one_container() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("org-inst", "org", "The Institute")).unwrap();
+        upsert_node(&conn, &Node::new("pl-inst", "place", "The Institute")).unwrap();
+        let t = create_task(&conn, "Book the room", None, Some("The Institute"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("org-inst")
+        );
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let same_name = create_task(&conn, "Tidelab", None, None, None).unwrap();
+        let u = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide")
+        );
+        assert!(get_task(&conn, &same_name).unwrap().is_some());
+        // Only the place: no container of that name.
+        let e = create_task(&conn, "x", None, Some("The Institute annex"), None).unwrap_err();
+        assert!(e.to_string().contains("no container node matches"), "{e}");
     }
 
     /// A task cannot be merged into a container: the row would move and

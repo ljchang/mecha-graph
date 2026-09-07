@@ -1813,6 +1813,20 @@ mod tests {
         );
         assert_eq!(row["task"]["project_id"], "proj-tide");
 
+        // A typo in waiting_on refuses the call before the status write —
+        // the case that used to close the task and retire the live claim.
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "waiting_on": "Nadai" }),
+        )
+        .expect_err("an unknown waiting_on refuses the call");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+
         // A date that does not parse refuses the call before the status
         // write, like every other pre-flight refusal.
         let e = kg_task_update(
@@ -2462,7 +2476,22 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     };
     let due = sched(&args["due"])?;
     let defer = sched(&args["defer"])?;
-    // And the provenance pointer, so no writer below this line can refuse.
+    // And who the task waits on — resolved after the status landed, a typo
+    // returned an error on a call that had already closed the task and
+    // retired the live claim (found on review, the one writer the block's
+    // claim had missed).
+    if let Some(who) = args["waiting_on"].as_str() {
+        gtd::resolve_waiting_on(conn, who)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+    // And that the target is a task at all, which `session` refuses inside
+    // its setter.
+    if !gtd::is_task(conn, task)? {
+        return Err(mecha_graph_core::Error::Other(format!(
+            "{task} is not a task on the board — nothing was changed"
+        )));
+    }
+    // And the provenance pointer. After these, no writer below can refuse.
     match args.get("captured_from") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) if s.trim().is_empty() => {}
