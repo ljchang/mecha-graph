@@ -756,7 +756,7 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
     };
     if NEVER_A_PARENT.contains(&node.node_type.as_str()) {
         return Err(Error::Other(format!(
-            "'{}' is a {}, not a container — a task's parent may be any node type but \
+            "'{}' is of type {}, not a container — a task's parent may be any node type but \
              these: {}; name a project, goal, area, topic or org, by name or node id",
             node.name,
             node.node_type,
@@ -1944,7 +1944,10 @@ mod tests {
         // refused rather than rendered as a project.
         let e = create_task(&conn, "Under a task", None, Some(&by_id.node_id), None)
             .expect_err("a task id as a parent is refused");
-        assert!(e.to_string().contains("is a task, not a container"), "{e}");
+        assert!(
+            e.to_string().contains("is of type task, not a container"),
+            "{e}"
+        );
         assert!(
             e.to_string()
                 .contains("task, person, agent, place, event, event_series, document, artifact"),
@@ -1952,14 +1955,17 @@ mod tests {
         );
         let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
             .expect_err("a task name as a parent is refused");
-        assert!(e.to_string().contains("is a task, not a container"), "{e}");
+        assert!(
+            e.to_string().contains("is of type task, not a container"),
+            "{e}"
+        );
         // Nor is a person, an event, a document or an artifact — the same
         // mis-citation from another type.
         upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
         let e = create_task(&conn, "Send the figures", None, Some("Wren"), None)
             .expect_err("a person as a parent is refused");
         assert!(
-            e.to_string().contains("is a person, not a container"),
+            e.to_string().contains("is of type person, not a container"),
             "{e}"
         );
         // The agent node every graph ships with is the obvious slip from
@@ -1969,8 +1975,7 @@ mod tests {
         let e = create_task(&conn, "Draft the aims", None, Some("mecha"), None)
             .expect_err("the agent as a parent is refused");
         assert!(
-            e.to_string().contains("is a agent, not a container")
-                || e.to_string().contains("is an agent, not a container"),
+            e.to_string().contains("is of type agent, not a container"),
             "{e}"
         );
         // A goal or an area is a container, and stays one.
