@@ -244,6 +244,12 @@ pub fn render_stats(h: &HealthStats, style: &Style) -> String {
             h.merge_queue_depth
         ));
     }
+    if h.unfit_parents > 0 {
+        alerts.push(format!(
+            "{} task(s) filed under a node that is never a parent → mecha-graph repair-parents",
+            h.unfit_parents
+        ));
+    }
     if h.isolated_pct > 25.0 {
         alerts.push(format!(
             "isolated {:.0}% > 25% → check Tier 1/2 linkers",

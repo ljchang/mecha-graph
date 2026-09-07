@@ -727,7 +727,10 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
             Ok(n)
         }
         Err(e) => {
-            conn.execute_batch("ROLLBACK TO detach_tasks_under; RELEASE detach_tasks_under")?;
+            // The rollback's own error must not replace the one that caused
+            // it (found on review).
+            let _ =
+                conn.execute_batch("ROLLBACK TO detach_tasks_under; RELEASE detach_tasks_under");
             Err(e)
         }
     }
@@ -1017,11 +1020,26 @@ fn parent_candidates(
         .map(|t| format!("'{t}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    // The substring tier escapes the caller's `%` and `_`, as
+    // `suggest_entities` does: left live, one unintended container reachable
+    // only through a wildcard would be filed under with nothing refused
+    // (found on review). The exact tier reaches a node by canonical name,
+    // alias, or identifier — the third being how a project keyed by a path
+    // or a URL is named at all (found on review).
     let (predicate, needle) = if fuzzy {
-        ("n.canonical_name LIKE ?1", format!("%{canonical}%"))
+        let escaped = canonical
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        (
+            "n.canonical_name LIKE ?1 ESCAPE '\\'",
+            format!("%{escaped}%"),
+        )
     } else {
         (
-            "(n.canonical_name = ?1 OR n.id IN (SELECT node_id FROM node_alias WHERE alias = ?1))",
+            "(n.canonical_name = ?1 \
+              OR n.id IN (SELECT node_id FROM node_alias WHERE alias = ?1) \
+              OR n.id IN (SELECT node_id FROM node_identifier WHERE value = ?1))",
             canonical,
         )
     };
@@ -2761,6 +2779,32 @@ mod tests {
         let u = create_task(&conn, "z", None, Some("Renewal plan"), None).unwrap();
         assert_eq!(
             get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-b")
+        );
+        // A wildcard in the argument is a character, not a pattern: "re_"
+        // reaches nothing, where a live `_` would have matched "renewal".
+        assert!(create_task(&conn, "w", None, Some("re_"), None).is_err());
+        assert!(create_task(&conn, "w", None, Some("%"), None).is_err());
+        // An identifier names a container too — how a project keyed by a
+        // path or a URL is reached.
+        crate::graph::upsert_identifier(
+            &conn,
+            "url",
+            "https://example.test/renewal-plan",
+            "proj-b",
+            "manual",
+        )
+        .unwrap();
+        let v = create_task(
+            &conn,
+            "v",
+            None,
+            Some("https://example.test/renewal-plan"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_task(&conn, &v).unwrap().unwrap().project_id.as_deref(),
             Some("proj-b")
         );
     }

@@ -19,6 +19,13 @@ pub struct HealthStats {
     pub merge_queue_depth: i64,
     /// >1 live fact on same (subject, predicate) — usually a missed supersession.
     pub live_contradictions: i64,
+    /// Tasks filed under a node that is never a parent — a person, the
+    /// agent, a place, another task, a parent whose row is gone — rows
+    /// from before the write guard, which the board goes on rendering as
+    /// `project_id` for a consumer to cite until `repair-parents` runs
+    /// (found on review: the guard binds new writes only, and nothing
+    /// reported the old rows).
+    pub unfit_parents: i64,
     /// Facts asserted only by LLM extraction, never corroborated (§11.5).
     pub llm_only_facts: i64,
     /// Beliefs closed by world-change rather than error: valid time ended,
@@ -151,6 +158,7 @@ pub fn health(conn: &Connection) -> Result<HealthStats> {
         isolated_pct: pct(isolated, n_nodes),
         merge_queue_depth: scalar("SELECT COUNT(*) FROM fact_candidate WHERE status = 'proposed'")?,
         live_contradictions: crate::fact::live_contradictions(conn)?.len() as i64,
+        unfit_parents: crate::gtd::repair_unfit_parents(conn, false)?.found.len() as i64,
         decayed_beliefs: conn.query_row(
             "SELECT COUNT(*) FROM fact
              WHERE valid_to IS NOT NULL AND invalidated_at IS NULL",

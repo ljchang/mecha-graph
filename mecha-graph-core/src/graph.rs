@@ -974,7 +974,7 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     match moved {
         Ok(()) => conn.execute_batch("RELEASE retype_node")?,
         Err(e) => {
-            conn.execute_batch("ROLLBACK TO retype_node; RELEASE retype_node")?;
+            let _ = conn.execute_batch("ROLLBACK TO retype_node; RELEASE retype_node");
             return Err(e);
         }
     }
