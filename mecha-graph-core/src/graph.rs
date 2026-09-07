@@ -942,17 +942,38 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
             // is kept on the node instead: its status, its completion, and
             // — as a detachment, since a consumer may have cited it — the
             // parent it was filed under (found on review).
-            let (status, completed_at, parent_id): (String, Option<String>, Option<String>) = conn
-                .query_row(
-                    "SELECT status, completed_at, parent_id FROM task_detail WHERE node_id = ?1",
-                    params![node_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?;
-            let converted = serde_json::json!({
-                "status": status, "completed_at": completed_at, "parent_id": parent_id,
-                "to": node_type, "at": crate::ids::now(),
-            })
-            .to_string();
+            // Every column of the row, by name, so the record is the row —
+            // not three fields of it with the estimate and the context tag
+            // deleted silently (found on review) — and a column added later
+            // is kept without this being told.
+            let mut stmt = conn.prepare("SELECT * FROM task_detail WHERE node_id = ?1")?;
+            let names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut row_json = serde_json::Map::new();
+            let mut parent_id: Option<String> = None;
+            stmt.query_row(params![node_id], |r| {
+                for (i, name) in names.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(n) => serde_json::Value::from(n),
+                        rusqlite::types::ValueRef::Real(f) => serde_json::Value::from(f),
+                        rusqlite::types::ValueRef::Text(t) => {
+                            serde_json::Value::from(String::from_utf8_lossy(t).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => {
+                            serde_json::Value::from(format!("<{} bytes>", b.len()))
+                        }
+                    };
+                    if name == "parent_id" {
+                        parent_id = v.as_str().map(str::to_string);
+                    }
+                    row_json.insert(name.clone(), v);
+                }
+                Ok(())
+            })?;
+            drop(stmt);
+            row_json.insert("to".into(), serde_json::Value::from(node_type));
+            row_json.insert("at".into(), serde_json::Value::from(crate::ids::now()));
+            let converted = serde_json::Value::Object(row_json).to_string();
             conn.execute(
                 "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.converted_task', json(?2)) WHERE id = ?1",
                 params![node_id, converted],

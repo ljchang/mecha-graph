@@ -34,9 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project, and the task would be a legal parent the survey could not
   see — except that a finished task with nothing under it *converts*:
   `retype` removes its task row with the type, keeping the id, the facts
-  and the associations a drop-and-recreate would lose, and keeps the row
-  it removes on the node (`properties.converted_task`, plus a detachment
-  record for the parent it was filed under). A parent name is resolved
+  and the associations a drop-and-recreate would lose, and keeps the whole
+  row it removes on the node (`properties.converted_task`, every column,
+  plus a detachment record for the parent it was filed under). A parent name is resolved
   over every container that matches it — exact name or alias, then
   substring, with no limit — so a second container cannot hide outside
   a window and task titles cannot fill one. `project_id` comes from the same join as `project`, so a parent
@@ -56,7 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   right"), so the list is not a standing pile; a deliberate re-file or
   clear records the parent it leaves, reviewed. On `kg_task_update`, a
   list or number where a string belongs refuses the call rather than
-  skipping the field and answering `updated`. A filing under a single
+  skipping the field and answering `updated`, and on `kg_task_create` a
+  non-string `due` or `context` refuses the create. A filing under a single
   event is plausible like one under a series. `task-project <task>` reads a
   converted node's record too. On `kg_task_update` the parent is resolved before anything is
   written, and so are the dates and `waiting_on`, so a refused one changes

@@ -1760,6 +1760,20 @@ mod tests {
             "reviewed over MCP"
         );
 
+        // A list where a string belongs creates nothing either.
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Send the figures", "due": ["2026-10-01"] }),
+        )
+        .expect_err("a non-string due is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Send the figures", "context": ["@lab"] }),
+        )
+        .expect_err("a non-string context is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
         // A refused provenance pointer creates nothing: the board is the
         // same size after the call as before, so a caller told "no task
         // was created" can retry without staging a duplicate.
@@ -2347,10 +2361,18 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
 
 fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
     let name = args["name"].as_str().unwrap_or_default();
-    let due = match args["due"].as_str() {
-        Some(raw) => gtd::parse_due(raw)?,
+    // Shape-checked like every scalar the update reads: a list where a
+    // string belongs used to create an undated, untagged task that answered
+    // `created` — the surface where the loss is least detectable, since
+    // there is no prior row to diff against (found on review).
+    let created_suffix = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — no task was created"))
+    };
+    let due = match scalar_arg(args, "due").map_err(created_suffix)? {
+        Some(raw) => gtd::parse_due(raw).map_err(created_suffix)?,
         None => None,
     };
+    let context = scalar_arg(args, "context").map_err(created_suffix)?;
     // **Resolve every `about` name before creating anything.** The same rule
     // `set_task_waiting_on` states as "resolve before retiring anything",
     // for the same reason one step earlier: resolving afterwards makes a
@@ -2389,13 +2411,7 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
         None => None,
     };
-    let task_id = gtd::create_task(
-        conn,
-        name,
-        due.as_deref(),
-        parent.as_deref(),
-        args["context"].as_str(),
-    )?;
+    let task_id = gtd::create_task(conn, name, due.as_deref(), parent.as_deref(), context)?;
     // A second write rather than a sixth positional argument, on the
     // `set_task_session` shape: the property has its own validating setter,
     // and `create_task` has a TUI caller that has nothing to say about

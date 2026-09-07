@@ -917,7 +917,7 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
                 json_extract(n.properties, '$.detached_parents[#-1].reason'),
                 json_extract(n.properties, '$.detached_parents[#-1].at')
          FROM task_detail td
-         JOIN nodes n ON n.id = td.node_id
+         LEFT JOIN nodes n ON n.id = td.node_id
          WHERE td.parent_id IS NULL
            AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
            AND COALESCE(json_extract(n.properties, '$.detached_parents[#-1].reviewed'), 0) = 0
@@ -927,7 +927,9 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
         .query_map([], |r| {
             Ok(DetachedPending {
                 task_id: r.get(0)?,
-                task_name: r.get(1)?,
+                task_name: r
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "(missing)".to_string()),
                 parent_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 reason: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
@@ -967,7 +969,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
                 CASE WHEN EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)
                      THEN 'task' ELSE p.node_type END
          FROM task_detail td
-         JOIN nodes n ON n.id = td.node_id
+         LEFT JOIN nodes n ON n.id = td.node_id
          LEFT JOIN nodes p ON p.id = td.parent_id
          WHERE td.parent_id IS NOT NULL
            AND (p.id IS NULL
@@ -983,7 +985,9 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
                 .unwrap_or_else(|| MISSING_PARENT.to_string());
             Ok(UnfitParent {
                 task_id: r.get(0)?,
-                task_name: r.get(1)?,
+                task_name: r
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "(missing)".to_string()),
                 parent_id: r.get(2)?,
                 parent_name: r
                     .get::<_, Option<String>>(3)?
@@ -2714,6 +2718,22 @@ mod tests {
         assert_eq!(records[2]["id"], "proj-ghost");
         assert_eq!(records[2]["type"], MISSING_PARENT);
         assert_eq!(records[2]["name"], "(missing)");
+        // A task row whose own node is gone (foreign keys off) is a finding
+        // for the count and the survey alike, so the stats alert can be
+        // cleared by the tool it names.
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type, parent_id) VALUES ('task-ghost', 'inbox', 'action', 'p-wren')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1);
+        assert_eq!(survey.found[0].task_name, "(missing)");
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 0);
+        conn.execute("DELETE FROM task_detail WHERE node_id = 'task-ghost'", [])
+            .unwrap();
         // And the survey sees an orphan parent too, and detaches it on apply.
         upsert_node(&conn, &Node::new("proj-gone2", "project", "Gone")).unwrap();
         set_task_project(&conn, &t, "proj-gone2").unwrap();
@@ -2895,6 +2915,11 @@ mod tests {
         let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
         assert_eq!(node.properties["converted_task"]["status"], "done");
         assert_eq!(node.properties["converted_task"]["parent_id"], "proj-x");
+        // The whole row, by column: a tag or an estimate is kept too.
+        assert!(node.properties["converted_task"]
+            .get("context_tag")
+            .is_some());
+        assert!(node.properties["converted_task"].get("task_type").is_some());
         assert!(node.properties["converted_task"]["completed_at"].is_string());
         assert_eq!(node.properties["detached_parents"][0]["id"], "proj-x");
         assert_eq!(
