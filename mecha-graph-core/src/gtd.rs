@@ -788,6 +788,18 @@ fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> Strin
 pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
     require_task(conn, node_id)?;
     let parent_id = resolve_project_arg(conn, project)?;
+    if parent_id.is_none() {
+        // Clearing a parent that is already clear is the operator saying
+        // "no project is right" about a detachment: mark the last record
+        // reviewed, so it leaves the pending list while staying a record.
+        conn.execute(
+            "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+             WHERE id = ?1
+               AND json_extract(properties, '$.detached_parents') IS NOT NULL
+               AND (SELECT parent_id FROM task_detail WHERE node_id = ?1) IS NULL",
+            params![node_id],
+        )?;
+    }
     set_task_parent_id(conn, node_id, parent_id.as_deref())?;
     Ok(parent_id)
 }
@@ -823,8 +835,12 @@ pub struct UnfitParent {
 pub const MISSING_PARENT: &str = "missing";
 
 /// The types of `NEVER_A_PARENT` that were reachable parents before the
-/// guard and read as deliberate filings rather than slips.
-const PLAUSIBLE_OLD_PARENTS: &[&str] = &["place", "event_series"];
+/// guard and read as deliberate filings rather than slips: a building, a
+/// recurring seminar, one specific meeting ("bring the printed slides",
+/// filed under Thursday's review). A person, the agent, another task, a
+/// document or an artifact read as slips — nobody files work *under* a
+/// PDF (found on review: `event` had been left out by omission).
+const PLAUSIBLE_OLD_PARENTS: &[&str] = &["place", "event", "event_series"];
 
 /// A task that was detached — by this survey's `--apply`, a merge onto a
 /// non-container, or a conversion — and has not been re-filed since: it
@@ -853,7 +869,36 @@ pub struct ParentRepairReport {
     pub pending: Vec<DetachedPending>,
 }
 
-/// Tasks with a detachment record and no parent.
+/// The survey's own predicate as one count, for `stats::health` — which
+/// refreshes on every TUI stats pane and wants the alert, not the rows,
+/// and not the JSON walk `detached_pending` does over every task node
+/// (found on review).
+pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
+    let placeholders = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM task_detail td
+             LEFT JOIN nodes p ON p.id = td.parent_id
+             WHERE td.parent_id IS NOT NULL
+               AND (p.id IS NULL
+                    OR p.node_type IN ({placeholders})
+                    OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Tasks with a detachment record and no parent, whose last record has not
+/// been marked reviewed — `task-project <task> ""` on a task already under
+/// nothing is that mark, the operator's "no project is right", and without
+/// it this list was a standing pile the nightly printed forever (found on
+/// review; the shape `invalidate-phantoms` was added to end).
 pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
     let mut stmt = conn.prepare(
         "SELECT td.node_id, n.name,
@@ -865,6 +910,7 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
          JOIN nodes n ON n.id = td.node_id
          WHERE td.parent_id IS NULL
            AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
+           AND COALESCE(json_extract(n.properties, '$.detached_parents[#-1].reviewed'), 0) = 0
          ORDER BY td.node_id",
     )?;
     let rows = stmt
@@ -2731,6 +2777,11 @@ mod tests {
         .unwrap();
         let survey = repair_unfit_parents(&conn, false).unwrap();
         assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            1,
+            "the count is the survey's predicate"
+        );
         assert_eq!(survey.found[0].parent_id, "proj-odd");
         assert_eq!(
             survey.found[0].parent_type, "task",
@@ -3011,7 +3062,23 @@ mod tests {
             "a task under a real container is untouched"
         );
         assert!(repair_unfit_parents(&conn, true).unwrap().found.is_empty());
-        // Re-filed, it leaves the pending list.
+        // The count the health pane reads agrees with the survey.
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 0);
+        // "No project is right": clearing an already-clear parent marks the
+        // record reviewed, and it leaves the pending list while staying.
+        assert_eq!(detached_pending(&conn).unwrap().len(), 1);
+        set_task_project(&conn, &legacy, "").unwrap();
+        assert!(
+            detached_pending(&conn).unwrap().is_empty(),
+            "reviewed: off the list"
+        );
+        let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["reviewed"], true);
+        assert_eq!(
+            node.properties["detached_parents"][0]["id"], "p-wren",
+            "the record stays"
+        );
+        // Re-filed, it is off the list for the other reason.
         set_task_project(&conn, &legacy, "Tidelab").unwrap();
         assert!(
             repair_unfit_parents(&conn, false)

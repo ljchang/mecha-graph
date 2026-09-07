@@ -158,7 +158,7 @@ pub fn health(conn: &Connection) -> Result<HealthStats> {
         isolated_pct: pct(isolated, n_nodes),
         merge_queue_depth: scalar("SELECT COUNT(*) FROM fact_candidate WHERE status = 'proposed'")?,
         live_contradictions: crate::fact::live_contradictions(conn)?.len() as i64,
-        unfit_parents: crate::gtd::repair_unfit_parents(conn, false)?.found.len() as i64,
+        unfit_parents: crate::gtd::unfit_parent_count(conn)?,
         decayed_beliefs: conn.query_row(
             "SELECT COUNT(*) FROM fact
              WHERE valid_to IS NOT NULL AND invalidated_at IS NULL",

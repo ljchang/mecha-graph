@@ -51,7 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs as one transaction, recording a detachment only where it landed;
   and the survey also lists every task detached earlier — by an apply, a
   merge, or a conversion — and not re-filed since, so a merge's silent
-  detach stays reviewable as a set. `task-project <task>` reads a
+  detach stays reviewable as a set; `task-project <task> ""` on a task
+  already under nothing marks its record reviewed ("no project is
+  right"), so the list is not a standing pile. A filing under a single
+  event is plausible like one under a series. `task-project <task>` reads a
   converted node's record too. On `kg_task_update` the parent is resolved before anything is
   written, and so are the dates and `waiting_on`, so a refused one changes
   nothing — not a status that already landed. A name shared with a node

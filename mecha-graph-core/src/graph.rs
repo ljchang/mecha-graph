@@ -1512,8 +1512,9 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
     // before, and a task may absorb a stray node of another type.
     if keep.node_type != "task" && crate::gtd::is_task(conn, dup_id)? {
         return Err(crate::error::Error::Other(format!(
-            "{} is a task on the board and {} is a {} — a task row cannot be merged into a \
-             container; drop or complete the task instead",
+            "{} is a task on the board and {} is a {} — a task row cannot be merged onto another \
+             node; convert it first (`retype` a done or dropped task with nothing filed under \
+             it) or delete the duplicate task",
             dup.name, keep.name, keep.node_type
         )));
     }
