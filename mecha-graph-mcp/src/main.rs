@@ -1696,6 +1696,42 @@ mod tests {
         );
     }
 
+    /// The consumer reads `project_id` off the wire, not off `TaskItem`:
+    /// every task surface carries it, equal to the parent node's id, and
+    /// the create echo carries it at the moment the citing consumer has it
+    /// to record.
+    #[test]
+    fn every_task_surface_carries_the_project_id_on_the_wire() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        let created = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship the pilot", "project": "Tide pool study" }),
+        )
+        .unwrap();
+        assert_eq!(created["task"]["project_id"], "proj-tide");
+        assert_eq!(created["task"]["project"], "Tide pool study");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let listed = kg_task_list(&conn, &json!({})).unwrap();
+        let row = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["project_id"], "proj-tide");
+
+        let updated = kg_task_update(&conn, &json!({ "task": id, "status": "next" })).unwrap();
+        assert_eq!(updated["task"]["project_id"], "proj-tide");
+
+        // Absent exactly when the name is — a null on the wire, not a
+        // missing key, so a reader can tell "no project" from "older server".
+        let alone = kg_task_create(&conn, &json!({ "name": "No project" })).unwrap();
+        assert!(alone["task"]["project_id"].is_null());
+        assert!(alone["task"].get("project_id").is_some());
+    }
+
     /// `kg_upsert` cannot write prose into a date column.
     #[test]
     fn valid_from_must_be_a_date() {
@@ -2211,11 +2247,25 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // this PR wrote; and reading it back means the echo reflects what was
     // actually recorded, including a pre-existing shadow row upgraded to
     // reviewed by this very call.
-    let about = gtd::get_task(conn, &task_id)?
-        .map(|t| t.about)
+    let created = gtd::get_task(conn, &task_id)?;
+    let about = created
+        .as_ref()
+        .map(|t| t.about.clone())
         .unwrap_or_default();
+    // And the whole row under `task`, through `task_json` like the update
+    // echo — the moment a task is created under a project is the moment a
+    // citing consumer has the project's id to record, and a hand-written
+    // literal here was the one surface that did not carry it (found on
+    // review). The top-level keys stay: callers read `id` and `due_at` off
+    // them.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let task = created.map(|t| task_json(&t, &today));
     Ok(json!({
-        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about
+        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about,
+        "task": task
     }))
 }
 

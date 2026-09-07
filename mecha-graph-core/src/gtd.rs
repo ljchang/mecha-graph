@@ -237,8 +237,8 @@ fn list_tasks_filtered(
                    -- this reads as a list of people rather than of events.
                    GROUP BY pn.id
                    ORDER BY last_held DESC)),
-                -- The parent's id beside its name (column 11): appended
-                -- last so no earlier column index moves.
+                -- The parent's id beside its name (which is column 11):
+                -- appended last, at column 15, so no earlier index moves.
                 td.parent_id
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
