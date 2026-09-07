@@ -2485,8 +2485,11 @@ fn scalar_arg<'a>(args: &'a Value, key: &str) -> mecha_graph_core::Result<Option
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.as_str())),
+        // The shape problem alone; the outcome clause is the caller's, as
+        // `project_arg` leaves it — baked in here, create's re-wrap read
+        // "— nothing was changed — no task was created" (found on review).
         Some(other) => Err(mecha_graph_core::Error::Other(format!(
-            "`{key}` must be a string, not {other} — nothing was changed"
+            "`{key}` must be a string, not {other}"
         ))),
     }
 }
@@ -2540,8 +2543,11 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // had already closed the task and retired its `waiting_on` claim — the
     // half-write the `project` pre-check closes, one field over (found on
     // review).
+    let changed_nothing = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+    };
     let sched = |key: &str| -> mecha_graph_core::Result<Option<Option<String>>> {
-        match scalar_arg(args, key)? {
+        match scalar_arg(args, key).map_err(changed_nothing)? {
             None => Ok(None),
             Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
                 mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
@@ -2553,10 +2559,10 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // Every scalar the writes below read, checked for shape here so a list
     // where a string belongs refuses the call rather than skipping the
     // field and answering `updated`.
-    let status_arg = scalar_arg(args, "status")?;
-    let context_arg = scalar_arg(args, "context")?;
-    let waiting_on_arg = scalar_arg(args, "waiting_on")?;
-    let session_arg = scalar_arg(args, "session")?;
+    let status_arg = scalar_arg(args, "status").map_err(changed_nothing)?;
+    let context_arg = scalar_arg(args, "context").map_err(changed_nothing)?;
+    let waiting_on_arg = scalar_arg(args, "waiting_on").map_err(changed_nothing)?;
+    let session_arg = scalar_arg(args, "session").map_err(changed_nothing)?;
     // And who the task waits on — resolved after the status landed, a typo
     // returned an error on a call that had already closed the task and
     // retired the live claim (found on review, the one writer the block's
