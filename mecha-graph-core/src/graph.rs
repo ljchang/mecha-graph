@@ -1535,12 +1535,7 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         // which case they are detached with a record of where they were,
         // never re-pointed onto a parent the guard would have refused
         // (found on review).
-        let keep_type: String = conn.query_row(
-            "SELECT node_type FROM nodes WHERE id = ?1",
-            params![keep_id],
-            |r| r.get(0),
-        )?;
-        if crate::gtd::NEVER_A_PARENT.contains(&keep_type.as_str()) {
+        if crate::gtd::NEVER_A_PARENT.contains(&keep.node_type.as_str()) {
             crate::gtd::detach_tasks_under(conn, dup_id, "merge_nodes")?;
         } else {
             conn.execute(
@@ -1571,7 +1566,6 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         )?;
         // Cascades take mention/alias/identifier leftovers and detail rows.
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![dup_id])?;
-        let _ = keep;
         Ok(())
     })();
 

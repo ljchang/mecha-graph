@@ -829,8 +829,9 @@ enum Command {
         /// The task's node id, e.g. 'task-1a2b3c4d'
         task: String,
         /// The parent — a project, goal, area, topic or org, by name or node
-        /// id; "" clears
-        project: String,
+        /// id; "" clears. Omit to print the current parent and where the
+        /// task was filed before any detachment
+        project: Option<String>,
     },
     /// Scan task titles for entities the graph already knows, filing matches
     /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
@@ -2363,6 +2364,32 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
         }
         Command::TaskProject { task, project } => {
+            let Some(project) = project else {
+                // The reader for the record the detach writes: the store
+                // remembers, and this is where it says so (found on
+                // review — written and read by nothing).
+                let t = gtd::get_task(&conn, &task)?
+                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                match (&t.project, &t.project_id) {
+                    (Some(name), Some(id)) => println!("{} — filed under {name} ({id})", t.name),
+                    _ => println!("{} — filed under no project", t.name),
+                }
+                let node = graph::get_node(&conn, &task)?
+                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                if let Some(history) = node.properties["detached_parents"].as_array() {
+                    for h in history {
+                        println!(
+                            "  was under {} ({}, {}) — detached {} by {}",
+                            h["name"].as_str().unwrap_or("?"),
+                            h["type"].as_str().unwrap_or("?"),
+                            h["id"].as_str().unwrap_or("?"),
+                            h["at"].as_str().unwrap_or("?"),
+                            h["reason"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                return Ok(());
+            };
             match gtd::set_task_project(&conn, &task, &project)? {
                 Some(parent) => {
                     let t = gtd::get_task(&conn, &task)?
