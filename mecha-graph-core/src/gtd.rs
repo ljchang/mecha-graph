@@ -807,6 +807,11 @@ pub struct UnfitParent {
     /// person, the agent, another task). Both are detached on `apply`;
     /// this is so the survey tells them apart before that.
     pub plausible: bool,
+    /// Whether `--apply` detached this row. `false` on a survey, and on the
+    /// one row an apply can miss — re-filed between the survey's read and
+    /// the write (`AND parent_id = ?2`) — so the printed list and the count
+    /// cannot disagree without saying which row (found on review).
+    pub detached: bool,
 }
 
 /// The parent type the survey reports for a `parent_id` whose node row is
@@ -880,6 +885,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
                     .unwrap_or_else(|| "(missing)".to_string()),
                 plausible: PLAUSIBLE_OLD_PARENTS.contains(&parent_type.as_str()),
                 parent_type,
+                detached: false,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -893,7 +899,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         // review). The record of where each task was goes on the task node
         // — the store remembers, not the terminal.
         let tx = conn.unchecked_transaction()?;
-        for u in &report.found {
+        for u in &mut report.found {
             let detached = tx.execute(
                 "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1 AND parent_id = ?2",
                 params![u.task_id, u.parent_id],
@@ -913,6 +919,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
                     params![u.task_id, record],
                 )?;
             }
+            u.detached = detached == 1;
             report.detached += detached;
         }
         tx.commit()?;
@@ -2895,6 +2902,7 @@ mod tests {
                 parent_name: "Wren".into(),
                 parent_type: "person".into(),
                 plausible: false,
+                detached: false,
             }]
         );
         assert_eq!(survey.detached, 0, "a survey detaches nothing");
@@ -2903,6 +2911,10 @@ mod tests {
         let applied = repair_unfit_parents(&conn, true).unwrap();
         assert_eq!(applied.found.len(), 1);
         assert_eq!(applied.detached, 1);
+        assert!(
+            applied.found[0].detached,
+            "the row says it was the one detached"
+        );
         assert_eq!(pid(&legacy), None);
         // The store remembers where it was, on the task itself.
         let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
