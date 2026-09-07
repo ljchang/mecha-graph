@@ -246,7 +246,7 @@ pub fn render_stats(h: &HealthStats, style: &Style) -> String {
     }
     if h.unfit_parents > 0 {
         alerts.push(format!(
-            "{} task(s) filed under a node that is never a parent (slips; the survey lists plausible old filings besides) → mecha-graph repair-parents",
+            "{} task(s) filed under a node that is never a parent (slips; the survey lists plausible old filings besides) → mecha-graph repair-parents, then --apply",
             h.unfit_parents
         ));
     }

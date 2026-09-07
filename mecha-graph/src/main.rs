@@ -2388,6 +2388,13 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         (_, true, false) => {
                             "  — NOT detached: re-filed since the survey's read; run again"
                         }
+                        // The survey reflects the flag it was given, so a dry
+                        // run of the wider apply reads as one (found on
+                        // review: the flag was a silent no-op without --apply).
+                        (true, false, _) if include_plausible => {
+                            "  — plausible under the old rule; --apply --include-plausible WOULD \
+                             detach it"
+                        }
                         (true, false, _) => {
                             "  — plausible under the old rule; re-file rather than detach?"
                         }
@@ -2404,8 +2411,10 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     "detached {} — re-file with `mecha-graph task-project <task> <project>`",
                     report.detached
                 );
+            } else if include_plausible {
+                println!("survey only; --apply --include-plausible detaches every row above");
             } else {
-                println!("survey only; --apply detaches them");
+                println!("survey only; --apply detaches the slips (--include-plausible the rest)");
             }
         }
         Command::TaskProject { task, project } => {

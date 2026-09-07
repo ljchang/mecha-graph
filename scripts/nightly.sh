@@ -125,7 +125,10 @@ run "$PKG" invalidate-phantoms
 # for mecha's goal record to cite until somebody looks. The finding lands in
 # this log the way the phantom repair's does; detaching is an operator's
 # `repair-parents --apply`, after reading which filings are plausible.
-run "$PKG" repair-parents
+# `--text`, because this command answers JSON off a terminal and the log
+# is not one — the other passes print prose unconditionally (found on
+# review).
+run "$PKG" repair-parents --text
 
 # Decay sweep (§11.5): re-derive co-occurrence beliefs against the mentions
 # the linkers just rebuilt, close the collapsed ones (valid time only) and
