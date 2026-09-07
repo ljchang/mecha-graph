@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a task on the board cannot be retyped into anything, nor merged into
   a container — only the type would move, or the row would land on a
   project, and the task would be a legal parent the survey could not
-  see. `project_id` comes from the same join as `project`, so a parent
+  see — except that a finished task with nothing under it *converts*:
+  `retype` removes its task row with the type, keeping the id, the facts
+  and the associations a drop-and-recreate would lose. `project_id` comes from the same join as `project`, so a parent
   whose node row is gone is handed out by neither. A parent argument
   that is a node id resolves to that node before any name, so the id
   the board hands out always comes back to the same node. Everywhere the

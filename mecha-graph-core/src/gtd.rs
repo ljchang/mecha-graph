@@ -2605,6 +2605,44 @@ mod tests {
         assert!(e.to_string().contains("no container node matches"), "{e}");
     }
 
+    /// The exit from the row rule: a finished task with nothing under it
+    /// converts to a container, and the task row goes with the type.
+    #[test]
+    fn a_finished_task_with_nothing_under_it_converts_to_a_container() {
+        let conn = open_memory().unwrap();
+        let t = create_task(&conn, "Tide pool study", None, None, None).unwrap();
+        let e = crate::graph::retype_node(&conn, &t, "project").unwrap_err();
+        assert!(
+            e.to_string().contains("only once it is done or dropped"),
+            "{e}"
+        );
+        set_task_status(&conn, &t, "done").unwrap();
+        // Still refused while something sits under it.
+        upsert_node(&conn, &Node::new("proj-x", "project", "X")).unwrap();
+        let child = create_task(&conn, "Child", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+            params![child, t],
+        )
+        .unwrap();
+        assert!(crate::graph::retype_node(&conn, &t, "project").is_err());
+        set_task_project(&conn, &child, "proj-x").unwrap();
+        // Now it converts: the row is gone, the id stays, and it is a parent.
+        let (was, now) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        assert_eq!((was.as_str(), now.as_str()), ("task", "project"));
+        assert!(!is_task(&conn, &t).unwrap());
+        assert!(get_task(&conn, &t).unwrap().is_none(), "off the board");
+        let under = create_task(&conn, "Ship the pilot", None, Some(&t), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &under)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some(t.as_str())
+        );
+    }
+
     /// A task cannot be merged into a container: the row would move and
     /// the container would be a task on the board and a legal parent the
     /// survey cannot see.

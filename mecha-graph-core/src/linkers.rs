@@ -712,9 +712,10 @@ pub fn repair_node_id_payloads(conn: &Connection, dry_run: bool) -> Result<IdPay
     };
     for (dup_id, names_id) in placeholders {
         match crate::graph::get_node(conn, &names_id)? {
-            Some(real)
-                if crate::gtd::is_task(conn, &dup_id)? && !crate::gtd::is_task(conn, &real.id)? =>
-            {
+            // The same predicate `merge_nodes` refuses on — the kept node's
+            // *type* — so a container by type that carries a task row is
+            // skipped here rather than aborting the pass there.
+            Some(real) if real.node_type != "task" && crate::gtd::is_task(conn, &dup_id)? => {
                 rep.placeholders_skipped.push(dup_id);
             }
             Some(real) => {

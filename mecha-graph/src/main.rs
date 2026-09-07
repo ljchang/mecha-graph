@@ -2359,10 +2359,15 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     // The one thing the survey knows that the reader must
                     // weigh before --apply: a filing that was legal and may
                     // have been meant, or a slip.
-                    if u.plausible {
-                        "  — plausible under the old rule; re-file rather than detach?"
-                    } else {
-                        ""
+                    match (u.plausible, apply) {
+                        (true, false) => {
+                            "  — plausible under the old rule; re-file rather than detach?"
+                        }
+                        (true, true) => {
+                            "  — was plausible under the old rule; `task-project` can re-file it \
+                             from the record"
+                        }
+                        (false, _) => "",
                     }
                 );
             }
