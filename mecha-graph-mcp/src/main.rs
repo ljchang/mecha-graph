@@ -248,7 +248,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_create",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
-            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` must name an existing container node — a project, goal, area or topic — by name or node id (the `project_id` a task row carries): an unknown name is an error, not an implicit node; a name matching several nodes is refused with their ids; and a task, person, event, document or artifact is never a parent.",
+            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` names the parent — any container node (project, goal, area, topic, org…) by name or node id (the `project_id` a task row carries): an unknown name is an error, not an implicit node; a name matching several nodes is refused with their ids; and a task, person, place, event, event_series, document or artifact is never a parent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
