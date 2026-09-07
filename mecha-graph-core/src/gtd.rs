@@ -716,6 +716,12 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
             ),
             params![parent_id, record],
         )?;
+        conn.execute(
+            "UPDATE nodes SET properties = json_remove(properties, '$.detached_parents[0]')
+             WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)
+               AND json_array_length(properties, '$.detached_parents') > ?2",
+            params![parent_id, DETACHMENT_HISTORY as i64],
+        )?;
         Ok(conn.execute(
             "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
             params![parent_id],
@@ -741,6 +747,20 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
 /// under a person, re-filed, then its new parent merged into one) would
 /// otherwise keep only the second record and lose the filing that
 /// motivated the survey (found on review). `?2` is the record.
+/// How many detachment records a task node keeps. `kg_task_update` puts
+/// re-filing in an agent's hands, and every move appends one record, so
+/// without a cap the list — printed whole by `task-project`, walked by
+/// every survey — grew with the agent's habits (found on review). The
+/// oldest goes first; twenty moves of history is more than a review reads.
+pub const DETACHMENT_HISTORY: usize = 20;
+
+/// The SQL that drops the oldest record once the list is over the cap —
+/// run after every append, so the length never exceeds it by more than
+/// the one just added.
+const TRIM_DETACHED: &str =
+    "UPDATE nodes SET properties = json_remove(properties, '$.detached_parents[0]') \
+     WHERE id = ?1 AND json_array_length(properties, '$.detached_parents') > ?2";
+
 const APPEND_DETACHED: &str = "json_set(COALESCE(properties, '{}'), '$.detached_parents', \
      json_insert(COALESCE(json_extract(COALESCE(properties, '{}'), '$.detached_parents'), '[]'), \
      '$[#]', json(?2)))";
@@ -765,6 +785,7 @@ pub fn record_detachment(
         ),
         params![task_id, record],
     )?;
+    conn.execute(TRIM_DETACHED, params![task_id, DETACHMENT_HISTORY as i64])?;
     Ok(())
 }
 
@@ -1060,6 +1081,7 @@ pub fn repair_unfit_parents_with(
                     ),
                     params![u.task_id, record],
                 )?;
+                tx.execute(TRIM_DETACHED, params![u.task_id, DETACHMENT_HISTORY as i64])?;
             }
             u.detached = detached == 1;
             report.detached += detached;
@@ -3091,6 +3113,25 @@ mod tests {
         assert!(get_task(&conn, &u).unwrap().is_none());
     }
 
+    /// The history is capped: an agent re-filing a task on every turn does
+    /// not grow its node without bound, and the newest record survives.
+    #[test]
+    fn the_detachment_history_keeps_the_newest_records_up_to_the_cap() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-a", "project", "A")).unwrap();
+        upsert_node(&conn, &Node::new("proj-b", "project", "B")).unwrap();
+        let t = create_task(&conn, "Ping-pong", None, Some("proj-a"), None).unwrap();
+        for i in 0..(DETACHMENT_HISTORY + 5) {
+            let to = if i % 2 == 0 { "proj-b" } else { "proj-a" };
+            set_task_project(&conn, &t, to).unwrap();
+        }
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let history = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(history.len(), DETACHMENT_HISTORY);
+        // The last move was from proj-a (odd index 24 → to proj-b? i=24 is even → to proj-b, from proj-a)
+        assert_eq!(history.last().unwrap()["id"], "proj-a");
+    }
+
     /// A survey tells a plausible old filing from a slip.
     #[test]
     fn the_survey_marks_a_place_or_series_parent_plausible_and_a_person_not() {
@@ -3120,6 +3161,9 @@ mod tests {
             "a building was a legal filing under the old rule"
         );
         assert!(!by_id(&b), "a person never was");
+        // The health count is the slips: the plausible filing is not an
+        // alert the command it names could never clear.
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
         // --apply acts on the distinction: the slip goes, the plausible
         // filing stays until asked for.
         let applied = repair_unfit_parents(&conn, true).unwrap();

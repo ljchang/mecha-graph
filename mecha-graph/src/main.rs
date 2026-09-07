@@ -2382,10 +2382,10 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     // weigh before --apply: a filing that was legal and may
                     // have been meant, or a slip.
                     match (u.plausible, apply, u.detached) {
-                        (true, true, false) => {
+                        (true, true, false) if !include_plausible => {
                             "  — kept: plausible under the old rule; --include-plausible detaches it"
                         }
-                        (false, true, false) => {
+                        (_, true, false) => {
                             "  — NOT detached: re-filed since the survey's read; run again"
                         }
                         (true, false, _) => {
