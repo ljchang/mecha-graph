@@ -2546,6 +2546,13 @@ mod tests {
             Some("proj-r01s")
         );
         assert_eq!(pid(&t).as_deref(), Some("proj-r01s"));
+        // The parent left is recorded, reviewed, so the history answers
+        // "which id did a consumer cite before?" without a pending finding.
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-r01");
+        assert_eq!(node.properties["detached_parents"][0]["reason"], "re-filed");
+        assert_eq!(node.properties["detached_parents"][0]["reviewed"], true);
+        assert!(detached_pending(&conn).unwrap().is_empty());
         assert_eq!(set_task_project(&conn, &t, "").unwrap(), None);
         assert_eq!(pid(&t), None);
         // The same refusals as capture: a person, an ambiguous name, an
