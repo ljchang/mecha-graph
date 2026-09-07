@@ -806,6 +806,22 @@ fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> Strin
 /// also have cited (found on review). Resolves exactly as `create_task`
 /// does, so the two cannot disagree about what a parent may be. Returns the
 /// parent's id, `None` when cleared.
+/// Whether the task's current parent carries the operator's vouch — the
+/// `parent_reviewed` mark naming that parent. What a caller reports after
+/// a vouch attempt, since the writer refuses one for a slip silently and
+/// a report that says "filed under Wren" reads as if it took (found on
+/// review).
+pub fn vouch_stands(conn: &Connection, node_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_detail td JOIN nodes n ON n.id = td.node_id
+         WHERE td.node_id = ?1 AND td.parent_id IS NOT NULL
+           AND json_extract(n.properties, '$.parent_reviewed') = td.parent_id",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
     require_task(conn, node_id)?;
     let parent_id = resolve_project_for(conn, node_id, project)?;
@@ -3105,14 +3121,15 @@ mod tests {
         // Now it converts: the row is gone, the id stays, and it is a parent.
         let (was, now) = crate::graph::retype_node(&conn, &t, "project").unwrap();
         let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
-        assert_eq!(node.properties["converted_task"]["status"], "done");
-        assert_eq!(node.properties["converted_task"]["parent_id"], "proj-x");
+        let c = &node.properties["converted_task"];
+        assert_eq!(c["row"]["status"], "done");
+        assert_eq!(c["row"]["parent_id"], "proj-x");
+        assert_eq!(c["converted_to"], "project");
+        assert!(c["converted_at"].is_string());
         // The whole row, by column: a tag or an estimate is kept too.
-        assert!(node.properties["converted_task"]
-            .get("context_tag")
-            .is_some());
-        assert!(node.properties["converted_task"].get("task_type").is_some());
-        assert!(node.properties["converted_task"]["completed_at"].is_string());
+        assert!(c["row"].get("context_tag").is_some());
+        assert!(c["row"].get("task_type").is_some());
+        assert!(c["row"]["completed_at"].is_string());
         assert_eq!(node.properties["detached_parents"][0]["id"], "proj-x");
         assert_eq!(
             node.properties["detached_parents"][0]["reason"],

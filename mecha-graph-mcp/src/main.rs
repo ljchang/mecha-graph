@@ -2360,7 +2360,13 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
 }
 
 fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let name = args["name"].as_str().unwrap_or_default();
+    // The required scalar, checked like its neighbours: a list where the
+    // name belongs used to refuse as "task needs a name" — true, and the
+    // wrong problem to name to a caller whose payload carries one (found
+    // on review).
+    let name = scalar_arg(args, "name")
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+        .unwrap_or_default();
     // Shape-checked like every scalar the update reads: a list where a
     // string belongs used to create an undated, untagged task that answered
     // `created` — the surface where the loss is least detectable, since

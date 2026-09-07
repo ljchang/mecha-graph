@@ -2454,10 +2454,10 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         "{} — now a {}; was a task ({}, completed {}) filed under {}, converted {}",
                         node.name,
                         node.node_type,
-                        c["status"].as_str().unwrap_or("?"),
-                        c["completed_at"].as_str().unwrap_or("never"),
-                        c["parent_id"].as_str().unwrap_or("no project"),
-                        c["at"].as_str().unwrap_or("?")
+                        c["row"]["status"].as_str().unwrap_or("?"),
+                        c["row"]["completed_at"].as_str().unwrap_or("never"),
+                        c["row"]["parent_id"].as_str().unwrap_or("no project"),
+                        c["converted_at"].as_str().unwrap_or("?")
                     );
                     if let Some(h) = history.as_ref().and_then(|h| h.as_array()) {
                         for r in h {
@@ -2538,6 +2538,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let parent = gtd::set_task_project(&conn, &task, &project)?;
             let t = gtd::get_task(&conn, &task)?
                 .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+            // A vouch the writer refused (a slip is a slip whoever vouches)
+            // must not report as one that took (found on review).
+            let vouched = gtd::vouch_stands(&conn, &task)?;
             // JSON here too — the write is the call a script most needs to
             // confirm, and JSON is the default off a terminal (found on
             // review).
@@ -2547,15 +2550,28 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "task": t.node_id, "name": t.name,
                         "project": t.project, "project_id": t.project_id,
+                        "vouched": vouched,
                     }))?
                 );
                 return Ok(());
             }
             match parent {
                 Some(parent) => println!(
-                    "{} — filed under {} ({parent})",
+                    "{} — filed under {} ({parent}){}",
                     t.name,
-                    t.project.as_deref().unwrap_or("?")
+                    t.project.as_deref().unwrap_or("?"),
+                    if vouched {
+                        " — vouched for; off the survey"
+                    } else if gtd::NEVER_A_PARENT.contains(
+                        &graph::get_node(&conn, &parent)?
+                            .map(|n| n.node_type)
+                            .unwrap_or_default()
+                            .as_str(),
+                    ) {
+                        " — a slip stays a slip: no vouch is written for this type"
+                    } else {
+                        ""
+                    }
                 ),
                 None => println!("{} — filed under no project", t.name),
             }

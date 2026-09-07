@@ -971,9 +971,16 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
                 Ok(())
             })?;
             drop(stmt);
-            row_json.insert("to".into(), serde_json::Value::from(node_type));
-            row_json.insert("at".into(), serde_json::Value::from(crate::ids::now()));
-            let converted = serde_json::Value::Object(row_json).to_string();
+            // The row nested under its own key, the two synthetic fields
+            // beside it under names no column will carry: written into the
+            // same map, `to`/`at` would win a collision with a column added
+            // later and replace its value silently (found on review).
+            let converted = serde_json::json!({
+                "row": serde_json::Value::Object(row_json),
+                "converted_to": node_type,
+                "converted_at": crate::ids::now(),
+            })
+            .to_string();
             conn.execute(
                 "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.converted_task', json(?2)) WHERE id = ?1",
                 params![node_id, converted],
