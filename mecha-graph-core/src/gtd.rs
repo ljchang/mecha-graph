@@ -1055,7 +1055,12 @@ pub fn set_task_captured_from(
 /// Bounce a malformed pointer rather than storing it — `parse_due`'s rule,
 /// and it matters more here: a stored pointer nothing can follow looks
 /// exactly like provenance right up until somebody clicks it.
-fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value> {
+/// Public so a caller that writes several things can refuse *before* its
+/// first write: `kg_task_create` used to insert the task and then refuse
+/// the pointer, leaving a task the error said was never created — and a
+/// consumer that retries on "nothing was created" then stages a duplicate
+/// (found on review).
+pub fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value> {
     let object = value
         .as_object()
         .ok_or_else(|| Error::Other("captured_from must be an object".into()))?;
