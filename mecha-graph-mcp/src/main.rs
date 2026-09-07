@@ -1767,6 +1767,10 @@ mod tests {
         )
         .expect_err("a non-string due is refused");
         assert!(e.to_string().contains("no task was created"), "{e}");
+        assert!(
+            !e.to_string().contains("nothing was changed"),
+            "one outcome clause: {e}"
+        );
         let e = kg_task_create(
             &conn,
             &json!({ "name": "Send the figures", "context": ["@lab"] }),
