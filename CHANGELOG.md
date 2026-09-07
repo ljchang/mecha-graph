@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
   `project_id`, absent exactly when `project` is — the create echo now
   carries the whole row under `task` through the same renderer as the
-  update echo, beside the top-level keys callers already read. The name is prose (spaces,
+  update echo, beside the top-level keys callers already read. And
+  `kg_task_create` accepts that id back as `project`: a pointer the server
+  hands out is one it accepts, so a consumer filing a task under the
+  project it just read is not refused for citing what it was told to cite. The name is prose (spaces,
   and two nodes can share one); a consumer recording *which* project a task
   served cites `project:<node id>` and refuses whitespace in an id, so the
   name alone could never be cited. mecha's goal record is that consumer.

@@ -584,10 +584,20 @@ pub fn create_task(
     if name.is_empty() {
         return Err(Error::Other("task needs a name".into()));
     }
+    // By name or alias first, then by node id: the board hands out
+    // `project_id` beside the name, and a pointer a server hands out must
+    // be one it accepts back — a consumer filing a task under the project
+    // it just read would otherwise be refused for citing the id it was
+    // told to cite (found on review). Names first, as `resolve_about`
+    // orders it: a name is what a caller normally has, and an id shaped
+    // like a name is not a thing here.
     let parent_id = match project_name.map(str::trim).filter(|s| !s.is_empty()) {
         Some(p) => match crate::graph::resolve_entity(conn, p)? {
             Some(node) => Some(node.id),
-            None => return Err(Error::Other(format!("no node matches project '{p}'"))),
+            None => match crate::graph::get_node(conn, p)? {
+                Some(node) => Some(node.id),
+                None => return Err(Error::Other(format!("no node matches project '{p}'"))),
+            },
         },
         None => None,
     };
@@ -1747,6 +1757,17 @@ mod tests {
         let alone = get_task(&conn, &alone).unwrap().unwrap();
         assert_eq!(alone.project, None);
         assert_eq!(alone.project_id, None);
+
+        // The id the board hands out is accepted back on create — a
+        // consumer citing `project_id` files under the same project.
+        let by_id = create_task(&conn, "Write it up", None, Some("proj-tide"), None).unwrap();
+        let by_id = get_task(&conn, &by_id).unwrap().unwrap();
+        assert_eq!(by_id.project_id.as_deref(), Some("proj-tide"));
+        assert_eq!(by_id.project.as_deref(), Some("Tide pool study"));
+        assert!(
+            create_task(&conn, "Nowhere", None, Some("proj-nope"), None).is_err(),
+            "an unknown id is still an error, not an implicit node"
+        );
     }
 
     #[test]
