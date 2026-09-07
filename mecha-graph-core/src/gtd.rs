@@ -983,8 +983,11 @@ pub struct DetachedPending {
 
 #[derive(Debug, Default, Serialize)]
 pub struct ParentRepairReport {
-    /// The flag this report was computed under, echoed so a survey and the
-    /// apply it previews are the same document.
+    /// The flags this report was computed under, echoed so a survey and
+    /// the apply it previews are the same document — both of them, since a
+    /// survey and an apply whose every row was re-filed between the read
+    /// and the write were byte-for-byte the same JSON (found on review).
+    pub applied: bool,
     pub include_plausible: bool,
     pub found: Vec<UnfitParent>,
     /// Rows actually detached. Zero on a dry run, however many were found.
@@ -1161,6 +1164,7 @@ pub fn repair_unfit_parents_with(
         })?
         .collect::<std::result::Result<_, _>>()?;
     let mut report = ParentRepairReport {
+        applied: apply,
         include_plausible,
         found,
         detached: 0,
@@ -3186,9 +3190,14 @@ mod tests {
         // Filed somewhere itself: the conversion records that too.
         set_task_project(&conn, &t, "proj-x").unwrap();
         // Now it converts: the row is gone, the id stays, and it is a parent.
-        let (was, now) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        let (was, now, wrote) = crate::graph::retype_node(&conn, &t, "project").unwrap();
         let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
         let c = &node.properties["converted_task"];
+        assert_eq!(
+            wrote.as_ref(),
+            Some(c),
+            "the call returns the record it wrote"
+        );
         assert_eq!(c["row"]["status"], "done");
         assert_eq!(c["row"]["parent_id"], "proj-x");
         assert_eq!(c["converted_to"], "project");
@@ -3205,6 +3214,21 @@ mod tests {
         assert_eq!((was.as_str(), now.as_str()), ("task", "project"));
         assert!(!is_task(&conn, &t).unwrap());
         assert!(get_task(&conn, &t).unwrap().is_none(), "off the board");
+        // A later retype onto the type it was converted to is not a
+        // conversion: the node's record stays, the call returns none, so
+        // the CLI cannot re-print a board row removed (found on review).
+        let (_, _, again) = crate::graph::retype_node(&conn, &t, "topic").unwrap();
+        assert!(again.is_none());
+        let (_, _, again) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        assert!(again.is_none(), "the record on the node is not this call's");
+        assert_eq!(
+            crate::graph::get_node(&conn, &t)
+                .unwrap()
+                .unwrap()
+                .properties["converted_task"],
+            *c,
+            "the record is written once"
+        );
         // And there is no retype back: a task is made by capture.
         let e = crate::graph::retype_node(&conn, &t, "task").unwrap_err();
         assert!(e.to_string().contains("by capture, not by retype"), "{e}");
@@ -3367,6 +3391,10 @@ mod tests {
         assert!(!row(&a) && row(&b));
         assert!(!survey.include_plausible);
         let wider = repair_unfit_parents_with(&conn, false, true).unwrap();
+        assert!(
+            !wider.applied && wider.include_plausible,
+            "both flags echoed"
+        );
         assert!(wider.include_plausible);
         assert!(wider.found.iter().all(|u| u.would_detach));
         // The health count is the slips: the plausible filing is not an

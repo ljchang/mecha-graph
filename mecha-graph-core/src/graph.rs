@@ -873,7 +873,17 @@ pub fn create_node(conn: &Connection, node_type: &str, name: &str, source: &str)
 /// would keep its old id nowhere, so every fact, mention and rollup pointing
 /// at it would have to be moved, and a partial move is how a repair becomes
 /// a second problem. Changing one column moves nothing.
-pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<(String, String)> {
+/// Returns `(was, now, converted)`: the type moved from and to, and the
+/// conversion record this call wrote — `None` when it did not convert.
+/// The record it wrote, not the record on the node: `converted_task` is
+/// written once and outlives the retype, so a later retype landing on the
+/// same type read it back as its own and reported a board row removed it
+/// had not removed (found on review).
+pub fn retype_node(
+    conn: &Connection,
+    node_id: &str,
+    node_type: &str,
+) -> Result<(String, String, Option<serde_json::Value>)> {
     if !NODE_TYPES.contains(&node_type) {
         return Err(crate::error::Error::Other(format!(
             "node_type '{node_type}' not in closed set {NODE_TYPES:?}"
@@ -947,7 +957,8 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
         }
     }
     conn.execute_batch("SAVEPOINT retype_node")?;
-    let moved = (|| -> Result<()> {
+    let moved = (|| -> Result<Option<serde_json::Value>> {
+        let mut wrote = None;
         if converting_task {
             // The row is the one thing the conversion does not keep, so it
             // is kept on the node instead: its status, its completion, and
@@ -990,12 +1001,12 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
                 "row": serde_json::Value::Object(row_json),
                 "converted_to": node_type,
                 "converted_at": crate::ids::now(),
-            })
-            .to_string();
+            });
             conn.execute(
                 "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.converted_task', json(?2)) WHERE id = ?1",
-                params![node_id, converted],
+                params![node_id, converted.to_string()],
             )?;
+            wrote = Some(converted);
             if let Some(pid) = parent_id {
                 crate::gtd::record_detachment(conn, node_id, &pid, "retype_node")?;
             }
@@ -1008,20 +1019,23 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
             "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
             params![node_id, node_type],
         )?;
-        Ok(())
+        Ok(wrote)
     })();
-    match moved {
-        Ok(()) => conn.execute_batch("RELEASE retype_node")?,
+    let converted = match moved {
+        Ok(c) => {
+            conn.execute_batch("RELEASE retype_node")?;
+            c
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK TO retype_node; RELEASE retype_node");
             return Err(e);
         }
-    }
+    };
     // The id keeps its old prefix, and that is deliberate. It is an opaque
     // key that every fact, mention and rollup already references; rewriting
     // it to match the new type would mean rewriting all of them to gain a
     // string nobody resolves on.
-    Ok((node.node_type, node_type.to_string()))
+    Ok((node.node_type, node_type.to_string(), converted))
 }
 
 /// Is `name` free for `exclude_id` to take? The public face of
@@ -2460,8 +2474,9 @@ mod tests {
         .unwrap();
         add_alias(&conn, "topic-obic", "OBIC", "manual").unwrap();
 
-        let (was, now) = retype_node(&conn, "topic-obic", "org").unwrap();
+        let (was, now, converted) = retype_node(&conn, "topic-obic", "org").unwrap();
         assert_eq!((was.as_str(), now.as_str()), ("topic", "org"));
+        assert!(converted.is_none(), "no row, no conversion");
 
         let after = get_node(&conn, "topic-obic").unwrap().unwrap();
         assert_eq!(after.node_type, "org");

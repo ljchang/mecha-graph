@@ -225,7 +225,7 @@ pub fn apply(conn: &Connection, p: &Proposal) -> Result<String> {
             let to = p
                 .payload_str("to_type")
                 .ok_or_else(|| crate::error::Error::Other("no to_type in payload".into()))?;
-            let (was, now) = graph::retype_node(conn, &p.subject_id, &to)?;
+            let (was, now, _) = graph::retype_node(conn, &p.subject_id, &to)?;
             Ok(format!("{}: {was} → {now}", p.subject_name))
         }
         "rename" => {

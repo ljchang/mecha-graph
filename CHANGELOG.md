@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vouch takes a stale mark with it — and is never inferred from an
   MCP update that echoes the row it read) and takes it off the
   survey —
-  and `mecha-graph task-project` re-files one from the direct interface;
+  and `mecha-graph task-project` re-files one from the direct interface
+  (the survey's JSON echoes both of its flags, `applied` and
+  `include_plausible`);
   it also finds a parent whose node is gone (reported as `missing`), and
   a task on the board cannot be retyped into anything, nor merged into
   a container — only the type would move, or the row would land on a

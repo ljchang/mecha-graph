@@ -3138,27 +3138,24 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Retype { target, node_type } => {
             let id = resolve_one(&conn, &target)?;
-            let (was, now) = graph::retype_node(&conn, &id, &node_type)?;
+            let (was, now, converted) = graph::retype_node(&conn, &id, &node_type)?;
             println!("{id}: {was} → {now}");
             // The one retype that shrinks the board says so: a done task
             // converted to a container had its row removed and, if it was
             // filed somewhere, a detachment recorded (found on review — the
             // line above was the whole output).
-            // Gated on the record this retype wrote, not on the old type:
-            // the conversion is decided by the row, and a task by row under
-            // a container type converts too (found on review).
-            if let Some(node) = graph::get_node(&conn, &id)? {
-                let c = &node.properties["converted_task"];
-                if c["converted_to"].as_str() == Some(now.as_str()) {
-                    {
-                        println!(
-                            "  board row removed (was {}, filed under {}); the row is kept on the \
-                             node — `task-project {id}` reads it",
-                            c["row"]["status"].as_str().unwrap_or("?"),
-                            c["row"]["parent_id"].as_str().unwrap_or("no project")
-                        );
-                    }
-                }
+            // Gated on the record this call returned, not on the old type
+            // and not on the node's `converted_task`: the conversion is
+            // decided by the row, and the node's record outlives the retype
+            // that wrote it, so a later retype onto the same type read it
+            // back as its own (found on review, twice).
+            if let Some(c) = converted {
+                println!(
+                    "  board row removed (was {}, filed under {}); the row is kept on the \
+                     node — `task-project {id}` reads it",
+                    c["row"]["status"].as_str().unwrap_or("?"),
+                    c["row"]["parent_id"].as_str().unwrap_or("no project")
+                );
             }
         }
 
