@@ -618,13 +618,17 @@ pub fn create_task(
 /// resolves like any other, and so does a building's). `org` stays a
 /// container on purpose: a task filed under a department reads as filed
 /// under one. `repair_unfit_parents` is the same rule over rows written
-/// before it existed. Bound to every writer of `parent_id`, not only the
-/// resolver: `set_task_parent_id` re-checks the id it is handed,
-/// `graph::retype_node` refuses to turn a parent into one of these while
-/// tasks sit under it, and `graph::merge_nodes` detaches rather than
-/// re-points when the kept node is one (found on review — a guard at
-/// resolve time alone left two mutators that re-create the state after
-/// the fact). `CONTAINER_TYPES` is the other half, and a test holds the
+/// before it existed. Bound to every writer of `parent_id` and to the two
+/// deliberate writers of a type, not only the resolver: `set_task_parent_id`
+/// re-checks the id it is handed, `graph::retype_node` refuses to turn a
+/// parent into one of these while tasks sit under it, and
+/// `graph::merge_nodes` detaches rather than re-points when the kept node
+/// is one (found on review — a guard at resolve time alone left two
+/// mutators that re-create the state after the fact). Not bound:
+/// `graph::upsert_node`'s `ON CONFLICT … SET node_type`, so a node retyped
+/// into a container and then re-ingested by a source that derives the same
+/// id (a calendar event) becomes an event again over its tasks with no call
+/// refused; `repair-parents` is what catches that, after the fact. `CONTAINER_TYPES` is the other half, and a test holds the
 /// two to be a partition of `graph::NODE_TYPES`, so a fourteenth type
 /// cannot become a parent by omission.
 pub const NEVER_A_PARENT: &[&str] = &[
@@ -660,30 +664,51 @@ pub fn tasks_under(conn: &Connection, node_id: &str) -> Result<usize> {
 }
 
 /// Detach every task filed under `parent_id`, leaving on each task node a
-/// record of where it was (`properties.detached_parent`: the parent's id,
-/// name and type, and why) — because a filing that was legal under an
+/// record of where it was (appended to `properties.detached_parents`: the
+/// parent's id, name and type, and why) — because a filing that was legal under an
 /// older rule is indistinguishable from a slip once it is gone, and the
 /// only other record of it would be somebody's terminal (found on review).
 /// Returns how many were detached.
 pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> Result<usize> {
-    let Some(parent) = crate::graph::get_node(conn, parent_id)? else {
-        return Ok(0);
-    };
-    let record = serde_json::json!({
-        "id": parent.id, "name": parent.name, "type": parent.node_type,
-        "reason": reason, "at": crate::ids::now(),
-    })
-    .to_string();
-    conn.execute(
-        "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.detached_parent', json(?2))
-         WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
-        params![parent_id, record],
-    )?;
+    // The record needs the parent node; the detach does not. A parent row
+    // that is gone (a store attached with foreign keys off can carry a
+    // `parent_id` whose node is not there) must still lose its children,
+    // or the pass meant to remove the unfit parent would report success
+    // and leave it (found on review). Fail closed on the write, not the
+    // record.
+    if let Some(parent) = crate::graph::get_node(conn, parent_id)? {
+        let record = detached_record(&parent.id, &parent.name, &parent.node_type, reason);
+        conn.execute(
+            &format!(
+                "UPDATE nodes SET properties = {}
+                 WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
+                APPEND_DETACHED
+            ),
+            params![parent_id, record],
+        )?;
+    }
     let n = conn.execute(
         "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
         params![parent_id],
     )?;
     Ok(n)
+}
+
+/// The SQL that appends one record to a task node's `detached_parents`
+/// list — a list, not a slot, because a task detached twice (surveyed
+/// under a person, re-filed, then its new parent merged into one) would
+/// otherwise keep only the second record and lose the filing that
+/// motivated the survey (found on review). `?2` is the record.
+const APPEND_DETACHED: &str = "json_set(COALESCE(properties, '{}'), '$.detached_parents', \
+     json_insert(COALESCE(json_extract(COALESCE(properties, '{}'), '$.detached_parents'), '[]'), \
+     '$[#]', json(?2)))";
+
+fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> String {
+    serde_json::json!({
+        "id": id, "name": name, "type": node_type,
+        "reason": reason, "at": crate::ids::now(),
+    })
+    .to_string()
 }
 
 /// Re-file a task under another project, or under none (`""`). The one
@@ -775,13 +800,17 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         // The record of where each task was goes on the task node before
         // the column is nulled — the store remembers, not the terminal.
         for u in &report.found {
-            let record = serde_json::json!({
-                "id": u.parent_id, "name": u.parent_name, "type": u.parent_type,
-                "reason": "repair_unfit_parents", "at": crate::ids::now(),
-            })
-            .to_string();
+            let record = detached_record(
+                &u.parent_id,
+                &u.parent_name,
+                &u.parent_type,
+                "repair_unfit_parents",
+            );
             conn.execute(
-                "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.detached_parent', json(?2)) WHERE id = ?1",
+                &format!(
+                    "UPDATE nodes SET properties = {} WHERE id = ?1",
+                    APPEND_DETACHED
+                ),
                 params![u.task_id, record],
             )?;
             report.detached += conn.execute(
@@ -2232,8 +2261,11 @@ mod tests {
             "detached, never re-pointed onto a person"
         );
         let node = crate::graph::get_node(&conn, &u).unwrap().unwrap();
-        assert_eq!(node.properties["detached_parent"]["id"], "proj-wren");
-        assert_eq!(node.properties["detached_parent"]["reason"], "merge_nodes");
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-wren");
+        assert_eq!(
+            node.properties["detached_parents"][0]["reason"],
+            "merge_nodes"
+        );
         // Onto a container, tasks follow the merge as before.
         upsert_node(&conn, &Node::new("proj-a", "project", "Alpha")).unwrap();
         upsert_node(&conn, &Node::new("proj-b", "project", "Alpha (dup)")).unwrap();
@@ -2242,6 +2274,52 @@ mod tests {
         assert_eq!(
             get_task(&conn, &v).unwrap().unwrap().project_id.as_deref(),
             Some("proj-a")
+        );
+    }
+
+    /// A second detachment keeps the first record, and a parent whose node
+    /// is gone still loses its children.
+    #[test]
+    fn detachment_records_accumulate_and_a_missing_parent_still_detaches() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-wren", "project", "Wren's project")).unwrap();
+        let t = create_task(&conn, "Draft the aims", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-wren' WHERE node_id = ?1",
+            params![t],
+        )
+        .unwrap();
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        set_task_project(&conn, &t, "proj-wren").unwrap();
+        crate::graph::merge_nodes(&conn, "p-wren", "proj-wren").unwrap();
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let records = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "both detachments are remembered: {records:?}"
+        );
+        assert_eq!(records[0]["reason"], "repair_unfit_parents");
+        assert_eq!(records[1]["reason"], "merge_nodes");
+        assert_eq!(records[1]["id"], "proj-wren");
+
+        // A parent row that is gone: the column is still nulled, the record
+        // is what cannot be written.
+        upsert_node(&conn, &Node::new("proj-ghost", "project", "Ghost")).unwrap();
+        set_task_project(&conn, &t, "proj-ghost").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'proj-ghost'", [])
+            .unwrap();
+        assert_eq!(detach_tasks_under(&conn, "proj-ghost", "test").unwrap(), 1);
+        assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        assert_eq!(
+            node.properties["detached_parents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -2320,10 +2398,10 @@ mod tests {
         assert_eq!(pid(&legacy), None);
         // The store remembers where it was, on the task itself.
         let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
-        assert_eq!(node.properties["detached_parent"]["id"], "p-wren");
-        assert_eq!(node.properties["detached_parent"]["type"], "person");
+        assert_eq!(node.properties["detached_parents"][0]["id"], "p-wren");
+        assert_eq!(node.properties["detached_parents"][0]["type"], "person");
         assert_eq!(
-            node.properties["detached_parent"]["reason"],
+            node.properties["detached_parents"][0]["reason"],
             "repair_unfit_parents"
         );
         assert_eq!(

@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id writer re-checks what it is handed, `retype` refuses to turn a
   parent into a non-container while tasks sit under it, `merge` detaches
   rather than re-points onto one, and a detached task keeps where it was
-  on its own node (`properties.detached_parent`) so the record is in the
+  on its own node (appended to `properties.detached_parents`) so the record is in the
   store rather than a terminal. The survey marks a filing under a place
   or a recurring event `plausible` — legal under the old rule — apart
   from a slip under a person, the agent or another task. `NEVER_A_PARENT`
