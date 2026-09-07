@@ -828,8 +828,48 @@ pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Resu
     if parent_id.is_none() {
         mark_detachment_reviewed(conn, node_id)?;
     }
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if parent_id.is_some() && parent_id == current {
+        // The direct interface's own gesture: re-filing under the parent
+        // the task already has is "this filing was meant".
+        vouch_for_parent(conn, node_id)?;
+    }
     set_task_parent_id(conn, node_id, parent_id.as_deref())?;
     Ok(parent_id)
+}
+
+/// The operator's vouch for the parent a task already has: written only
+/// when that parent is a plausible old filing — a place, an event, a
+/// series — with its node present and no task row, and naming that parent
+/// so it lapses with a move or a retype. `true` when written. Called by the
+/// direct interface alone (`task-project <task> <its parent's id>`); the
+/// MCP update never infers it, because an agent's read-modify-write echoes
+/// the row it read and a mark inferred from that retired survey rows no
+/// human had looked at (found on review).
+pub fn vouch_for_parent(conn: &Connection, node_id: &str) -> Result<bool> {
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    let Some(cur) = current else {
+        return Ok(false);
+    };
+    let plausible_now = crate::graph::get_node(conn, &cur)?
+        .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
+        && !is_task(conn, &cur)?;
+    if !plausible_now {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', ?2) WHERE id = ?1",
+        params![node_id, cur],
+    )?;
+    Ok(true)
 }
 
 /// Clearing a parent that is already clear is the operator — or the agent,
@@ -1378,23 +1418,11 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
     )?;
     if let (Some(cur), Some(new)) = (current.as_deref(), parent_id) {
         if cur == new {
-            // The vouch is written only for a parent that is unfit *now*
-            // and plausibly meant — a place, an event, a series — and it
-            // names that parent, never a bare flag: a flag set by an
-            // idempotent re-send under an ordinary project survived onto
-            // the event a type rewrite later made of it, and the survey
-            // honoured it there — the one net for that writer, failing
-            // open for any task ever re-filed onto its own parent (found on
-            // review). Honoured only while the id still matches the row's.
-            let plausible_now = crate::graph::get_node(conn, cur)?
-                .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
-                && !is_task(conn, cur)?;
-            if plausible_now {
-                conn.execute(
-                    "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', ?2) WHERE id = ?1",
-                    params![node_id, cur],
-                )?;
-            }
+            // The parent the task already has: nothing to write, and no
+            // mark either — an idempotent re-send over MCP echoes the row
+            // it read, and a mark inferred from that retired a survey row
+            // no human had looked at (found on review). The vouch is an
+            // explicit gesture, `vouch_for_parent`, made by `task-project`.
             return Ok(());
         }
     }

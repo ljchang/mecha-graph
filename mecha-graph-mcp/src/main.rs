@@ -1760,6 +1760,43 @@ mod tests {
             "reviewed over MCP"
         );
 
+        // No name at all: the same clause as every other refusal here.
+        let e =
+            kg_task_create(&conn, &json!({ "due": "tomorrow" })).expect_err("a name is required");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
+        // An agent's idempotent re-send of the parent it read is not a vouch:
+        // the survey row stays until a person says so from the terminal.
+        upsert_node(&conn, &Node::new("pl-hall", "place", "Fixture Hall")).unwrap();
+        let parked = kg_task_create(&conn, &json!({ "name": "Fix the projector" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-hall' WHERE node_id = ?1",
+            mecha_graph_core::rusqlite::params![parked],
+        )
+        .unwrap();
+        kg_task_update(
+            &conn,
+            &json!({ "task": parked, "due": "tomorrow", "project": "pl-hall" }),
+        )
+        .unwrap();
+        assert!(
+            !gtd::vouch_stands(&conn, &parked).unwrap(),
+            "no mark from an echo"
+        );
+        assert!(gtd::repair_unfit_parents(&conn, false)
+            .unwrap()
+            .found
+            .iter()
+            .any(|u| u.task_id == parked));
+        assert!(
+            gtd::vouch_for_parent(&conn, &parked).unwrap(),
+            "the explicit gesture"
+        );
+        assert!(gtd::vouch_stands(&conn, &parked).unwrap());
+
         // A list where a string belongs creates nothing either.
         let e = kg_task_create(
             &conn,
@@ -2371,6 +2408,13 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     let name = scalar_arg(args, "name")
         .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
         .unwrap_or_default();
+    if name.trim().is_empty() {
+        // The commonest malformed call, with the clause every other
+        // refusal here carries (found on review).
+        return Err(mecha_graph_core::Error::Other(
+            "task needs a name — no task was created".into(),
+        ));
+    }
     // Shape-checked like every scalar the update reads: a list where a
     // string belongs used to create an undated, untagged task that answered
     // `created` — the surface where the loss is least detectable, since
