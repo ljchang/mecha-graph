@@ -742,6 +742,29 @@ const APPEND_DETACHED: &str = "json_set(COALESCE(properties, '{}'), '$.detached_
      json_insert(COALESCE(json_extract(COALESCE(properties, '{}'), '$.detached_parents'), '[]'), \
      '$[#]', json(?2)))";
 
+/// Append to one task node the record of the parent it is losing —
+/// `detach_tasks_under`'s record for a single row, for a caller that
+/// removes the row itself (`retype_node`'s conversion).
+pub fn record_detachment(
+    conn: &Connection,
+    task_id: &str,
+    parent_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let record = match crate::graph::get_node(conn, parent_id)? {
+        Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
+        None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
+    };
+    conn.execute(
+        &format!(
+            "UPDATE nodes SET properties = {} WHERE id = ?1",
+            APPEND_DETACHED
+        ),
+        params![task_id, record],
+    )?;
+    Ok(())
+}
+
 fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> String {
     serde_json::json!({
         "id": id, "name": name, "type": node_type,
@@ -919,18 +942,18 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
     let node = if let Some(node) = crate::graph::get_node(conn, what)? {
         node
     } else {
-        // Only nodes that could be a parent count towards ambiguity: an
-        // institute that is both an org and a place, or a task titled after
-        // its project, would otherwise make the project un-nameable by name
-        // — a refusal for a name with exactly one legal answer (found on
-        // review). The type and the row are filtered here; the refusal below
-        // then names a genuine ambiguity between two containers.
-        let mut matches = Vec::new();
-        for n in crate::graph::resolve_entity_all(conn, what)? {
-            if NEVER_A_PARENT.contains(&n.node_type.as_str()) || is_task(conn, &n.id)? {
-                continue;
-            }
-            matches.push(n);
+        // Only nodes that could be a parent are candidates, and the query is
+        // the parent's own — not `resolve_entity_all`, whose fuzzy tier
+        // stops at five rows: filtering its window to containers counted
+        // containers *in the window*, so a second project matching the
+        // name could sit outside it and the parent was picked by sort order
+        // after all, or four task titles could fill it and hide the one
+        // container (found on review). Exact name or alias first, the
+        // substring only when neither matches; no limit on either, so
+        // `len() > 1` is a genuine ambiguity between two containers.
+        let mut matches = parent_candidates(conn, what, false)?;
+        if matches.is_empty() {
+            matches = parent_candidates(conn, what, true)?;
         }
         match matches.len() {
             1 => matches.into_iter().next().expect("one match"),
@@ -973,6 +996,55 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
         )));
     }
     Ok(node)
+}
+
+/// Container nodes a parent name reaches: by exact canonical name or alias,
+/// or — `fuzzy` — by substring of the canonical name. Every row that could
+/// be a parent and no other (the type not in `NEVER_A_PARENT`, no task
+/// row), and **no limit**, so a count over the result is a count over the
+/// matching set.
+fn parent_candidates(
+    conn: &Connection,
+    what: &str,
+    fuzzy: bool,
+) -> Result<Vec<crate::graph::Node>> {
+    let canonical = crate::ids::canonicalize(what);
+    if canonical.is_empty() {
+        return Ok(Vec::new());
+    }
+    let never = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (predicate, needle) = if fuzzy {
+        ("n.canonical_name LIKE ?1", format!("%{canonical}%"))
+    } else {
+        (
+            "(n.canonical_name = ?1 OR n.id IN (SELECT node_id FROM node_alias WHERE alias = ?1))",
+            canonical,
+        )
+    };
+    // The type list is a private `const` of string literals interpolated
+    // because SQLite has no array parameter — never caller input.
+    let sql = format!(
+        "SELECT n.id FROM nodes n
+         WHERE {predicate}
+           AND n.node_type NOT IN ({never})
+           AND n.id NOT IN (SELECT node_id FROM task_detail)
+         ORDER BY n.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Vec<String> = stmt
+        .query_map(params![needle], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(n) = crate::graph::get_node(conn, &id)? {
+            out.push(n);
+        }
+    }
+    Ok(out)
 }
 
 /// The parent a `project` argument resolves to, or `None` for `""` —
@@ -2627,8 +2699,19 @@ mod tests {
         .unwrap();
         assert!(crate::graph::retype_node(&conn, &t, "project").is_err());
         set_task_project(&conn, &child, "proj-x").unwrap();
+        // Filed somewhere itself: the conversion records that too.
+        set_task_project(&conn, &t, "proj-x").unwrap();
         // Now it converts: the row is gone, the id stays, and it is a parent.
         let (was, now) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        assert_eq!(node.properties["converted_task"]["status"], "done");
+        assert_eq!(node.properties["converted_task"]["parent_id"], "proj-x");
+        assert!(node.properties["converted_task"]["completed_at"].is_string());
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-x");
+        assert_eq!(
+            node.properties["detached_parents"][0]["reason"],
+            "retype_node"
+        );
         assert_eq!((was.as_str(), now.as_str()), ("task", "project"));
         assert!(!is_task(&conn, &t).unwrap());
         assert!(get_task(&conn, &t).unwrap().is_none(), "off the board");
@@ -2640,6 +2723,45 @@ mod tests {
                 .project_id
                 .as_deref(),
             Some(t.as_str())
+        );
+    }
+
+    /// The count is over the matching set, not a window: task titles that
+    /// share the substring do not hide a container or crowd out a second
+    /// one, and two containers sharing it are refused.
+    #[test]
+    fn a_fuzzy_parent_name_is_counted_over_every_container_that_matches() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-a", "project", "Renewal budget")).unwrap();
+        for i in 0..6 {
+            create_task(
+                &conn,
+                &format!("Draft the renewal aims {i}"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Six tasks and one container match "renewal"; the container wins.
+        let t = create_task(&conn, "x", None, Some("renewal"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-a")
+        );
+        // A second container matching it is a refusal that names both.
+        upsert_node(&conn, &Node::new("proj-b", "project", "Renewal plan")).unwrap();
+        let e = create_task(&conn, "y", None, Some("renewal"), None).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("matches 2 nodes") && msg.contains("proj-a") && msg.contains("proj-b"),
+            "{msg}"
+        );
+        // An exact name still wins outright over the substring tier.
+        let u = create_task(&conn, "z", None, Some("Renewal plan"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-b")
         );
     }
 

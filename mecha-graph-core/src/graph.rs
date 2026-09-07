@@ -938,6 +938,28 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     conn.execute_batch("SAVEPOINT retype_node")?;
     let moved = (|| -> Result<()> {
         if converting_task {
+            // The row is the one thing the conversion does not keep, so it
+            // is kept on the node instead: its status, its completion, and
+            // — as a detachment, since a consumer may have cited it — the
+            // parent it was filed under (found on review).
+            let (status, completed_at, parent_id): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT status, completed_at, parent_id FROM task_detail WHERE node_id = ?1",
+                    params![node_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            let converted = serde_json::json!({
+                "status": status, "completed_at": completed_at, "parent_id": parent_id,
+                "to": node_type, "at": crate::ids::now(),
+            })
+            .to_string();
+            conn.execute(
+                "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.converted_task', json(?2)) WHERE id = ?1",
+                params![node_id, converted],
+            )?;
+            if let Some(pid) = parent_id {
+                crate::gtd::record_detachment(conn, node_id, &pid, "retype_node")?;
+            }
             conn.execute(
                 "DELETE FROM task_detail WHERE node_id = ?1",
                 params![node_id],

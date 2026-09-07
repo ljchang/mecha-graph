@@ -34,7 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project, and the task would be a legal parent the survey could not
   see — except that a finished task with nothing under it *converts*:
   `retype` removes its task row with the type, keeping the id, the facts
-  and the associations a drop-and-recreate would lose. `project_id` comes from the same join as `project`, so a parent
+  and the associations a drop-and-recreate would lose, and keeps the row
+  it removes on the node (`properties.converted_task`, plus a detachment
+  record for the parent it was filed under). A parent name is resolved
+  over every container that matches it — exact name or alias, then
+  substring, with no limit — so a second container cannot hide outside
+  a window and task titles cannot fill one. `project_id` comes from the same join as `project`, so a parent
   whose node row is gone is handed out by neither. A parent argument
   that is a node id resolves to that node before any name, so the id
   the board hands out always comes back to the same node. Everywhere the

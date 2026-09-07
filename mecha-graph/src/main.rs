@@ -2451,17 +2451,29 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
                 return Ok(());
             };
-            match gtd::set_task_project(&conn, &task, &project)? {
-                Some(parent) => {
-                    let t = gtd::get_task(&conn, &task)?
-                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
-                    println!(
-                        "{} — filed under {} ({parent})",
-                        t.name,
-                        t.project.as_deref().unwrap_or("?")
-                    );
-                }
-                None => println!("{task} — filed under no project"),
+            let parent = gtd::set_task_project(&conn, &task, &project)?;
+            let t = gtd::get_task(&conn, &task)?
+                .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+            // JSON here too — the write is the call a script most needs to
+            // confirm, and JSON is the default off a terminal (found on
+            // review).
+            if want_json(cli_json, cli_text) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "task": t.node_id, "name": t.name,
+                        "project": t.project, "project_id": t.project_id,
+                    }))?
+                );
+                return Ok(());
+            }
+            match parent {
+                Some(parent) => println!(
+                    "{} — filed under {} ({parent})",
+                    t.name,
+                    t.project.as_deref().unwrap_or("?")
+                ),
+                None => println!("{} — filed under no project", t.name),
             }
         }
         Command::TaskAbout { task, add, remove } => {
