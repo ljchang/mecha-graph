@@ -1759,6 +1759,16 @@ mod tests {
             .len();
         assert_eq!(after, before, "and it created nothing");
 
+        // A refused parent says so in the words the other refusals use.
+        upsert_node(
+            &conn,
+            &Node::new("proj-tide2", "project", "Tide pool study 2"),
+        )
+        .unwrap();
+        let e = kg_task_create(&conn, &json!({ "name": "x", "project": "Tide pool" }))
+            .expect_err("an ambiguous name is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
         // The object the id came in, re-sent instead of the string, is
         // refused — never an unfiled task that answers `created`.
         let e = kg_task_create(
@@ -2315,11 +2325,20 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::validate_captured_from(&args["captured_from"])
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
     }
+    // The parent, resolved here so its refusal says what the others say —
+    // an ambiguous name is the refusal a consumer most likely retries
+    // blind (found on review). `create_task` resolves the id again, which
+    // is a lookup by id and cannot disagree.
+    let parent = match project_arg(args)? {
+        Some(p) => gtd::resolve_project_arg(conn, p)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
+        None => None,
+    };
     let task_id = gtd::create_task(
         conn,
         name,
         due.as_deref(),
-        project_arg(args)?,
+        parent.as_deref(),
         args["context"].as_str(),
     )?;
     // A second write rather than a sixth positional argument, on the

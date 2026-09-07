@@ -904,7 +904,9 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     // on review, twice: the row is the fact, and a type check beside it
     // let a row a merge had moved through). Dropping or converting the
     // task row is a different operation, and not this one.
-    if crate::gtd::is_task(conn, node_id)? {
+    // — except back *to* `task`, which is the one repair for a node that
+    // is a task by row and something else by type (found on review).
+    if node_type != "task" && crate::gtd::is_task(conn, node_id)? {
         return Err(crate::error::Error::Other(format!(
             "{} is a task on the board (it has a task row), and a task cannot be retyped into \
              a {node_type} — drop or complete it instead",

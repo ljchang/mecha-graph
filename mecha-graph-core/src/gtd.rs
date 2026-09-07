@@ -806,14 +806,17 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         // dropped — `detach_tasks_under` defends the same case, and a survey
         // blind to it would print "nothing to fix" over a board still
         // handing the orphan out as `project_id`.
-        "SELECT td.node_id, n.name, td.parent_id, p.name, p.node_type
+        "SELECT td.node_id, n.name, td.parent_id, p.name,
+                -- the row is the fact: a parent that is itself on the board is
+                -- reported as the task it is, whatever its declared type
+                CASE WHEN EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)
+                     THEN 'task' ELSE p.node_type END
          FROM task_detail td
          JOIN nodes n ON n.id = td.node_id
          LEFT JOIN nodes p ON p.id = td.parent_id
          WHERE td.parent_id IS NOT NULL
            AND (p.id IS NULL
                 OR p.node_type IN ({placeholders})
-                -- the row is the fact: a parent that is itself on the board
                 OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
          ORDER BY td.node_id"
     );
@@ -827,7 +830,9 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
                 task_id: r.get(0)?,
                 task_name: r.get(1)?,
                 parent_id: r.get(2)?,
-                parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                parent_name: r
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "(missing)".to_string()),
                 plausible: PLAUSIBLE_OLD_PARENTS.contains(&parent_type.as_str()),
                 parent_type,
             })
@@ -2393,6 +2398,7 @@ mod tests {
         assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
         assert_eq!(survey.found[0].parent_id, "proj-gone2");
         assert_eq!(survey.found[0].parent_type, MISSING_PARENT);
+        assert_eq!(survey.found[0].parent_name, "(missing)");
         assert!(!survey.found[0].plausible);
         assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
         assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
@@ -2479,6 +2485,17 @@ mod tests {
         let survey = repair_unfit_parents(&conn, false).unwrap();
         assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
         assert_eq!(survey.found[0].parent_id, "proj-odd");
+        assert_eq!(
+            survey.found[0].parent_type, "task",
+            "reported as the task it is"
+        );
+        // And the one repair for the node itself: detach what sits under it
+        // (a task is never a parent, so the retype refuses while one does),
+        // then retype it back to task.
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "task").is_err());
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        crate::graph::retype_node(&conn, "proj-odd", "task").unwrap();
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "project").is_err());
         upsert_node(&conn, &Node::new("proj-b", "project", "Beta")).unwrap();
         let u = create_task(&conn, "Under beta", None, Some("proj-b"), None).unwrap();
         crate::graph::merge_nodes(&conn, "proj-odd", "proj-b").unwrap();
