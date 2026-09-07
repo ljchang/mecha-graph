@@ -645,6 +645,13 @@ pub struct IdPayloadRepair {
     /// they are left pending and reported. A human decides; a guess here
     /// would invent the subject of somebody's belief.
     pub unresolvable: Vec<i64>,
+    /// Placeholders that are tasks on the board — a task captured with an
+    /// id pasted into its name — which `merge_nodes` refuses to fold into a
+    /// container, since the task row would land on it. Skipped and named
+    /// rather than aborting the pass after earlier merges had committed
+    /// (found on review); `mecha-graph task-project` or a rename is the
+    /// remedy, by hand.
+    pub placeholders_skipped: Vec<String>,
     /// `(placeholder id, the node it was standing in for, facts moved)`.
     ///
     /// The third number is the one to read before running this. A placeholder
@@ -704,7 +711,17 @@ pub fn repair_node_id_payloads(conn: &Connection, dry_run: bool) -> Result<IdPay
         rows
     };
     for (dup_id, names_id) in placeholders {
+        // Probed before the match rather than inside a guard, so the one
+        // fallible read here is visibly a read and not a branch condition
+        // (found on review).
+        let dup_is_task = crate::gtd::is_task(conn, &dup_id)?;
         match crate::graph::get_node(conn, &names_id)? {
+            // The same predicate `merge_nodes` refuses on — the kept node's
+            // *type* — so a container by type that carries a task row is
+            // skipped here rather than aborting the pass there.
+            Some(real) if real.node_type != "task" && dup_is_task => {
+                rep.placeholders_skipped.push(dup_id);
+            }
             Some(real) => {
                 let facts: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM fact

@@ -21,6 +21,14 @@ pub struct TaskItem {
     pub completed_at: Option<String>,
     /// Parent project name (task_detail.parent_id), if any.
     pub project: Option<String>,
+    /// The parent project's node id — the same `task_detail.parent_id`
+    /// `project` is the name of. Carried beside the name because a name is
+    /// prose (it has spaces, and two nodes can share one) and a consumer
+    /// that records *which* project a task served needs the pointer the
+    /// board minted: mecha's goal record cites `project:<node id>` and
+    /// refuses an id with whitespace in it, so the name alone could never be
+    /// cited. Absent exactly when `project` is.
+    pub project_id: Option<String>,
     /// Who this waits on (live `waiting_on` fact), if anyone.
     pub waiting_on: Option<String>,
     /// Who held it before — names from `waiting_on` facts that have been
@@ -228,7 +236,16 @@ fn list_tasks_filtered(
                    -- back and forth listed the same holder repeatedly, and
                    -- this reads as a list of people rather than of events.
                    GROUP BY pn.id
-                   ORDER BY last_held DESC))
+                   ORDER BY last_held DESC)),
+                -- The parent's id beside its name (which is column 11):
+                -- appended last, at column 15, so no earlier index moves —
+                -- and from the SAME join as the name, never the raw column,
+                -- so the two are absent together: a `parent_id` whose node
+                -- row is gone (a store restored with foreign keys off) is
+                -- handed out by neither, where the raw column minted a
+                -- pointer to nothing for a consumer to cite (found on
+                -- review). The survey reads the raw column and reports it.
+                (SELECT p.id FROM nodes p WHERE p.id = td.parent_id)
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?3 IS NULL OR n.id = ?3)
@@ -328,6 +345,7 @@ fn list_tasks_filtered(
                     .get::<_, Option<String>>(14)?
                     .map(|joined| joined.split(NAME_SEP).map(str::to_string).collect())
                     .unwrap_or_default(),
+                project_id: r.get(15)?,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -559,8 +577,10 @@ pub fn parse_due(input: &str) -> Result<Option<String>> {
 }
 
 /// Create a task by hand (TUI `a` / manual capture). `project` resolves
-/// against the graph (project/topic node); unknown names are an error rather
-/// than an implicit node — typo protection.
+/// against the graph by name, alias or node id; unknown names are an error
+/// rather than an implicit node — typo protection — an ambiguous name is
+/// refused rather than guessed, and a node whose type is in
+/// [`NEVER_A_PARENT`] is not a parent.
 pub fn create_task(
     conn: &Connection,
     name: &str,
@@ -573,10 +593,7 @@ pub fn create_task(
         return Err(Error::Other("task needs a name".into()));
     }
     let parent_id = match project_name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => match crate::graph::resolve_entity(conn, p)? {
-            Some(node) => Some(node.id),
-            None => return Err(Error::Other(format!("no node matches project '{p}'"))),
-        },
+        Some(p) => Some(resolve_parent(conn, p)?.id),
         None => None,
     };
     let task_id = format!("task-{}", &crate::ids::new_uid()[..8]);
@@ -594,6 +611,924 @@ pub fn create_task(
         ],
     )?;
     Ok(task_id)
+}
+
+/// Node types that are never a task's parent. Not a whitelist: `project`,
+/// `goal`, `area`, `topic`, `org` and the rest are containers a task can
+/// sit under, and the set is open at that end. What is closed is the other
+/// end — a node that is itself a unit of work, a person, a place the work
+/// happens at, or a record of something that happened is not a container,
+/// and filing a task under one renders it on the board as a project and
+/// hands a consumer `project_id` to cite (found on review, three times: a
+/// task's own id sits beside its `project_id` on every row, a person's name
+/// resolves like any other, and so does a building's). `org` stays a
+/// container on purpose: a task filed under a department reads as filed
+/// under one. `repair_unfit_parents` is the same rule over rows written
+/// before it existed. Bound to every writer of `parent_id` and to the two
+/// deliberate writers of a type, not only the resolver: `set_task_parent_id`
+/// re-checks the id it is handed, `graph::retype_node` refuses to turn a
+/// parent into one of these while tasks sit under it, and
+/// `graph::merge_nodes` detaches rather than re-points when the kept node
+/// is one (found on review — a guard at resolve time alone left two
+/// mutators that re-create the state after the fact). Not bound:
+/// `graph::upsert_node`'s `ON CONFLICT … SET node_type`, so a node retyped
+/// into a container and then re-ingested by a source that derives the same
+/// id (a calendar event) becomes an event again over its tasks with no call
+/// refused; `repair-parents` is what catches that, after the fact. `CONTAINER_TYPES` is the other half, and a test holds the
+/// two to be a partition of `graph::NODE_TYPES`, so a fourteenth type
+/// cannot become a parent by omission.
+pub const NEVER_A_PARENT: &[&str] = &[
+    "task",
+    "person",
+    // The counterpart of `person`, and closed for the same reason: an
+    // `agent` is something that acts, not something work sits under — it
+    // is here so a task can *wait on* it. It ships in every graph
+    // (migration `agent_node`), so `project: "mecha"` resolves on tier one
+    // without anybody having created a node (found on review).
+    "agent",
+    "place",
+    "event",
+    "event_series",
+    "document",
+    "artifact",
+];
+
+/// The node types a task may sit under. Not consulted by the guard —
+/// `NEVER_A_PARENT` is — but held against it: the two must partition the
+/// closed type set, so adding a type forces a decision here rather than a
+/// silent admission.
+pub const CONTAINER_TYPES: &[&str] = &["org", "project", "goal", "area", "topic"];
+
+/// Whether `node_id` has a row on the board — a `task_detail` row — which
+/// is what makes it a task regardless of what `nodes.node_type` says.
+pub fn is_task(conn: &Connection, node_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// How many tasks are filed under `node_id`.
+pub fn tasks_under(conn: &Connection, node_id: &str) -> Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_detail WHERE parent_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
+}
+
+/// Detach every task filed under `parent_id`, leaving on each task node a
+/// record of where it was (appended to `properties.detached_parents`: the
+/// parent's id, name and type, and why) — because a filing that was legal under an
+/// older rule is indistinguishable from a slip once it is gone, and the
+/// only other record of it would be somebody's terminal (found on review).
+/// Returns how many were detached.
+pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> Result<usize> {
+    // A parent row that is gone (a store attached with foreign keys off
+    // can carry a `parent_id` whose node is not there) must still lose
+    // its children, or the pass meant to remove the unfit parent would
+    // report success and leave it (found on review).
+    // A parent whose row is gone still gets a record — the id is in hand,
+    // the name reads `(missing)` and the type `missing`, as the survey
+    // reports the same case (found on review: the one detachment that left no record was
+    // the one hardest to reconstruct).
+    // A savepoint of its own, so the record and the detach land together
+    // or not at all: written outside one, the record would land first and
+    // a failed detach would leave `detached_parents` entries for filings
+    // still in place — a record worse than none (found on review). A
+    // savepoint rather than a transaction because `merge_nodes` calls this
+    // inside its own, and SQLite refuses a transaction within one. The
+    // record targets the rows still under the parent, so it goes first.
+    conn.execute_batch("SAVEPOINT detach_tasks_under")?;
+    let result = (|| -> Result<usize> {
+        let record = match crate::graph::get_node(conn, parent_id)? {
+            Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
+            None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
+        };
+        conn.execute(
+            &format!(
+                "UPDATE nodes SET properties = {}
+                 WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
+                APPEND_DETACHED
+            ),
+            params![parent_id, record],
+        )?;
+        conn.execute(
+            "UPDATE nodes SET properties = json_remove(properties, '$.detached_parents[0]')
+             WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)
+               AND json_array_length(properties, '$.detached_parents') > ?2",
+            params![parent_id, DETACHMENT_HISTORY as i64],
+        )?;
+        Ok(conn.execute(
+            "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
+            params![parent_id],
+        )?)
+    })();
+    match result {
+        Ok(n) => {
+            conn.execute_batch("RELEASE detach_tasks_under")?;
+            Ok(n)
+        }
+        Err(e) => {
+            // The rollback's own error must not replace the one that caused
+            // it (found on review).
+            let _ =
+                conn.execute_batch("ROLLBACK TO detach_tasks_under; RELEASE detach_tasks_under");
+            Err(e)
+        }
+    }
+}
+
+/// How many detachment records a task node keeps. `kg_task_update` puts
+/// re-filing in an agent's hands, and every move appends one record, so
+/// without a cap the list — printed whole by `task-project`, walked by
+/// every survey — grew with the agent's habits (found on review). The
+/// oldest goes first; twenty moves of history is more than a review reads.
+pub const DETACHMENT_HISTORY: usize = 20;
+
+/// The SQL that drops the oldest record once the list is over the cap —
+/// run after every append, so the length never exceeds it by more than
+/// the one just added.
+const TRIM_DETACHED: &str =
+    "UPDATE nodes SET properties = json_remove(properties, '$.detached_parents[0]') \
+     WHERE id = ?1 AND json_array_length(properties, '$.detached_parents') > ?2";
+
+/// The SQL that appends one record to a task node's `detached_parents`
+/// list — a list, not a slot, because a task detached twice (surveyed
+/// under a person, re-filed, then its new parent merged into one) would
+/// otherwise keep only the second record and lose the filing that
+/// motivated the survey (found on review). `?2` is the record.
+const APPEND_DETACHED: &str = "json_set(COALESCE(properties, '{}'), '$.detached_parents', \
+     json_insert(COALESCE(json_extract(COALESCE(properties, '{}'), '$.detached_parents'), '[]'), \
+     '$[#]', json(?2)))";
+
+/// Append to one task node the record of the parent it is losing —
+/// `detach_tasks_under`'s record for a single row, for a caller that
+/// removes the row itself (`retype_node`'s conversion).
+pub fn record_detachment(
+    conn: &Connection,
+    task_id: &str,
+    parent_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let record = match crate::graph::get_node(conn, parent_id)? {
+        Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
+        None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
+    };
+    conn.execute(
+        &format!(
+            "UPDATE nodes SET properties = {} WHERE id = ?1",
+            APPEND_DETACHED
+        ),
+        params![task_id, record],
+    )?;
+    conn.execute(TRIM_DETACHED, params![task_id, DETACHMENT_HISTORY as i64])?;
+    Ok(())
+}
+
+fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> String {
+    serde_json::json!({
+        "id": id, "name": name, "type": node_type,
+        "reason": reason, "at": crate::ids::now(),
+    })
+    .to_string()
+}
+
+/// Re-file a task under another project, or under none (`""`). The one
+/// correction path for a parent — and there has to be one, because the
+/// board hands the parent out as `project_id` for another repo's goal record
+/// to cite, so a parent chosen wrong at capture (a fuzzy match on `R01`
+/// that meant the supplement) used to be permanent for that task id, and
+/// dropping the task and re-creating it minted a second id the consumer may
+/// also have cited (found on review). Resolves exactly as `create_task`
+/// does, so the two cannot disagree about what a parent may be. Returns the
+/// parent's id, `None` when cleared.
+pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
+    require_task(conn, node_id)?;
+    let parent_id = resolve_project_for(conn, node_id, project)?;
+    if parent_id.is_none() {
+        mark_detachment_reviewed(conn, node_id)?;
+    }
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if parent_id.is_some() && parent_id == current {
+        // The direct interface's own gesture: re-filing under the parent
+        // the task already has is "this filing was meant".
+        vouch_for_parent(conn, node_id)?;
+    }
+    set_task_parent_id(conn, node_id, parent_id.as_deref())?;
+    Ok(parent_id)
+}
+
+/// The operator's vouch for the parent a task already has: written only
+/// when that parent is a plausible old filing — a place, an event, a
+/// series — with its node present and no task row, and naming that parent
+/// so it lapses with a move or a retype. `true` when written. Called by the
+/// direct interface alone (`task-project <task> <its parent's id>`); the
+/// MCP update never infers it, because an agent's read-modify-write echoes
+/// the row it read and a mark inferred from that retired survey rows no
+/// human had looked at (found on review).
+pub fn vouch_for_parent(conn: &Connection, node_id: &str) -> Result<bool> {
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    let plausible_now = match current.as_deref() {
+        Some(cur) => {
+            crate::graph::get_node(conn, cur)?
+                .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
+                && !is_task(conn, cur)?
+        }
+        None => false,
+    };
+    if !plausible_now {
+        // A declined vouch takes any mark with it: one written while the
+        // parent qualified is stale once it does not — the parent's row
+        // gone, its type rewritten under it — and a stale mark left in
+        // place answered `vouch_stands` for a row the survey listed (found
+        // on review).
+        conn.execute(
+            "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed')
+             WHERE id = ?1 AND json_extract(properties, '$.parent_reviewed') IS NOT NULL",
+            params![node_id],
+        )?;
+        return Ok(false);
+    }
+    let cur = current.expect("checked above");
+    conn.execute(
+        "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', ?2) WHERE id = ?1",
+        params![node_id, cur],
+    )?;
+    Ok(true)
+}
+
+/// Whether the task's current parent carries the operator's vouch *and
+/// the survey honours it*: the `parent_reviewed` mark naming that parent,
+/// the parent's node present, its type a plausible old filing, and no task
+/// row under it — the survey's exclusion predicate, whole. What a caller
+/// reports after a vouch attempt, since the writer refuses one for a slip
+/// silently and a report that says "filed under Wren" reads as if it took
+/// (found on review). The mark alone was not enough: a mark written while
+/// the parent qualified outlives the parent's row, and a second vouch
+/// attempt then read the stale mark and said "off the survey" about a row
+/// the survey listed (found on review).
+pub fn vouch_stands(conn: &Connection, node_id: &str) -> Result<bool> {
+    let plausible = PLAUSIBLE_OLD_PARENTS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM task_detail td
+             JOIN nodes n ON n.id = td.node_id
+             JOIN nodes p ON p.id = td.parent_id
+             WHERE td.node_id = ?1
+               AND json_extract(n.properties, '$.parent_reviewed') = td.parent_id
+               AND p.node_type IN ({plausible})
+               AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)"
+        ),
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Clearing a parent that is already clear is the operator — or the agent,
+/// over `kg_task_update` — saying "no project is right" about a
+/// detachment: the last record is marked reviewed, so the task leaves the
+/// pending list while the record stays. A no-op on a task with a parent
+/// or with no record. Public because the MCP update writes the parent
+/// through `set_task_parent_id` after its pre-flight and needs the same
+/// mark, or the pile was drainable from the terminal alone (found on
+/// review).
+pub fn mark_detachment_reviewed(conn: &Connection, node_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+         WHERE id = ?1
+           AND json_extract(properties, '$.detached_parents') IS NOT NULL
+           AND (SELECT parent_id FROM task_detail WHERE node_id = ?1) IS NULL",
+        params![node_id],
+    )?;
+    Ok(())
+}
+
+/// A task whose parent is a node type that is never a parent — written
+/// before `NEVER_A_PARENT` guarded the write, or by a writer this crate
+/// does not own.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnfitParent {
+    pub task_id: String,
+    pub task_name: String,
+    pub parent_id: String,
+    pub parent_name: String,
+    pub parent_type: String,
+    /// A filing that was legal before the guard and may have been meant —
+    /// under a recurring seminar, a building — as opposed to a slip (a
+    /// person, the agent, another task). Both are detached on `apply`;
+    /// this is so the survey tells them apart before that.
+    pub plausible: bool,
+    /// Whether `--apply` detached this row. `false` on a survey, and on the
+    /// one row an apply can miss — re-filed between the survey's read and
+    /// the write (`AND parent_id = ?2`) — so the printed list and the count
+    /// cannot disagree without saying which row (found on review).
+    pub detached: bool,
+    /// Whether an apply *with the flags this call was given* would detach
+    /// this row: a slip always, a plausible filing only with
+    /// `include_plausible`. Carried on the survey too, so the JSON a script
+    /// reads off a terminal reflects the flag it passed — the prose branch
+    /// alone did, and JSON is the default off a terminal (found on review).
+    pub would_detach: bool,
+}
+
+/// The parent type the survey reports for a `parent_id` whose node row is
+/// gone — a store attached with foreign keys off can carry one. The board
+/// hands it out as neither `project` nor `project_id` (both come from the
+/// join to `nodes`), so nothing cites it; the survey reads the raw column
+/// and is where it is seen (found on review). Not a node type; a word the
+/// survey owns.
+pub const MISSING_PARENT: &str = "missing";
+
+/// The types of `NEVER_A_PARENT` that were reachable parents before the
+/// guard and read as deliberate filings rather than slips: a building, a
+/// recurring seminar, one specific meeting ("bring the printed slides",
+/// filed under Thursday's review). A person, the agent, another task, a
+/// document or an artifact read as slips — nobody files work *under* a
+/// PDF (found on review: `event` had been left out by omission).
+const PLAUSIBLE_OLD_PARENTS: &[&str] = &["place", "event", "event_series"];
+
+/// A task that was detached — by this survey's `--apply`, a merge onto a
+/// non-container, or a conversion — and has not been re-filed since: it
+/// carries a `detached_parents` record and no parent. Reported so the
+/// filings the survey exists to let a human review stay reviewable as a
+/// set after a merge has already detached them silently (found on review:
+/// the per-row record was queryable by nobody).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DetachedPending {
+    pub task_id: String,
+    pub task_name: String,
+    /// The most recent record: the parent it was last under, and why.
+    pub parent_id: String,
+    pub parent_name: String,
+    pub reason: String,
+    pub at: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ParentRepairReport {
+    /// The flags this report was computed under, echoed so a survey and
+    /// the apply it previews are the same document — both of them, since a
+    /// survey and an apply whose every row was re-filed between the read
+    /// and the write were byte-for-byte the same JSON (found on review).
+    pub applied: bool,
+    pub include_plausible: bool,
+    pub found: Vec<UnfitParent>,
+    /// Rows actually detached. Zero on a dry run, however many were found.
+    pub detached: usize,
+    /// Tasks detached earlier — by an apply or a merge — and not re-filed
+    /// since: nothing to apply, something to review. A conversion's
+    /// detachment is not here: the converted node has no task row and is
+    /// not waiting to be re-filed; `task-project <node>` reads its record
+    /// (found on review — the doc had said "or a conversion").
+    pub pending: Vec<DetachedPending>,
+}
+
+/// The survey's *slips* as one count, for `stats::health` — which
+/// refreshes on every TUI stats pane and wants the alert, not the rows,
+/// and not the JSON walk `detached_pending` does over every task node
+/// (found on review). Slips only: a filing the survey marks plausible
+/// (a place, an event, a series) is one `--apply` keeps by design, so
+/// counting it here made an alert the command it names could never clear
+/// (found on review — the standing pile, one surface over). The survey
+/// still lists the plausible ones.
+pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
+    let placeholders = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plausible = PLAUSIBLE_OLD_PARENTS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM task_detail td
+             LEFT JOIN nodes p ON p.id = td.parent_id
+             WHERE td.parent_id IS NOT NULL
+               AND (p.id IS NULL
+                    OR p.node_type IN ({placeholders})
+                    OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
+               AND CASE WHEN EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)
+                        THEN 'task' ELSE COALESCE(p.node_type, '') END NOT IN ({plausible})"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Open tasks with a detachment record and no parent, whose last record
+/// has not been marked reviewed. An inner join on the task's own node, on
+/// purpose: the record lives on that node, so a task row whose node is
+/// gone has no record to surface here — the survey and the count keep
+/// that orphan visible while it still has a parent, and this list is
+/// about what comes after (found on review: a LEFT JOIN read as if it
+/// handled the case) — a finished task is not waiting to be
+/// re-filed, and forty pre-guard filings under people would otherwise be
+/// forty nightly rows drained one terminal command at a time (found on
+/// review) — `task-project <task> ""` on a task already under
+/// nothing is that mark, the operator's "no project is right", and without
+/// it this list was a standing pile the nightly printed forever (found on
+/// review; the shape `invalidate-phantoms` was added to end).
+pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
+    let mut stmt = conn.prepare(
+        "SELECT td.node_id, n.name,
+                json_extract(n.properties, '$.detached_parents[#-1].id'),
+                json_extract(n.properties, '$.detached_parents[#-1].name'),
+                json_extract(n.properties, '$.detached_parents[#-1].reason'),
+                json_extract(n.properties, '$.detached_parents[#-1].at')
+         FROM task_detail td
+         JOIN nodes n ON n.id = td.node_id
+         WHERE td.parent_id IS NULL
+           AND td.status NOT IN ('done', 'dropped')
+           AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
+           AND COALESCE(json_extract(n.properties, '$.detached_parents[#-1].reviewed'), 0) = 0
+         ORDER BY td.node_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DetachedPending {
+                task_id: r.get(0)?,
+                task_name: r.get(1)?,
+                parent_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                reason: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Find (and optionally detach) tasks filed under a node that is never a
+/// parent. `NEVER_A_PARENT` runs on every new write; this is the same rule
+/// over the rows already there, because the board hands every row's parent
+/// out as `project_id` and a consumer records it — so a task captured under
+/// a person's name before the guard existed would go on minting exactly the
+/// pointer the guard exists to prevent (found on review). **Reporting is
+/// the default and `apply` is opt-in**, `repair_unparseable_dates`'s shape:
+/// detaching loses where a task was filed, and a pass that can do that
+/// should not do it to somebody who ran it expecting a survey. Detached,
+/// not re-filed: nothing here can know which container was meant.
+pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepairReport> {
+    repair_unfit_parents_with(conn, apply, false)
+}
+
+/// The survey, with `--apply` acting on what the survey tells apart: a
+/// plausible old filing is listed and **kept** unless `include_plausible`,
+/// so the classification the survey computes is the one thing an operator
+/// can act on rather than a prompt with no answer (found on review).
+pub fn repair_unfit_parents_with(
+    conn: &Connection,
+    apply: bool,
+    include_plausible: bool,
+) -> Result<ParentRepairReport> {
+    let placeholders = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plausible = PLAUSIBLE_OLD_PARENTS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The type lists are private `const`s of string literals interpolated
+    // because SQLite has no array parameter — never caller input.
+    let sql = format!(
+        // LEFT JOIN, so a parent whose node row is gone is found rather than
+        // dropped — `detach_tasks_under` defends the same case, and a survey
+        // blind to it would print "nothing to fix" over a board still
+        // handing the orphan out as `project_id`.
+        "SELECT td.node_id, n.name, td.parent_id, p.name,
+                -- the row is the fact: a parent that is itself on the board is
+                -- reported as the task it is, whatever its declared type
+                CASE WHEN EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)
+                     THEN 'task' ELSE p.node_type END
+         FROM task_detail td
+         LEFT JOIN nodes n ON n.id = td.node_id
+         LEFT JOIN nodes p ON p.id = td.parent_id
+         WHERE td.parent_id IS NOT NULL
+           AND (p.id IS NULL
+                OR p.node_type IN ({placeholders})
+                OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
+           -- a plausible filing the operator has vouched for is off the list;
+           -- a slip stays whoever vouches for it
+           -- COALESCE, because a parent whose row is gone has a NULL type and
+           -- a NULL conjunct drops the row from the survey while the count
+           -- still holds it — the standing pile again (found on review)
+           AND NOT (COALESCE(json_extract(n.properties, '$.parent_reviewed') = td.parent_id, 0)
+                    AND COALESCE(p.node_type, '') IN ({plausible})
+                    AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
+         ORDER BY td.node_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let found: Vec<UnfitParent> = stmt
+        .query_map([], |r| {
+            let parent_type: String = r
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| MISSING_PARENT.to_string());
+            Ok(UnfitParent {
+                task_id: r.get(0)?,
+                task_name: r
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "(missing)".to_string()),
+                parent_id: r.get(2)?,
+                parent_name: r
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "(missing)".to_string()),
+                plausible: PLAUSIBLE_OLD_PARENTS.contains(&parent_type.as_str()),
+                parent_type,
+                detached: false,
+                would_detach: false,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut report = ParentRepairReport {
+        applied: apply,
+        include_plausible,
+        found,
+        detached: 0,
+        pending: Vec::new(),
+    };
+    for u in &mut report.found {
+        u.would_detach = !u.plausible || include_plausible;
+    }
+    if apply {
+        // One transaction for the pass, and per row the detach first and
+        // the record only when it landed: a row re-filed between the survey
+        // and the apply (`AND parent_id = ?2` misses) must not gain a record
+        // of a detachment that did not happen, and a pass that fails half
+        // way must not leave some rows detached and others not (found on
+        // review). The record of where each task was goes on the task node
+        // — the store remembers, not the terminal.
+        let tx = conn.unchecked_transaction()?;
+        for u in &mut report.found {
+            if u.plausible && !include_plausible {
+                continue;
+            }
+            let detached = tx.execute(
+                "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1 AND parent_id = ?2",
+                params![u.task_id, u.parent_id],
+            )?;
+            if detached == 1 {
+                tx.execute(
+                    "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed') WHERE id = ?1",
+                    params![u.task_id],
+                )?;
+                let record = detached_record(
+                    &u.parent_id,
+                    &u.parent_name,
+                    &u.parent_type,
+                    "repair_unfit_parents",
+                );
+                tx.execute(
+                    &format!(
+                        "UPDATE nodes SET properties = {} WHERE id = ?1",
+                        APPEND_DETACHED
+                    ),
+                    params![u.task_id, record],
+                )?;
+                tx.execute(TRIM_DETACHED, params![u.task_id, DETACHMENT_HISTORY as i64])?;
+            }
+            u.detached = detached == 1;
+            report.detached += detached;
+        }
+        tx.commit()?;
+    }
+    // Read after the apply, so what this pass just detached is on the
+    // list too.
+    report.pending = detached_pending(conn)?;
+    Ok(report)
+}
+
+/// The project a task is filed under, from a name, alias or node id.
+///
+/// The id first, then the name (see the body for why the order is the
+/// reverse of `resolve_about`'s). The board hands out `project_id` beside the name, and a pointer a server
+/// hands out must be one it accepts back — a consumer filing a task under
+/// the project it just read would otherwise be refused for citing the id it
+/// was told to cite. **Ambiguity is surfaced, never resolved by sort
+/// order**, `validate_about_target`'s rule: `resolve_entity` takes the
+/// first of several matches by access count, so two projects sharing a
+/// name meant whichever was busier, silently — and since the echo now
+/// mints `project_id` from that guess and another repo's goal record cites
+/// it, the guess became a durable pointer (found on review). Now that the
+/// id path exists, "name the id instead" is advice the caller can follow.
+pub fn resolve_parent(conn: &Connection, what: &str) -> Result<ParentCandidate> {
+    // The id first, exactly: the round-trip this feature sells — a pointer
+    // the server hands out is one it accepts back — holds only if an
+    // argument that *is* a node id resolves to that node, and this graph
+    // does contain nodes whose name is another node's id
+    // (`repair_node_id_payloads` exists for them). Names-first would file
+    // under the placeholder on an exact canonical match with no ambiguity
+    // to tell the two apart (found on review). A name that collides with
+    // an existing id loses to the id, by this rule.
+    let node = if let Some(node) = crate::graph::get_node(conn, what)? {
+        ParentCandidate::from(node)
+    } else {
+        // Only nodes that could be a parent are candidates, and the query is
+        // the parent's own — not `resolve_entity_all`, whose fuzzy tier
+        // stops at five rows: filtering its window to containers counted
+        // containers *in the window*, so a second project matching the
+        // name could sit outside it and the parent was picked by sort order
+        // after all, or four task titles could fill it and hide the one
+        // container (found on review). Exact name or alias first, the
+        // substring only when neither matches; no limit on either, so
+        // `len() > 1` is a genuine ambiguity between two containers.
+        let mut matches = parent_candidates(conn, what, false)?;
+        if matches.is_empty() {
+            matches = parent_candidates(conn, what, true)?;
+        }
+        match matches.len() {
+            1 => matches.into_iter().next().expect("one match"),
+            0 => {
+                return Err(Error::Other(format!(
+                    "no container node matches project '{what}' (a node of a type that is never a \
+                     parent — {} — or a task by row, is not one)",
+                    NEVER_A_PARENT.join(", ")
+                )))
+            }
+            n => {
+                // The count is exact; the enumeration is advice, and an
+                // unbounded one is kilobytes of tool error on the refusal a
+                // consumer most needs to read (found on review).
+                const SHOWN: usize = 10;
+                let mut names: Vec<String> = matches
+                    .iter()
+                    .take(SHOWN)
+                    .map(|n| format!("{} ({})", n.name, n.id))
+                    .collect();
+                if n > SHOWN {
+                    names.push(format!(
+                        "…and {} more — narrow the name or name the id",
+                        n - SHOWN
+                    ));
+                }
+                return Err(Error::Other(format!(
+                    "'{what}' matches {n} nodes — name the id instead, since a task's parent is \
+                     durable and echoed as `project_id`: {}",
+                    names.join(", ")
+                )));
+            }
+        }
+    };
+    if NEVER_A_PARENT.contains(&node.node_type.as_str()) {
+        return Err(Error::Other(format!(
+            "'{}' is of type {}, not a container — a task's parent may be any node type but \
+             these: {}; name a project, goal, area, topic or org, by name or node id",
+            node.name,
+            node.node_type,
+            NEVER_A_PARENT.join(", ")
+        )));
+    }
+    // The row is the fact: a node on the board is a task whatever its type
+    // says (a store from before the guards, or `upsert_node`'s type
+    // rewrite), and a task is never a parent (found on review).
+    if is_task(conn, &node.id)? {
+        return Err(Error::Other(format!(
+            "'{}' is a task on the board, whatever its type says — not a parent",
+            node.name
+        )));
+    }
+    Ok(node)
+}
+
+/// What a parent lookup needs of a node — the three columns, without the
+/// alias load `get_node` pays: a substring that matches a thousand
+/// containers must not run two thousand statements to print ten names and
+/// a count (found on review).
+#[derive(Debug, Clone)]
+pub struct ParentCandidate {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+}
+
+impl From<crate::graph::Node> for ParentCandidate {
+    fn from(n: crate::graph::Node) -> Self {
+        ParentCandidate {
+            id: n.id,
+            name: n.name,
+            node_type: n.node_type,
+        }
+    }
+}
+
+/// Container nodes a parent name reaches: by exact canonical name or alias,
+/// or — `fuzzy` — by substring of the canonical name. Every row that could
+/// be a parent and no other (the type not in `NEVER_A_PARENT`, no task
+/// row), and **no limit**, so a count over the result is a count over the
+/// matching set.
+fn parent_candidates(conn: &Connection, what: &str, fuzzy: bool) -> Result<Vec<ParentCandidate>> {
+    let canonical = crate::ids::canonicalize(what);
+    if canonical.is_empty() {
+        return Ok(Vec::new());
+    }
+    let never = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The substring tier escapes the caller's `%` and `_`, as
+    // `suggest_entities` does: left live, one unintended container reachable
+    // only through a wildcard would be filed under with nothing refused
+    // (found on review). The exact tier reaches a node by canonical name,
+    // alias, or identifier — the third being how a project keyed by a path
+    // or a URL is named at all (found on review).
+    let (predicate, needle) = if fuzzy {
+        let escaped = canonical
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        (
+            "n.canonical_name LIKE ?1 ESCAPE '\\'",
+            format!("%{escaped}%"),
+        )
+    } else {
+        (
+            "(n.canonical_name = ?1 \
+              OR n.id IN (SELECT node_id FROM node_alias WHERE alias = ?1) \
+              OR n.id IN (SELECT node_id FROM node_identifier WHERE value = ?1))",
+            canonical,
+        )
+    };
+    // The type list is a private `const` of string literals interpolated
+    // because SQLite has no array parameter — never caller input.
+    let sql = format!(
+        "SELECT n.id, n.name, n.node_type FROM nodes n
+         WHERE {predicate}
+           AND n.node_type NOT IN ({never})
+           AND n.id NOT IN (SELECT node_id FROM task_detail)
+         ORDER BY n.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let out = stmt
+        .query_map(params![needle], |r| {
+            Ok(ParentCandidate {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                node_type: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(out)
+}
+
+/// `resolve_project_arg`, with one exception a task's own parent earns:
+/// the parent the task already has — named by its id, never by name, since
+/// a name would skip the ambiguity refusal every other path gives it —
+/// resolves to itself even when the rule would refuse it as a parent now (a place,
+/// a series, from before the guard), because re-filing under the parent
+/// you already have is the "this filing was meant" gesture and nothing
+/// else could say it (found on review — the resolver refused the vouch).
+/// A slip stays a slip: the mark it earns is honoured by the survey only
+/// for a plausible type.
+pub fn resolve_project_for(
+    conn: &Connection,
+    node_id: &str,
+    project: &str,
+) -> Result<Option<String>> {
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if let Some(cur) = current.as_deref() {
+        // By id only: a name would skip the ambiguity refusal every other
+        // path gives it (found on review), and the survey prints the id
+        // beside the name for exactly this call.
+        if project.trim() == cur {
+            return Ok(Some(cur.to_string()));
+        }
+    }
+    resolve_project_arg(conn, project)
+}
+
+/// The parent a `project` argument resolves to, or `None` for `""` —
+/// resolution alone, so a caller that writes several fields can refuse
+/// before its first write (`kg_task_update`'s rule: a refused call changed
+/// nothing) and write the id afterwards with [`set_task_parent_id`].
+pub fn resolve_project_arg(conn: &Connection, project: &str) -> Result<Option<String>> {
+    match project.trim() {
+        "" => Ok(None),
+        p => Ok(Some(resolve_parent(conn, p)?.id)),
+    }
+}
+
+/// Write an already-resolved parent id, or clear it. The write half of
+/// [`set_task_project`]; takes an id `resolve_project_arg` produced, never
+/// a name — and re-checks it anyway: a writer weaker than its guard is the
+/// shape `validate_about_target` was written to fix, and the next caller
+/// is the one this is for (found on review). An id that is no node, or a
+/// node of a type that is never a parent, is refused before the write.
+pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&str>) -> Result<()> {
+    require_task(conn, node_id)?;
+    // The parent the task already has: nothing to write, and the guard
+    // below does not apply — this is the vouch (see `resolve_project_for`).
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if let (Some(cur), Some(new)) = (current.as_deref(), parent_id) {
+        if cur == new {
+            // The parent the task already has: nothing to write, and no
+            // mark either — an idempotent re-send over MCP echoes the row
+            // it read, and a mark inferred from that retired a survey row
+            // no human had looked at (found on review). The vouch is an
+            // explicit gesture, `vouch_for_parent`, made by `task-project`.
+            return Ok(());
+        }
+    }
+    if let Some(pid) = parent_id {
+        let Some(parent) = crate::graph::get_node(conn, pid)? else {
+            return Err(Error::Other(format!(
+                "no node with id {pid} to file a task under"
+            )));
+        };
+        if NEVER_A_PARENT.contains(&parent.node_type.as_str()) || is_task(conn, pid)? {
+            return Err(Error::Other(format!(
+                "'{}' is of type {}, not a container, or is itself a task on the board — not a \
+                 parent: {}",
+                parent.name,
+                parent.node_type,
+                NEVER_A_PARENT.join(", ")
+            )));
+        }
+    }
+    // A deliberate re-file or clear is the one path that moved a parent
+    // without a record, and the likeliest of the four (found on review):
+    // the parent being left is recorded like a detachment, and — since the
+    // operator or agent chose it — marked reviewed at once, so it is a
+    // record and not a pending finding.
+    // One savepoint for the move and its record, the discipline the other
+    // writers keep: moved first with the record failing after, the parent
+    // a consumer cited would be gone from the store while the call reported
+    // the re-file had not happened (found on review).
+    conn.execute_batch("SAVEPOINT set_task_parent_id")?;
+    let result = (|| -> Result<()> {
+        let was: Option<String> = conn.query_row(
+            "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        let moving = matches!(&was, Some(old) if Some(old.as_str()) != parent_id);
+        // Re-filing a task under the parent it already has is the operator
+        // saying "this filing was meant" — the acknowledgement a plausible
+        // old filing had no other way to receive, so the survey printed it
+        // every night (found on review). The mark is dropped by any move,
+        // and the survey honours it only for a plausible type: a filing
+        // under a person is a slip whoever vouches for it.
+        if moving {
+            conn.execute(
+                "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed') WHERE id = ?1",
+                params![node_id],
+            )?;
+            let old = was.expect("moving implies a former parent");
+            record_detachment(conn, node_id, &old, "re-filed")?;
+            conn.execute(
+                "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+                 WHERE id = ?1",
+                params![node_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+            params![node_id, parent_id],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE set_task_parent_id")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO set_task_parent_id; RELEASE set_task_parent_id");
+            Err(e)
+        }
+    }
 }
 
 /// Edit scheduling fields on an existing task (TUI `e`). `Some("")` clears a
@@ -649,7 +1584,11 @@ pub fn set_task_session(conn: &Connection, node_id: &str, session: &str) -> Resu
         Some(n) => n,
         None => return Err(Error::Other(format!("{node_id} is not a node"))),
     };
-    if node.node_type != "task" {
+    // The row is the fact, as every other mutator reads it: a node with a
+    // task row is a task whatever its type says, and refusing on the type
+    // here was the one writer left that could refuse after a status had
+    // landed (found on review).
+    if !is_task(conn, node_id)? {
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     let session = session.trim();
@@ -722,7 +1661,10 @@ pub fn set_task_captured_from(
         Some(n) => n,
         None => return Err(Error::Other(format!("{node_id} is not a node"))),
     };
-    if node.node_type != "task" {
+    // The row is the fact, as every other mutator reads it: refusing on
+    // the type here was the last writer that could refuse after a status
+    // had landed (found on review).
+    if !is_task(conn, node_id)? {
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     match captured_from {
@@ -742,7 +1684,12 @@ pub fn set_task_captured_from(
 /// Bounce a malformed pointer rather than storing it — `parse_due`'s rule,
 /// and it matters more here: a stored pointer nothing can follow looks
 /// exactly like provenance right up until somebody clicks it.
-fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value> {
+/// Public so a caller that writes several things can refuse *before* its
+/// first write: `kg_task_create` used to insert the task and then refuse
+/// the pointer, leaving a task the error said was never created — and a
+/// consumer that retries on "nothing was created" then stages a duplicate
+/// (found on review).
+pub fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value> {
     let object = value
         .as_object()
         .ok_or_else(|| Error::Other("captured_from must be an object".into()))?;
@@ -808,6 +1755,44 @@ fn validate_captured_from(value: &serde_json::Value) -> Result<serde_json::Value
 /// exactly the thing a harness should not be carrying around.
 pub const OWNER: &str = "@owner";
 
+/// Who a `waiting_on` names, or `None` for `""`: the resolution half of
+/// [`set_task_waiting_on`], public so `kg_task_update` can refuse before
+/// its first write — resolved after the status landed, a typo returned an
+/// error on a call that had already closed the task and retired the live
+/// claim it was trying to set (found on review).
+pub fn resolve_waiting_on(conn: &Connection, who: &str) -> Result<Option<crate::graph::Node>> {
+    let who = who.trim();
+    Ok(if who.is_empty() {
+        None
+    } else if who == OWNER {
+        // **The one name a caller cannot be expected to know.** A harness
+        // handing a task back says "this is yours now", and making it look up
+        // the owner's actual name first would mean shipping that name into
+        // config on every machine — and getting it wrong the day it changes.
+        // The graph already records who it is about (`owner_node`, an explicit
+        // mark rather than a heuristic), so this asks it.
+        match crate::graph::owner_node(conn)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(
+                    "this graph has no owner set, so `@owner` names nobody — \
+                     `mecha-graph owner <node>` marks one"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        match crate::graph::resolve_entity(conn, who)? {
+            Some(n) => Some(n),
+            None => {
+                return Err(Error::Other(format!(
+                    "no node matches '{who}' — waiting_on must name someone the graph already knows"
+                )))
+            }
+        }
+    })
+}
+
 /// Point a task's `waiting_on` at a node, or clear it with `""`.
 ///
 /// `@owner` ([`OWNER`]) resolves to whoever the graph is about.
@@ -837,36 +1822,7 @@ pub fn set_task_waiting_on(conn: &Connection, node_id: &str, who: &str) -> Resul
     // "nobody owes me this" and the error message says nothing about what was
     // lost. Found by the test written for the typo protection, which is a
     // fair description of how that protection was incomplete.
-    let who = who.trim();
-    let target = if who.is_empty() {
-        None
-    } else if who == OWNER {
-        // **The one name a caller cannot be expected to know.** A harness
-        // handing a task back says "this is yours now", and making it look up
-        // the owner's actual name first would mean shipping that name into
-        // config on every machine — and getting it wrong the day it changes.
-        // The graph already records who it is about (`owner_node`, an explicit
-        // mark rather than a heuristic), so this asks it.
-        match crate::graph::owner_node(conn)? {
-            Some(n) => Some(n),
-            None => {
-                return Err(Error::Other(
-                    "this graph has no owner set, so `@owner` names nobody — \
-                     `mecha-graph owner <node>` marks one"
-                        .into(),
-                ))
-            }
-        }
-    } else {
-        match crate::graph::resolve_entity(conn, who)? {
-            Some(n) => Some(n),
-            None => {
-                return Err(Error::Other(format!(
-                    "no node matches '{who}' — waiting_on must name someone the graph already knows"
-                )))
-            }
-        }
-    };
+    let target = resolve_waiting_on(conn, who)?;
 
     // Now that the answer is known, retire the old belief. Clearing and
     // re-pointing are the same operation from here, so neither can leave two
@@ -1014,8 +1970,13 @@ pub fn resolve_about(conn: &Connection, what: &str) -> Result<Option<crate::grap
     }
     // A node id resolves too, and it has to: the ambiguity refusal below
     // tells the caller to name an id instead, and advice a function cannot
-    // honour is worse than no advice. Names first, because a name is what a
-    // caller normally has and an id shaped like a name is not a thing here.
+    // honour is worse than no advice. Names first here — where
+    // `resolve_parent` tries the id first, because a parent's id is what
+    // the board hands out and must come back to the same node even when
+    // another node's *name* is that id (`repair_node_id_payloads` exists
+    // for those). An `about` is normally given by name, so this order
+    // stands; the two differ on that one string, and this comment says so
+    // rather than claiming the collision does not happen.
     if let Some(node) = crate::graph::resolve_entity(conn, what)? {
         return Ok(Some(node));
     }
@@ -1419,6 +2380,20 @@ fn require_task(conn: &Connection, node_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one check `set_task_status` makes before it writes, on its own so
+/// the MCP update's pre-flight can make it before the first write — a
+/// status the writer would refuse came back without the "nothing was
+/// changed" clause every other refusal carries, though nothing had been
+/// written (found on review).
+pub fn validate_status(status: &str) -> Result<()> {
+    if !TASK_STATUSES.contains(&status) {
+        return Err(Error::Other(format!(
+            "unknown task status '{status}' (one of {})",
+            TASK_STATUSES.join("|")
+        )));
+    }
+    Ok(())
+}
 /// Move a task through its lifecycle. Sets/clears `completed_at` so 'done'
 /// carries a timestamp and reopening clears it.
 ///
@@ -1438,12 +2413,7 @@ fn require_task(conn: &Connection, node_id: &str) -> Result<()> {
 /// task is a new question with a new answer, and guessing the old one is how
 /// a person silently re-acquires an obligation nobody gave them.
 pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result<()> {
-    if !TASK_STATUSES.contains(&status) {
-        return Err(Error::Other(format!(
-            "unknown task status '{status}' (one of {})",
-            TASK_STATUSES.join("|")
-        )));
-    }
+    validate_status(status)?;
     let n = conn.execute(
         "UPDATE task_detail SET status = ?2,
                 completed_at = CASE WHEN ?2 IN ('done','dropped')
@@ -1717,6 +2687,972 @@ mod tests {
         assert_eq!(review.waiting_on[0].1, "Nadia");
     }
 
+    /// A consumer that records which project a task served cites
+    /// `project:<node id>` and refuses whitespace in an id, so the name
+    /// alone could never be cited; the id rides beside it, and is absent
+    /// exactly when the name is.
+    #[test]
+    fn the_project_id_rides_beside_the_name_and_is_absent_with_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        let under =
+            create_task(&conn, "Ship the pilot", None, Some("Tide pool study"), None).unwrap();
+        let under = get_task(&conn, &under).unwrap().unwrap();
+        assert_eq!(under.project.as_deref(), Some("Tide pool study"));
+        assert_eq!(under.project_id.as_deref(), Some("proj-tide"));
+
+        let alone = create_task(&conn, "No project", None, None, None).unwrap();
+        let alone = get_task(&conn, &alone).unwrap().unwrap();
+        assert_eq!(alone.project, None);
+        assert_eq!(alone.project_id, None);
+
+        // The id the board hands out is accepted back on create — a
+        // consumer citing `project_id` files under the same project.
+        let by_id = create_task(&conn, "Write it up", None, Some("proj-tide"), None).unwrap();
+        let by_id = get_task(&conn, &by_id).unwrap().unwrap();
+        assert_eq!(by_id.project_id.as_deref(), Some("proj-tide"));
+        assert_eq!(by_id.project.as_deref(), Some("Tide pool study"));
+        assert!(
+            create_task(&conn, "Nowhere", None, Some("proj-nope"), None).is_err(),
+            "an unknown id is still an error, not an implicit node"
+        );
+        // A task is not a parent, by id or by name: the row's own id sits
+        // beside its `project_id`, and filing under the wrong one must be
+        // refused rather than rendered as a project.
+        let e = create_task(&conn, "Under a task", None, Some(&by_id.node_id), None)
+            .expect_err("a task id as a parent is refused");
+        assert!(
+            e.to_string().contains("is of type task, not a container"),
+            "{e}"
+        );
+        assert!(
+            e.to_string()
+                .contains("task, person, agent, place, event, event_series, document, artifact"),
+            "{e}"
+        );
+        // By name, the task is filtered out before the count, so the
+        // refusal reads as no container of that name.
+        let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
+            .expect_err("a task name as a parent is refused");
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+        // Nor is a person, an event, a document or an artifact — the same
+        // mis-citation from another type.
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let e = create_task(&conn, "Send the figures", None, Some("Wren"), None)
+            .expect_err("a person as a parent is refused");
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+        let e = create_task(&conn, "Send the figures", None, Some("p-wren"), None)
+            .expect_err("a person's id as a parent is refused");
+        assert!(
+            e.to_string().contains("is of type person, not a container"),
+            "{e}"
+        );
+        // The agent node every graph ships with is the obvious slip from
+        // the consumer that writes `waiting_on: "mecha"` on the same tool
+        // family — and not a container either. Seeded by migration, so no
+        // upsert here.
+        let e = create_task(&conn, "Draft the aims", None, Some("mecha"), None)
+            .expect_err("the agent as a parent is refused");
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+        let e = create_task(&conn, "Draft the aims", None, Some("agent-mecha"), None)
+            .expect_err("the agent's id as a parent is refused");
+        assert!(
+            e.to_string().contains("is of type agent, not a container"),
+            "{e}"
+        );
+        // A goal or an area is a container, and stays one.
+        upsert_node(&conn, &Node::new("goal-tenure", "goal", "Tenure")).unwrap();
+        let under_goal = create_task(&conn, "Publish", None, Some("goal-tenure"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &under_goal)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("goal-tenure")
+        );
+    }
+
+    /// Ambiguity is surfaced, never resolved by sort order: two projects
+    /// sharing a name are refused with both ids, and either id is accepted.
+    #[test]
+    fn an_ambiguous_project_name_is_refused_and_the_id_names_one() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-r01", "project", "R01 renewal")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-r01s", "project", "R01 renewal supplement"),
+        )
+        .unwrap();
+        let e = create_task(&conn, "Draft the aims", None, Some("renewal"), None)
+            .expect_err("a name matching two projects is refused");
+        let msg = e.to_string();
+        assert!(msg.contains("matches 2 nodes"), "{msg}");
+        assert!(
+            msg.contains("proj-r01") && msg.contains("proj-r01s"),
+            "{msg}"
+        );
+        let ok = create_task(&conn, "Draft the aims", None, Some("proj-r01s"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &ok).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-r01s")
+        );
+        // An exact name still resolves alone even though it is a prefix of
+        // the other: tier one is the exact canonical match.
+        let exact = create_task(&conn, "Budget", None, Some("R01 renewal"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &exact)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("proj-r01")
+        );
+    }
+
+    /// A parent can be corrected: re-filed by name or id under the same
+    /// rule as capture, or cleared with `""`.
+    #[test]
+    fn a_task_can_be_refiled_under_another_project_or_none() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-r01", "project", "R01 renewal")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-r01s", "project", "R01 renewal supplement"),
+        )
+        .unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let t = create_task(&conn, "Draft the aims", None, Some("R01 renewal"), None).unwrap();
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(
+            set_task_project(&conn, &t, "proj-r01s").unwrap().as_deref(),
+            Some("proj-r01s")
+        );
+        assert_eq!(pid(&t).as_deref(), Some("proj-r01s"));
+        // The parent left is recorded, reviewed, so the history answers
+        // "which id did a consumer cite before?" without a pending finding.
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-r01");
+        assert_eq!(node.properties["detached_parents"][0]["reason"], "re-filed");
+        assert_eq!(node.properties["detached_parents"][0]["reviewed"], true);
+        assert!(detached_pending(&conn).unwrap().is_empty());
+        assert_eq!(set_task_project(&conn, &t, "").unwrap(), None);
+        assert_eq!(pid(&t), None);
+        // The same refusals as capture: a person, an ambiguous name, an
+        // unknown one — and the row is untouched by a refused call.
+        assert_eq!(
+            set_task_project(&conn, &t, "R01 renewal")
+                .unwrap()
+                .as_deref(),
+            Some("proj-r01")
+        );
+        assert!(set_task_project(&conn, &t, "Wren").is_err());
+        assert!(set_task_project(&conn, &t, "renewal").is_err());
+        assert!(set_task_project(&conn, &t, "proj-nope").is_err());
+        assert_eq!(pid(&t).as_deref(), Some("proj-r01"));
+        assert!(
+            set_task_project(&conn, "task-nope", "proj-r01").is_err(),
+            "not a task"
+        );
+    }
+
+    /// The two halves partition the closed type set, so a new type cannot
+    /// become a parent by omission — it has to be placed.
+    #[test]
+    fn never_a_parent_and_container_types_partition_the_node_types() {
+        let mut both: Vec<&str> = NEVER_A_PARENT
+            .iter()
+            .chain(CONTAINER_TYPES)
+            .copied()
+            .collect();
+        both.sort();
+        let mut all: Vec<&str> = crate::graph::NODE_TYPES.to_vec();
+        all.sort();
+        assert_eq!(
+            both, all,
+            "every node type is a parent or never one, and not both"
+        );
+        assert!(NEVER_A_PARENT.iter().all(|t| !CONTAINER_TYPES.contains(t)));
+    }
+
+    /// The writer is as strong as its guard: an id handed straight to
+    /// `set_task_parent_id` is checked like a name would have been.
+    #[test]
+    fn the_parent_writer_refuses_what_the_resolver_would() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, None, None).unwrap();
+        assert!(set_task_parent_id(&conn, &t, Some("p-wren")).is_err());
+        assert!(set_task_parent_id(&conn, &t, Some("nope")).is_err());
+        set_task_parent_id(&conn, &t, Some("proj-tide")).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide")
+        );
+        set_task_parent_id(&conn, &t, None).unwrap();
+        assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
+    }
+
+    /// The two mutators that change what a parent *is* honour the rule:
+    /// a retype into a non-container is refused while tasks sit under the
+    /// node, and a merge onto a non-container detaches with a record
+    /// rather than re-pointing.
+    #[test]
+    fn retype_and_merge_cannot_recreate_a_forbidden_parent() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        let e = crate::graph::retype_node(&conn, "proj-tide", "person")
+            .expect_err("a parent with tasks under it cannot become a person");
+        assert!(e.to_string().contains("1 task(s) filed under it"), "{e}");
+        assert_eq!(
+            crate::graph::get_node(&conn, "proj-tide")
+                .unwrap()
+                .unwrap()
+                .node_type,
+            "project",
+            "refused, not applied"
+        );
+        // Into another container, or once the task is re-filed, it goes.
+        crate::graph::retype_node(&conn, "proj-tide", "topic").unwrap();
+        set_task_project(&conn, &t, "").unwrap();
+        crate::graph::retype_node(&conn, "proj-tide", "person").unwrap();
+
+        // Merge: a stray project duplicate that turns out to be the person.
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-wren", "project", "Wren's project")).unwrap();
+        let u = create_task(&conn, "Draft the aims", None, Some("proj-wren"), None).unwrap();
+        crate::graph::merge_nodes(&conn, "p-wren", "proj-wren").unwrap();
+        let row = get_task(&conn, &u).unwrap().unwrap();
+        assert_eq!(
+            row.project_id, None,
+            "detached, never re-pointed onto a person"
+        );
+        // A merge's silent detach is on the survey's pending list, so the
+        // set stays reviewable.
+        let pending = detached_pending(&conn).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.task_id == u && p.reason == "merge_nodes"),
+            "{pending:?}"
+        );
+        let node = crate::graph::get_node(&conn, &u).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-wren");
+        assert_eq!(
+            node.properties["detached_parents"][0]["reason"],
+            "merge_nodes"
+        );
+        // Onto a container, tasks follow the merge as before.
+        upsert_node(&conn, &Node::new("proj-a", "project", "Alpha")).unwrap();
+        upsert_node(&conn, &Node::new("proj-b", "project", "Alpha (dup)")).unwrap();
+        let v = create_task(&conn, "Budget", None, Some("proj-b"), None).unwrap();
+        crate::graph::merge_nodes(&conn, "proj-a", "proj-b").unwrap();
+        assert_eq!(
+            get_task(&conn, &v).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-a")
+        );
+    }
+
+    /// A second detachment keeps the first record, and a parent whose node
+    /// is gone still loses its children.
+    #[test]
+    fn detachment_records_accumulate_and_a_missing_parent_still_detaches() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-wren", "project", "Wren's project")).unwrap();
+        let t = create_task(&conn, "Draft the aims", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-wren' WHERE node_id = ?1",
+            params![t],
+        )
+        .unwrap();
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        set_task_project(&conn, &t, "proj-wren").unwrap();
+        crate::graph::merge_nodes(&conn, "p-wren", "proj-wren").unwrap();
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let records = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "both detachments are remembered: {records:?}"
+        );
+        assert_eq!(records[0]["reason"], "repair_unfit_parents");
+        assert_eq!(records[1]["reason"], "merge_nodes");
+        assert_eq!(records[1]["id"], "proj-wren");
+
+        // A parent row that is gone: the column is still nulled, the record
+        // is what cannot be written.
+        upsert_node(&conn, &Node::new("proj-ghost", "project", "Ghost")).unwrap();
+        set_task_project(&conn, &t, "proj-ghost").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'proj-ghost'", [])
+            .unwrap();
+        assert_eq!(detach_tasks_under(&conn, "proj-ghost", "test").unwrap(), 1);
+        assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let records = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(records.len(), 3, "the orphan detachment is recorded too");
+        assert_eq!(records[2]["id"], "proj-ghost");
+        assert_eq!(records[2]["type"], MISSING_PARENT);
+        assert_eq!(records[2]["name"], "(missing)");
+        // A task row whose own node is gone (foreign keys off) is a finding
+        // for the count and the survey alike, so the stats alert can be
+        // cleared by the tool it names.
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type, parent_id) VALUES ('task-ghost', 'inbox', 'action', 'p-wren')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1);
+        assert_eq!(survey.found[0].task_name, "(missing)");
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 0);
+        conn.execute("DELETE FROM task_detail WHERE node_id = 'task-ghost'", [])
+            .unwrap();
+        // And the survey sees an orphan parent too, and detaches it on apply.
+        upsert_node(&conn, &Node::new("proj-gone2", "project", "Gone")).unwrap();
+        set_task_project(&conn, &t, "proj-gone2").unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'proj-gone2'", [])
+            .unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id,
+            None,
+            "the board hands out neither the name nor the id of a parent that is gone"
+        );
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
+        assert_eq!(survey.found[0].parent_id, "proj-gone2");
+        assert_eq!(survey.found[0].parent_type, MISSING_PARENT);
+        assert_eq!(survey.found[0].parent_name, "(missing)");
+        assert!(!survey.found[0].plausible);
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
+    }
+
+    /// A task on the board cannot be retyped into anything: only the type
+    /// would move and the row would stay, a task that is now a legal parent
+    /// the survey cannot see.
+    #[test]
+    fn a_task_on_the_board_cannot_be_retyped_into_a_container() {
+        let conn = open_memory().unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, None, None).unwrap();
+        let e = crate::graph::retype_node(&conn, &t, "project")
+            .expect_err("a task row cannot become a project");
+        assert!(e.to_string().contains("is a task on the board"), "{e}");
+        assert!(crate::graph::retype_node(&conn, &t, "topic").is_err());
+        assert_eq!(
+            crate::graph::get_node(&conn, &t)
+                .unwrap()
+                .unwrap()
+                .node_type,
+            "task"
+        );
+        // And so it can never be cited as a parent.
+        assert!(create_task(&conn, "Child", None, Some(&t), None).is_err());
+
+        // The row, not the type, is what makes it a task: a project node
+        // that somehow holds a task row is refused the same way.
+        upsert_node(&conn, &Node::new("proj-odd", "project", "Odd")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('proj-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "person").is_err());
+    }
+
+    /// An argument that is a node id resolves to that node even when
+    /// another node's name is that id — the round-trip is exact.
+    #[test]
+    fn an_id_resolves_to_its_node_before_any_name_that_collides_with_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-placeholder", "project", "proj-tide"),
+        )
+        .unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, Some("proj-tide"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide"),
+            "the id, not the placeholder whose name is the id"
+        );
+        let u = create_task(&conn, "Write it up", None, Some("Tide pool study"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide")
+        );
+    }
+
+    /// A node that is a task by row and a container by type — a store from
+    /// before the guards — is never a parent, by any writer or the survey.
+    #[test]
+    fn a_task_by_row_is_not_a_parent_whatever_its_type_says() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-odd", "project", "Odd")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('proj-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        assert!(create_task(&conn, "Child", None, Some("proj-odd"), None).is_err());
+        assert!(create_task(&conn, "Child", None, Some("Odd"), None).is_err());
+        let t = create_task(&conn, "Child", None, None, None).unwrap();
+        assert!(set_task_parent_id(&conn, &t, Some("proj-odd")).is_err());
+        // A store that already has the filing: the survey sees it, and a
+        // merge onto the odd node detaches rather than re-points.
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'proj-odd' WHERE node_id = ?1",
+            params![t],
+        )
+        .unwrap();
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            1,
+            "the count is the survey's predicate"
+        );
+        assert_eq!(survey.found[0].parent_id, "proj-odd");
+        assert_eq!(
+            survey.found[0].parent_type, "task",
+            "reported as the task it is"
+        );
+        // And the one repair for the node itself: detach what sits under it
+        // (a task is never a parent, so the retype refuses while one does),
+        // then retype it back to task.
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "task").is_err());
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        crate::graph::retype_node(&conn, "proj-odd", "task").unwrap();
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "project").is_err());
+        upsert_node(&conn, &Node::new("proj-b", "project", "Beta")).unwrap();
+        let u = create_task(&conn, "Under beta", None, Some("proj-b"), None).unwrap();
+        crate::graph::merge_nodes(&conn, "proj-odd", "proj-b").unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id,
+            None,
+            "detached, not re-pointed"
+        );
+    }
+
+    /// A name shared with a node that could never be a parent is not
+    /// ambiguous: the org wins over the place, the project over the task.
+    #[test]
+    fn a_name_shared_with_a_non_parent_still_names_the_one_container() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("org-inst", "org", "The Institute")).unwrap();
+        upsert_node(&conn, &Node::new("pl-inst", "place", "The Institute")).unwrap();
+        let t = create_task(&conn, "Book the room", None, Some("The Institute"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("org-inst")
+        );
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let same_name = create_task(&conn, "Tidelab", None, None, None).unwrap();
+        let u = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-tide")
+        );
+        assert!(get_task(&conn, &same_name).unwrap().is_some());
+        // Only the place: no container of that name.
+        let e = create_task(&conn, "x", None, Some("The Institute annex"), None).unwrap_err();
+        assert!(e.to_string().contains("no container node matches"), "{e}");
+    }
+
+    /// The exit from the row rule: a finished task with nothing under it
+    /// converts to a container, and the task row goes with the type.
+    #[test]
+    fn a_finished_task_with_nothing_under_it_converts_to_a_container() {
+        let conn = open_memory().unwrap();
+        let t = create_task(&conn, "Tide pool study", None, None, None).unwrap();
+        let e = crate::graph::retype_node(&conn, &t, "project").unwrap_err();
+        assert!(
+            e.to_string().contains("only once it is done or dropped"),
+            "{e}"
+        );
+        set_task_status(&conn, &t, "done").unwrap();
+        // Still refused while something sits under it.
+        upsert_node(&conn, &Node::new("proj-x", "project", "X")).unwrap();
+        let child = create_task(&conn, "Child", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+            params![child, t],
+        )
+        .unwrap();
+        assert!(crate::graph::retype_node(&conn, &t, "project").is_err());
+        set_task_project(&conn, &child, "proj-x").unwrap();
+        // Filed somewhere itself: the conversion records that too.
+        set_task_project(&conn, &t, "proj-x").unwrap();
+        // Now it converts: the row is gone, the id stays, and it is a parent.
+        let (was, now, wrote) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let c = &node.properties["converted_task"];
+        assert_eq!(
+            wrote.as_ref(),
+            Some(c),
+            "the call returns the record it wrote"
+        );
+        assert_eq!(c["row"]["status"], "done");
+        assert_eq!(c["row"]["parent_id"], "proj-x");
+        assert_eq!(c["converted_to"], "project");
+        assert!(c["converted_at"].is_string());
+        // The whole row, by column: a tag or an estimate is kept too.
+        assert!(c["row"].get("context_tag").is_some());
+        assert!(c["row"].get("task_type").is_some());
+        assert!(c["row"]["completed_at"].is_string());
+        assert_eq!(node.properties["detached_parents"][0]["id"], "proj-x");
+        assert_eq!(
+            node.properties["detached_parents"][0]["reason"],
+            "retype_node"
+        );
+        assert_eq!((was.as_str(), now.as_str()), ("task", "project"));
+        assert!(!is_task(&conn, &t).unwrap());
+        assert!(get_task(&conn, &t).unwrap().is_none(), "off the board");
+        // A later retype onto the type it was converted to is not a
+        // conversion: the node's record stays, the call returns none, so
+        // the CLI cannot re-print a board row removed (found on review).
+        let (_, _, again) = crate::graph::retype_node(&conn, &t, "topic").unwrap();
+        assert!(again.is_none());
+        let (_, _, again) = crate::graph::retype_node(&conn, &t, "project").unwrap();
+        assert!(again.is_none(), "the record on the node is not this call's");
+        assert_eq!(
+            crate::graph::get_node(&conn, &t)
+                .unwrap()
+                .unwrap()
+                .properties["converted_task"],
+            *c,
+            "the record is written once"
+        );
+        // And there is no retype back: a task is made by capture.
+        let e = crate::graph::retype_node(&conn, &t, "task").unwrap_err();
+        assert!(e.to_string().contains("by capture, not by retype"), "{e}");
+        let under = create_task(&conn, "Ship the pilot", None, Some(&t), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &under)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some(t.as_str())
+        );
+    }
+
+    /// The count is over the matching set, not a window: task titles that
+    /// share the substring do not hide a container or crowd out a second
+    /// one, and two containers sharing it are refused.
+    #[test]
+    fn a_fuzzy_parent_name_is_counted_over_every_container_that_matches() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-a", "project", "Renewal budget")).unwrap();
+        for i in 0..6 {
+            create_task(
+                &conn,
+                &format!("Draft the renewal aims {i}"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Six tasks and one container match "renewal"; the container wins.
+        let t = create_task(&conn, "x", None, Some("renewal"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-a")
+        );
+        // A second container matching it is a refusal that names both.
+        upsert_node(&conn, &Node::new("proj-b", "project", "Renewal plan")).unwrap();
+        let e = create_task(&conn, "y", None, Some("renewal"), None).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("matches 2 nodes") && msg.contains("proj-a") && msg.contains("proj-b"),
+            "{msg}"
+        );
+        // An exact name still wins outright over the substring tier.
+        let u = create_task(&conn, "z", None, Some("Renewal plan"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &u).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-b")
+        );
+        // A wildcard in the argument is a character, not a pattern: "re_"
+        // reaches nothing, where a live `_` would have matched "renewal".
+        assert!(create_task(&conn, "w", None, Some("re_"), None).is_err());
+        assert!(create_task(&conn, "w", None, Some("%"), None).is_err());
+        // An identifier names a container too — how a project keyed by a
+        // path or a URL is reached.
+        crate::graph::upsert_identifier(
+            &conn,
+            "url",
+            "https://example.test/renewal-plan",
+            "proj-b",
+            "manual",
+        )
+        .unwrap();
+        let v = create_task(
+            &conn,
+            "v",
+            None,
+            Some("https://example.test/renewal-plan"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_task(&conn, &v).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-b")
+        );
+    }
+
+    /// A task cannot be merged into a container: the row would move and
+    /// the container would be a task on the board and a legal parent the
+    /// survey cannot see.
+    #[test]
+    fn a_task_cannot_be_merged_into_a_container() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let t = create_task(&conn, "Tidelab", None, None, None).unwrap();
+        let e = crate::graph::merge_nodes(&conn, "proj-tide", &t)
+            .expect_err("a task row cannot land on a project");
+        assert!(e.to_string().contains("is a task on the board"), "{e}");
+        assert!(
+            get_task(&conn, &t).unwrap().is_some(),
+            "refused, not applied"
+        );
+        assert!(!is_task(&conn, "proj-tide").unwrap());
+        // Two tasks merge as before.
+        let u = create_task(&conn, "Tidelab (dup)", None, None, None).unwrap();
+        crate::graph::merge_nodes(&conn, &t, &u).unwrap();
+        assert!(get_task(&conn, &u).unwrap().is_none());
+    }
+
+    /// The history is capped: an agent re-filing a task on every turn does
+    /// not grow its node without bound, and the newest record survives.
+    #[test]
+    fn the_detachment_history_keeps_the_newest_records_up_to_the_cap() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-a", "project", "A")).unwrap();
+        upsert_node(&conn, &Node::new("proj-b", "project", "B")).unwrap();
+        let t = create_task(&conn, "Ping-pong", None, Some("proj-a"), None).unwrap();
+        for i in 0..(DETACHMENT_HISTORY + 5) {
+            let to = if i % 2 == 0 { "proj-b" } else { "proj-a" };
+            set_task_project(&conn, &t, to).unwrap();
+        }
+        let node = crate::graph::get_node(&conn, &t).unwrap().unwrap();
+        let history = node.properties["detached_parents"].as_array().unwrap();
+        assert_eq!(history.len(), DETACHMENT_HISTORY);
+        // The last move was from proj-a (odd index 24 → to proj-b? i=24 is even → to proj-b, from proj-a)
+        assert_eq!(history.last().unwrap()["id"], "proj-a");
+    }
+
+    /// A survey tells a plausible old filing from a slip.
+    #[test]
+    fn the_survey_marks_a_place_or_series_parent_plausible_and_a_person_not() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("pl-hall", "place", "Fixture Hall")).unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let a = create_task(&conn, "Fix the projector", None, None, None).unwrap();
+        let b = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        for (t, p) in [(&a, "pl-hall"), (&b, "p-wren")] {
+            conn.execute(
+                "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+                params![t, p],
+            )
+            .unwrap();
+        }
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        let by_id = |id: &str| {
+            survey
+                .found
+                .iter()
+                .find(|u| u.task_id == id)
+                .unwrap()
+                .plausible
+        };
+        assert!(
+            by_id(&a),
+            "a building was a legal filing under the old rule"
+        );
+        assert!(!by_id(&b), "a person never was");
+        // The survey says what the apply it previews would do, under the
+        // flag it was given.
+        let row = |id: &str| {
+            survey
+                .found
+                .iter()
+                .find(|u| u.task_id == id)
+                .unwrap()
+                .would_detach
+        };
+        assert!(!row(&a) && row(&b));
+        assert!(!survey.include_plausible);
+        let wider = repair_unfit_parents_with(&conn, false, true).unwrap();
+        assert!(
+            !wider.applied && wider.include_plausible,
+            "both flags echoed"
+        );
+        assert!(wider.include_plausible);
+        assert!(wider.found.iter().all(|u| u.would_detach));
+        // The health count is the slips: the plausible filing is not an
+        // alert the command it names could never clear.
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
+        // A parent that is a task by row under a plausible declared type is
+        // a slip to the survey, and so to the count — the writer the guard
+        // does not bind (`upsert_node`'s type rewrite) makes exactly this row.
+        upsert_node(&conn, &Node::new("ev-odd", "event", "Thursday review")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('ev-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        let c = create_task(&conn, "Under the odd event", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'ev-odd' WHERE node_id = ?1",
+            params![c],
+        )
+        .unwrap();
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            2,
+            "the count reads the row, not the type"
+        );
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        let odd = survey.found.iter().find(|u| u.task_id == c).unwrap();
+        assert_eq!(odd.parent_type, "task");
+        assert!(!odd.plausible);
+        conn.execute(
+            "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1",
+            params![c],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM task_detail WHERE node_id = 'ev-odd'", [])
+            .unwrap();
+        // "This one was meant": re-filing under the same parent marks it,
+        // and the plausible row leaves the survey; a slip does not, whoever
+        // vouches; a move drops the mark.
+        set_task_project(&conn, &a, "pl-hall").unwrap();
+        // The slip's owner may try to vouch too: the call succeeds, but no
+        // mark is written for a person — failing closed at the writer, not
+        // open with a net downstream.
+        set_task_project(&conn, &b, "p-wren").unwrap();
+        let after = repair_unfit_parents(&conn, false).unwrap();
+        assert!(
+            after.found.iter().all(|u| u.task_id != a),
+            "vouched for: off the survey"
+        );
+        assert!(after.found.iter().any(|u| u.task_id == b), "a slip stays");
+        assert!(vouch_stands(&conn, &a).unwrap(), "the vouch stands");
+        assert!(!vouch_stands(&conn, &b).unwrap(), "no vouch for a slip");
+        // A vouched filing whose parent row is gone is a finding to the
+        // survey as it is to the count — never a NULL that drops it.
+        upsert_node(&conn, &Node::new("pl-gone", "place", "Gone Hall")).unwrap();
+        let g = create_task(&conn, "Under a hall that goes", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-gone' WHERE node_id = ?1",
+            params![g],
+        )
+        .unwrap();
+        set_task_project(&conn, &g, "pl-gone").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'pl-gone'", [])
+            .unwrap();
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert!(
+            survey.found.iter().any(|u| u.task_id == g),
+            "{:?}",
+            survey.found
+        );
+        // The mark outlived the parent's row; the vouch does not — the
+        // survey lists the row, so "vouched" must not stand, and a second
+        // vouch attempt takes the stale mark with it rather than reading
+        // it back as standing (found on review).
+        assert!(
+            !vouch_stands(&conn, &g).unwrap(),
+            "a lapsed vouch does not stand"
+        );
+        set_task_project(&conn, &g, "pl-gone").unwrap();
+        assert!(!vouch_stands(&conn, &g).unwrap());
+        let gn = crate::graph::get_node(&conn, &g).unwrap().unwrap();
+        assert!(
+            gn.properties.get("parent_reviewed").is_none(),
+            "the declined vouch removed the stale mark"
+        );
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .found
+                .iter()
+                .any(|u| u.task_id == g),
+            "still a finding"
+        );
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            survey.found.iter().filter(|u| !u.plausible).count() as i64,
+            "the count and the survey agree on the orphan"
+        );
+        assert_eq!(detach_tasks_under(&conn, "pl-gone", "test").unwrap(), 1);
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        // The vouch names its parent: one given under a project that a type
+        // rewrite later turns into an event does not carry.
+        upsert_node(&conn, &Node::new("proj-z2", "project", "Z2")).unwrap();
+        let v = create_task(
+            &conn,
+            "Vouched under a project",
+            None,
+            Some("proj-z2"),
+            None,
+        )
+        .unwrap();
+        set_task_project(&conn, &v, "proj-z2").unwrap();
+        conn.execute(
+            "UPDATE nodes SET node_type = 'event' WHERE id = 'proj-z2'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .found
+                .iter()
+                .any(|u| u.task_id == v),
+            "the vouch was for proj-z2 the project; the event is a finding"
+        );
+        upsert_node(&conn, &Node::new("proj-z", "project", "Z")).unwrap();
+        set_task_project(&conn, &a, "proj-z").unwrap();
+        let node = crate::graph::get_node(&conn, &a).unwrap().unwrap();
+        assert!(
+            node.properties.get("parent_reviewed").is_none(),
+            "a move drops the mark"
+        );
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-hall' WHERE node_id = ?1",
+            params![a],
+        )
+        .unwrap();
+        // --apply acts on the distinction: the slip goes, the plausible
+        // filing stays until asked for.
+        let applied = repair_unfit_parents(&conn, true).unwrap();
+        assert_eq!(applied.detached, 1, "{:?}", applied.found);
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(pid(&a).as_deref(), Some("pl-hall"), "kept");
+        assert_eq!(pid(&b), None, "detached");
+        // Two plausible rows now: `a` under the building and the task
+        // vouched under a project that a type rewrite made an event.
+        assert_eq!(
+            repair_unfit_parents_with(&conn, true, true)
+                .unwrap()
+                .detached,
+            2
+        );
+        assert_eq!(pid(&a), None, "detached when asked");
+    }
+
+    /// The guard on new writes, applied to the rows already there: a task
+    /// filed under a person before the guard is found, and detached only
+    /// on `apply`.
+    #[test]
+    fn unfit_parents_are_surveyed_and_detached_only_on_apply() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let fine = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        let legacy = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        // Written before the guard existed: straight into the column.
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-wren' WHERE node_id = ?1",
+            params![legacy],
+        )
+        .unwrap();
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(
+            pid(&legacy).as_deref(),
+            Some("p-wren"),
+            "the board hands the unfit parent out like any other"
+        );
+
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(
+            survey.found,
+            vec![UnfitParent {
+                task_id: legacy.clone(),
+                task_name: "Send the figures".into(),
+                parent_id: "p-wren".into(),
+                parent_name: "Wren".into(),
+                parent_type: "person".into(),
+                plausible: false,
+                detached: false,
+                would_detach: true,
+            }]
+        );
+        assert_eq!(survey.detached, 0, "a survey detaches nothing");
+        assert_eq!(pid(&legacy).as_deref(), Some("p-wren"));
+
+        let applied = repair_unfit_parents(&conn, true).unwrap();
+        assert_eq!(applied.found.len(), 1);
+        assert_eq!(applied.detached, 1);
+        assert!(
+            applied.found[0].detached,
+            "the row says it was the one detached"
+        );
+        // And it is now on the pending list, until re-filed.
+        assert_eq!(applied.pending.len(), 1);
+        assert_eq!(applied.pending[0].task_id, legacy);
+        assert_eq!(applied.pending[0].parent_id, "p-wren");
+        assert_eq!(applied.pending[0].reason, "repair_unfit_parents");
+        assert_eq!(pid(&legacy), None);
+        // The store remembers where it was, on the task itself.
+        let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["id"], "p-wren");
+        assert_eq!(node.properties["detached_parents"][0]["type"], "person");
+        assert_eq!(
+            node.properties["detached_parents"][0]["reason"],
+            "repair_unfit_parents"
+        );
+        assert_eq!(
+            pid(&fine).as_deref(),
+            Some("proj-tide"),
+            "a task under a real container is untouched"
+        );
+        assert!(repair_unfit_parents(&conn, true).unwrap().found.is_empty());
+        // The count the health pane reads agrees with the survey.
+        assert_eq!(unfit_parent_count(&conn).unwrap(), 0);
+        // A finished task is not waiting to be re-filed: closed, it leaves
+        // the pending list; reopened, it is back.
+        set_task_status(&conn, &legacy, "done").unwrap();
+        assert!(
+            detached_pending(&conn).unwrap().is_empty(),
+            "finished: not pending"
+        );
+        set_task_status(&conn, &legacy, "next").unwrap();
+        // "No project is right": clearing an already-clear parent marks the
+        // record reviewed, and it leaves the pending list while staying.
+        assert_eq!(detached_pending(&conn).unwrap().len(), 1);
+        set_task_project(&conn, &legacy, "").unwrap();
+        assert!(
+            detached_pending(&conn).unwrap().is_empty(),
+            "reviewed: off the list"
+        );
+        let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
+        assert_eq!(node.properties["detached_parents"][0]["reviewed"], true);
+        assert_eq!(
+            node.properties["detached_parents"][0]["id"], "p-wren",
+            "the record stays"
+        );
+        // Re-filed, it is off the list for the other reason.
+        set_task_project(&conn, &legacy, "Tidelab").unwrap();
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .pending
+                .is_empty(),
+            "re-filed: off the list"
+        );
+    }
+
     #[test]
     fn test_list_tasks_ordering_and_joins() {
         let conn = open_memory().unwrap();
@@ -1756,6 +3692,9 @@ mod tests {
         let ids: Vec<&str> = open.iter().map(|t| t.node_id.as_str()).collect();
         assert_eq!(ids, vec!["t-next1", "t-next2", "t-in", "t-wait"]);
         assert_eq!(open[0].project.as_deref(), Some("R01 renewal"));
+        // The pointer rides beside the name: a consumer citing the project
+        // needs the id the board minted, never the prose.
+        assert_eq!(open[0].project_id.as_deref(), Some("p1"));
         assert_eq!(open[3].waiting_on.as_deref(), Some("Nadia"));
 
         let all = list_tasks(&conn, true).unwrap();

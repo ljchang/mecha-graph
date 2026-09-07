@@ -236,7 +236,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project (`project` is its name, `project_id` its node id — cite the id), who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -248,13 +248,13 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_create",
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
-            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` must name an existing graph node — an unknown name is an error, not an implicit node.",
+            "description": "Capture a task. Lands in 'inbox' status — captured, not yet committed to — mirroring manual capture in the TUI. Direct write, no review queue: a task the user asked for is an instruction, not an inference about the world (same rule that lets kind=alias land directly in kg_upsert). Check kg_task_list first so the board does not collect duplicates. `project` names the parent — any container node (project, goal, area, topic, org…) by name or node id (the `project_id` a task row carries): an unknown name is an error, not an implicit node; a name matching several nodes is refused with their ids; and a task, person, agent, place, event, event_series, document or artifact is never a parent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
-                    "project": { "type": "string", "description": "Parent project/topic — must resolve to an existing node" },
+                    "project": { "type": "string", "description": "Parent, by name or node id — must resolve to exactly one existing node of a container type (project, goal, area, topic, org…); never a task, person, agent, place, event, event_series, document or artifact" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
                     "about": {
                         "type": "array",
@@ -289,6 +289,7 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
+                    "project": { "type": "string", "description": "Re-file under this parent, by name or node id, resolved exactly as kg_task_create resolves it (one existing node of a container type, never a task, person, agent, place, event, event_series, document or artifact) — and resolved before anything in this call is written, so a refused parent changes nothing; \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
                     "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
                     "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
                     "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },
@@ -1696,6 +1697,263 @@ mod tests {
         );
     }
 
+    /// The consumer reads `project_id` off the wire, not off `TaskItem`:
+    /// every task surface carries it, equal to the parent node's id, and
+    /// the create echo carries it at the moment the citing consumer has it
+    /// to record.
+    #[test]
+    fn every_task_surface_carries_the_project_id_on_the_wire() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        let created = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship the pilot", "project": "Tide pool study" }),
+        )
+        .unwrap();
+        assert_eq!(created["task"]["project_id"], "proj-tide");
+        assert_eq!(created["task"]["project"], "Tide pool study");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let listed = kg_task_list(&conn, &json!({})).unwrap();
+        let row = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["project_id"], "proj-tide");
+
+        let updated = kg_task_update(&conn, &json!({ "task": id, "status": "next" })).unwrap();
+        assert_eq!(updated["task"]["project_id"], "proj-tide");
+
+        // Absent exactly when the name is — a null on the wire, not a
+        // missing key, so a reader can tell "no project" from "older server".
+        let alone = kg_task_create(&conn, &json!({ "name": "No project" })).unwrap();
+        assert!(alone["task"]["project_id"].is_null());
+        assert!(alone["task"].get("project_id").is_some());
+
+        // The row can be re-filed through the update, by id or name, and
+        // cleared; a refused parent leaves it where it was.
+        let moved = kg_task_update(&conn, &json!({ "task": id, "project": "" })).unwrap();
+        assert!(moved["task"]["project_id"].is_null());
+        let moved = kg_task_update(&conn, &json!({ "task": id, "project": "proj-tide" })).unwrap();
+        assert_eq!(moved["task"]["project_id"], "proj-tide");
+        assert!(kg_task_update(&conn, &json!({ "task": id, "project": id })).is_err());
+
+        // Clearing an already-clear parent over MCP marks a detachment
+        // record reviewed, so the pending pile drains from this surface too.
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let t = kg_task_create(&conn, &json!({ "name": "For Nadia" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-nadia' WHERE node_id = ?1",
+            mecha_graph_core::rusqlite::params![t],
+        )
+        .unwrap();
+        assert_eq!(gtd::repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(gtd::detached_pending(&conn).unwrap().len(), 1);
+        kg_task_update(&conn, &json!({ "task": t, "project": "" })).unwrap();
+        assert!(
+            gtd::detached_pending(&conn).unwrap().is_empty(),
+            "reviewed over MCP"
+        );
+
+        // No name at all: the same clause as every other refusal here.
+        let e =
+            kg_task_create(&conn, &json!({ "due": "tomorrow" })).expect_err("a name is required");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
+        // An agent's idempotent re-send of the parent it read is not a vouch:
+        // the survey row stays until a person says so from the terminal.
+        upsert_node(&conn, &Node::new("pl-hall", "place", "Fixture Hall")).unwrap();
+        let parked = kg_task_create(&conn, &json!({ "name": "Fix the projector" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-hall' WHERE node_id = ?1",
+            mecha_graph_core::rusqlite::params![parked],
+        )
+        .unwrap();
+        kg_task_update(
+            &conn,
+            &json!({ "task": parked, "due": "tomorrow", "project": "pl-hall" }),
+        )
+        .unwrap();
+        assert!(
+            !gtd::vouch_stands(&conn, &parked).unwrap(),
+            "no mark from an echo"
+        );
+        assert!(gtd::repair_unfit_parents(&conn, false)
+            .unwrap()
+            .found
+            .iter()
+            .any(|u| u.task_id == parked));
+        assert!(
+            gtd::vouch_for_parent(&conn, &parked).unwrap(),
+            "the explicit gesture"
+        );
+        assert!(gtd::vouch_stands(&conn, &parked).unwrap());
+
+        // A list where a string belongs creates nothing either.
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Send the figures", "due": ["2026-10-01"] }),
+        )
+        .expect_err("a non-string due is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+        assert!(
+            !e.to_string().contains("nothing was changed"),
+            "one outcome clause: {e}"
+        );
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Send the figures", "context": ["@lab"] }),
+        )
+        .expect_err("a non-string context is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
+        // A refused provenance pointer creates nothing: the board is the
+        // same size after the call as before, so a caller told "no task
+        // was created" can retry without staging a duplicate.
+        let before = kg_task_list(&conn, &json!({ "include_closed": true })).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len();
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship it", "captured_from": { "kind": "mail", "id": "t9", "body": "…" } }),
+        )
+        .expect_err("a bad captured_from refuses the create");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+        let after = kg_task_list(&conn, &json!({ "include_closed": true })).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "and it created nothing");
+
+        // A refused parent says so in the words the other refusals use.
+        upsert_node(
+            &conn,
+            &Node::new("proj-tide2", "project", "Tide pool study 2"),
+        )
+        .unwrap();
+        let e = kg_task_create(&conn, &json!({ "name": "x", "project": "Tide pool" }))
+            .expect_err("an ambiguous name is refused");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+
+        // The object the id came in, re-sent instead of the string, is
+        // refused — never an unfiled task that answers `created`.
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship it", "project": { "id": "proj-tide" } }),
+        )
+        .expect_err("a non-string project is refused");
+        assert!(e.to_string().contains("must be a string"), "{e}");
+        assert!(kg_task_update(&conn, &json!({ "task": id, "project": 7 })).is_err());
+        assert_eq!(
+            kg_task_update(&conn, &json!({ "task": id, "status": "next" })).unwrap()["task"]
+                ["project_id"],
+            "proj-tide",
+            "and the row was not touched"
+        );
+
+        // A refused parent refuses the whole call before its first write:
+        // the status change in the same call does not land (found on
+        // review — it used to, retiring the live waiting_on claim on the
+        // way, which reopening does not restore).
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        for bad in [
+            json!("Wren"),
+            json!("proj-nope"),
+            json!({ "id": "proj-tide" }),
+        ] {
+            let e = kg_task_update(
+                &conn,
+                &json!({ "task": id, "status": "done", "project": bad }),
+            )
+            .expect_err("a refused parent refuses the call");
+            let msg = e.to_string();
+            assert!(msg.contains("nothing was changed"), "{msg}");
+        }
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+        assert_eq!(row["task"]["project_id"], "proj-tide");
+
+        // A list where a string belongs refuses the call, and nothing is
+        // written — `status: ["done"]` used to answer `updated` untouched.
+        let e = kg_task_update(&conn, &json!({ "task": id, "status": ["done"] }))
+            .expect_err("a non-string status is refused");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(row["task"]["status"], "next");
+
+        // An unknown status is refused before the first write, with the
+        // clause — a consumer keying its retry on the clause could not tell
+        // this refusal from a mid-call failure (found on review).
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "finished", "due": "tomorrow" }),
+        )
+        .expect_err("an unknown status is refused");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(row["task"]["status"], "next");
+        assert!(
+            row["task"]["due"].is_null(),
+            "the due in the same payload never landed"
+        );
+
+        // A typo in waiting_on refuses the call before the status write —
+        // the case that used to close the task and retire the live claim.
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "waiting_on": "Nadai" }),
+        )
+        .expect_err("an unknown waiting_on refuses the call");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+
+        // A date that does not parse refuses the call before the status
+        // write, like every other pre-flight refusal.
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "done", "due": "next thursday-ish, maybe" }),
+        )
+        .expect_err("an unparseable date refuses the call");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["status"], "next",
+            "the status change did not land"
+        );
+
+        // And the other direction: a re-file in a call that fails on a later
+        // field does not land either — the parent is written last.
+        upsert_node(&conn, &Node::new("proj-other", "project", "Other")).unwrap();
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "project": "proj-other",
+                     "captured_from": { "kind": "mail", "id": "t9", "body": "…" } }),
+        )
+        .expect_err("a bad captured_from refuses the call");
+        assert!(e.to_string().contains("captured_from"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["project_id"], "proj-tide",
+            "the re-file did not land"
+        );
+    }
+
     /// `kg_upsert` cannot write prose into a date column.
     #[test]
     fn valid_from_must_be_a_date() {
@@ -2105,6 +2363,9 @@ fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
         "id": t.node_id, "name": t.name, "status": t.status,
         "due_at": t.due_at, "defer_until": t.defer_until,
         "context": t.context_tag, "project": t.project,
+        // The parent's node id beside its name — the pointer a consumer
+        // cites (`project:<id>`), where the name is prose.
+        "project_id": t.project_id,
         "waiting_on": t.waiting_on, "about": t.about,
         // Why a task with no live association is on this entity's card.
         "previously_waiting_on": t.previously_waiting_on,
@@ -2156,11 +2417,32 @@ fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Val
 }
 
 fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let name = args["name"].as_str().unwrap_or_default();
-    let due = match args["due"].as_str() {
-        Some(raw) => gtd::parse_due(raw)?,
+    // The required scalar, checked like its neighbours: a list where the
+    // name belongs used to refuse as "task needs a name" — true, and the
+    // wrong problem to name to a caller whose payload carries one (found
+    // on review).
+    let name = scalar_arg(args, "name")
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+        .unwrap_or_default();
+    if name.trim().is_empty() {
+        // The commonest malformed call, with the clause every other
+        // refusal here carries (found on review).
+        return Err(mecha_graph_core::Error::Other(
+            "task needs a name — no task was created".into(),
+        ));
+    }
+    // Shape-checked like every scalar the update reads: a list where a
+    // string belongs used to create an undated, untagged task that answered
+    // `created` — the surface where the loss is least detectable, since
+    // there is no prior row to diff against (found on review).
+    let created_suffix = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — no task was created"))
+    };
+    let due = match scalar_arg(args, "due").map_err(created_suffix)? {
+        Some(raw) => gtd::parse_due(raw).map_err(created_suffix)?,
         None => None,
     };
+    let context = scalar_arg(args, "context").map_err(created_suffix)?;
     // **Resolve every `about` name before creating anything.** The same rule
     // `set_task_waiting_on` states as "resolve before retiring anything",
     // for the same reason one step earlier: resolving afterwards makes a
@@ -2180,13 +2462,26 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::validate_about_target(conn, name)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
     }
-    let task_id = gtd::create_task(
-        conn,
-        name,
-        due.as_deref(),
-        args["project"].as_str(),
-        args["context"].as_str(),
-    )?;
+    // The provenance pointer is checked before the insert for the same
+    // reason `about` is: refused after it, the task existed while the
+    // error said nothing was created, and a caller retrying without the
+    // pointer staged a duplicate (found on review).
+    if !args["captured_from"].is_null() {
+        gtd::validate_captured_from(&args["captured_from"])
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
+    }
+    // The parent, resolved here so its refusal says what the others say —
+    // an ambiguous name is the refusal a consumer most likely retries
+    // blind (found on review). `create_task` resolves the id again, which
+    // is a lookup by id and cannot disagree.
+    let parent = match project_arg(args)
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+    {
+        Some(p) => gtd::resolve_project_arg(conn, p)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
+        None => None,
+    };
+    let task_id = gtd::create_task(conn, name, due.as_deref(), parent.as_deref(), context)?;
     // A second write rather than a sixth positional argument, on the
     // `set_task_session` shape: the property has its own validating setter,
     // and `create_task` has a TUI caller that has nothing to say about
@@ -2208,12 +2503,59 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // this PR wrote; and reading it back means the echo reflects what was
     // actually recorded, including a pre-existing shadow row upgraded to
     // reviewed by this very call.
-    let about = gtd::get_task(conn, &task_id)?
-        .map(|t| t.about)
+    let created = gtd::get_task(conn, &task_id)?;
+    let about = created
+        .as_ref()
+        .map(|t| t.about.clone())
         .unwrap_or_default();
+    // And the whole row under `task`, through `task_json` like the update
+    // echo — the moment a task is created under a project is the moment a
+    // citing consumer has the project's id to record, and a hand-written
+    // literal here was the one surface that did not carry it (found on
+    // review). The top-level keys stay: callers read `id` and `due_at` off
+    // them.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let task = created.map(|t| task_json(&t, &today));
     Ok(json!({
-        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about
+        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about,
+        "task": task
     }))
+}
+
+/// `project` as a string, or refused. A number or an object is not
+/// silently dropped: `project_id` is a JSON field the caller just read off
+/// a row, and re-sending the object it came in rather than the string is
+/// the obvious slip — dropping it would create an unfiled task and answer
+/// `created` (found on review; `name_array`'s rule for the same class of
+/// input).
+fn project_arg(args: &Value) -> mecha_graph_core::Result<Option<&str>> {
+    match args.get("project") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`project` must be a string — a name or a node id — not {other}"
+        ))),
+    }
+}
+
+/// A scalar field as a string, or refused: a number or a list where a
+/// string belongs is not silently the same as an absent field — `status:
+/// ["done"]` answered `updated` with nothing written (found on review;
+/// `project_arg`'s rule, for every scalar the update reads).
+fn scalar_arg<'a>(args: &'a Value, key: &str) -> mecha_graph_core::Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        // The shape problem alone; the outcome clause is the caller's, as
+        // `project_arg` leaves it — baked in here, create's re-wrap read
+        // "— nothing was changed — no task was created" (found on review).
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` must be a string, not {other}"
+        ))),
+    }
 }
 
 fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
@@ -2236,6 +2578,79 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::validate_about_target(conn, name)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
     }
+    // That the target is a task at all, ahead of every other pre-check:
+    // `resolve_project_for` reads the task's row first and would answer
+    // "no rows" for a non-task where this says what it is (found on
+    // review).
+    if !gtd::is_task(conn, task)? {
+        return Err(mecha_graph_core::Error::Other(format!(
+            "{task} is not a task on the board — nothing was changed"
+        )));
+    }
+    // `project` resolved here too, before the first write, for the same
+    // reason: a refused parent — ambiguous, unknown, a person, a non-string
+    // — used to return an error on a call whose status change had already
+    // landed and retired the live `waiting_on` claim, which reopening does
+    // not restore (found on review). Pure reads; the write is last.
+    let parent =
+        match project_arg(args)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?
+        {
+            Some(p) => Some(gtd::resolve_project_for(conn, task, p).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?),
+            None => None,
+        };
+    // And the dates, through `parse_due` so 'tomorrow' and '+3d' work,
+    // parsed here rather than beside their write: parsed after the status
+    // landed, a date that did not parse returned an error on a call that
+    // had already closed the task and retired its `waiting_on` claim — the
+    // half-write the `project` pre-check closes, one field over (found on
+    // review).
+    let changed_nothing = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+    };
+    let sched = |key: &str| -> mecha_graph_core::Result<Option<Option<String>>> {
+        match scalar_arg(args, key).map_err(changed_nothing)? {
+            None => Ok(None),
+            Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?)),
+        }
+    };
+    let due = sched("due")?;
+    let defer = sched("defer")?;
+    // Every scalar the writes below read, checked for shape here so a list
+    // where a string belongs refuses the call rather than skipping the
+    // field and answering `updated`.
+    let status_arg = scalar_arg(args, "status").map_err(changed_nothing)?;
+    // And for value, not only shape: the status write is first, so a
+    // refused one wrote nothing, but its refusal came back without the
+    // clause every other pre-flight refusal carries (found on review).
+    if let Some(s) = status_arg {
+        gtd::validate_status(s).map_err(changed_nothing)?;
+    }
+    let context_arg = scalar_arg(args, "context").map_err(changed_nothing)?;
+    let waiting_on_arg = scalar_arg(args, "waiting_on").map_err(changed_nothing)?;
+    let session_arg = scalar_arg(args, "session").map_err(changed_nothing)?;
+    // And who the task waits on — resolved after the status landed, a typo
+    // returned an error on a call that had already closed the task and
+    // retired the live claim (found on review, the one writer the block's
+    // claim had missed).
+    if let Some(who) = waiting_on_arg {
+        gtd::resolve_waiting_on(conn, who)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+    // And the provenance pointer. After these, no writer below can refuse.
+    match args.get("captured_from") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.trim().is_empty() => {}
+        Some(v) => {
+            gtd::validate_captured_from(v).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?;
+        }
+    }
 
     // **Status goes FIRST, so every field after it sees the status the
     // caller is actually setting.**
@@ -2252,24 +2667,14 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // task — an open `waiting` task that nobody owes. Two ordering fixes for
     // the same field cancelled each other; the invariant on the writer is
     // what actually holds, and this order is what lets it see the truth.
-    if let Some(status) = args["status"].as_str() {
+    if let Some(status) = status_arg {
         gtd::set_task_status(conn, task, status)?;
     }
 
     // Absent field → untouched; "" → cleared — the same tri-state
-    // update_task_schedule speaks, with dates going through parse_due so
-    // 'tomorrow' and '+3d' work here too.
-    let sched = |v: &Value| -> mecha_graph_core::Result<Option<Option<String>>> {
-        match v.as_str() {
-            None => Ok(None),
-            Some(raw) => Ok(Some(gtd::parse_due(raw)?)),
-        }
-    };
-    let due = sched(&args["due"])?;
-    let defer = sched(&args["defer"])?;
-    let context = args["context"]
-        .as_str()
-        .map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
+    // update_task_schedule speaks; the dates were parsed in the pre-flight
+    // block above, before the first write.
+    let context = context_arg.map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
     if due.is_some() || defer.is_some() || context.is_some() {
         gtd::update_task_schedule(
             conn,
@@ -2282,10 +2687,10 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
 
     // After the schedule, because both can arrive in one call and a caller
     // moving a task to `waiting` almost always names who in the same breath.
-    if let Some(who) = args["waiting_on"].as_str() {
+    if let Some(who) = waiting_on_arg {
         gtd::set_task_waiting_on(conn, task, who)?;
     }
-    if let Some(session) = args["session"].as_str() {
+    if let Some(session) = session_arg {
         gtd::set_task_session(conn, task, session)?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
@@ -2310,6 +2715,19 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             gtd::set_task_captured_from(conn, task, None)?;
         }
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
+    }
+    // Re-file, with the parent resolved above (`""` cleared it to `None`) —
+    // and written **last**, after `captured_from`, the one writer left
+    // whose argument is validated inside its setter: a durable pointer a
+    // consumer cites must not be re-filed by a call that then fails and
+    // reports nothing landed (found on review).
+    if let Some(parent) = parent {
+        if parent.is_none() {
+            // `project: ""` on a task already under nothing is the "no
+            // project is right" acknowledgement, over this surface too.
+            gtd::mark_detachment_reviewed(conn, task)?;
+        }
+        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
     }
 
     // `task_json`, not a second literal. The reason this response echoes

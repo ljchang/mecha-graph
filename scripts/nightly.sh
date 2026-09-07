@@ -120,6 +120,16 @@ fi
 # what decay's alarm is for.
 run "$PKG" invalidate-phantoms
 
+# Survey, never apply: tasks filed under a node that is never a parent —
+# rows from before the write guard, which the board renders as `project_id`
+# for mecha's goal record to cite until somebody looks. The finding lands in
+# this log the way the phantom repair's does; detaching is an operator's
+# `repair-parents --apply`, after reading which filings are plausible.
+# `--text`, because this command answers JSON off a terminal and the log
+# is not one — the other passes print prose unconditionally (found on
+# review).
+run "$PKG" repair-parents --text
+
 # Decay sweep (§11.5): re-derive co-occurrence beliefs against the mentions
 # the linkers just rebuilt, close the collapsed ones (valid time only) and
 # refresh drifted numbers. Capped per run, so a backlog drains gradually and
@@ -229,6 +239,7 @@ alerts=[]
 if h['merge_queue_depth']>10: alerts.append(f\"merge queue {h['merge_queue_depth']}\")
 if h['isolated_pct']>25: alerts.append(f\"isolated {h['isolated_pct']:.0f}%\")
 if h['live_contradictions']>0: alerts.append(f\"{h['live_contradictions']} contradictions\")
+if h.get('unfit_parents',0)>0: alerts.append(f\"{h['unfit_parents']} task(s) under a non-parent\")
 for s in h['ingest_state']:
     if s['stale']: alerts.append(f\"{s['source']} stale\")
 print('; '.join(alerts))

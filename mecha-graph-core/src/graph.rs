@@ -873,7 +873,17 @@ pub fn create_node(conn: &Connection, node_type: &str, name: &str, source: &str)
 /// would keep its old id nowhere, so every fact, mention and rollup pointing
 /// at it would have to be moved, and a partial move is how a repair becomes
 /// a second problem. Changing one column moves nothing.
-pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<(String, String)> {
+/// Returns `(was, now, converted)`: the type moved from and to, and the
+/// conversion record this call wrote — `None` when it did not convert.
+/// The record it wrote, not the record on the node: `converted_task` is
+/// written once and outlives the retype, so a later retype landing on the
+/// same type read it back as its own and reported a board row removed it
+/// had not removed (found on review).
+pub fn retype_node(
+    conn: &Connection,
+    node_id: &str,
+    node_type: &str,
+) -> Result<(String, String, Option<serde_json::Value>)> {
     if !NODE_TYPES.contains(&node_type) {
         return Err(crate::error::Error::Other(format!(
             "node_type '{node_type}' not in closed set {NODE_TYPES:?}"
@@ -890,15 +900,142 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
             node.name
         )));
     }
-    conn.execute(
-        "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
-        params![node_id, node_type],
-    )?;
+    // A parent cannot be turned into something that is never one while
+    // tasks sit under it: the rows would keep their `parent_id`, the board
+    // would render a person under `project` and mint their id as
+    // `project_id` for a consumer to cite, and no call would have been
+    // refused (found on review). Refused rather than detached — the
+    // operator chose the retype and can re-file first.
+    // The other direction: a node that is a task on the board — it has a
+    // `task_detail` row, whatever `nodes.node_type` says — cannot simply be
+    // retyped, because only the type would move and the row would stay:
+    // still on the board, and now a legal parent that the survey cannot
+    // see (found on review, twice: the row is the fact, and a type check
+    // beside it let a row a merge had moved through). But a captured task
+    // that turned out to be a project is a correction the direct interface
+    // exists to serve, and a rule with no exit was one more thing found on
+    // review: so a *finished* task with nothing filed under it converts —
+    // its task row is removed in the same transaction as the type moves,
+    // keeping the id, the facts, the mentions and the `about` edges the
+    // doc above says a drop-and-recreate would lose.
+    let converting_task = node_type != "task" && crate::gtd::is_task(conn, node_id)?;
+    // The reverse is not a retype: a node becomes a task by capture, and a
+    // converted node retyped back to `task` would be a task-typed node on
+    // no board — refused as a parent, invisible to the survey, its row
+    // still only in `converted_task` (found on review).
+    if node_type == "task" && !crate::gtd::is_task(conn, node_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "{} has no row on the board — a node becomes a task by capture, not by retype; \
+             its conversion record, if any, is on the node (`task-project {node_id}`)",
+            node.name
+        )));
+    }
+    if converting_task {
+        let status: String = conn.query_row(
+            "SELECT status FROM task_detail WHERE node_id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        let under = crate::gtd::tasks_under(conn, node_id)?;
+        if !matches!(status.as_str(), "done" | "dropped") || under > 0 {
+            return Err(crate::error::Error::Other(format!(
+                "{} is a task on the board ({status}, {under} task(s) filed under it) — a task \
+                 converts to a {node_type} only once it is done or dropped and nothing sits \
+                 under it; then retype again and the task row is removed with the type",
+                node.name
+            )));
+        }
+    }
+    if crate::gtd::NEVER_A_PARENT.contains(&node_type) {
+        let under = crate::gtd::tasks_under(conn, node_id)?;
+        if under > 0 {
+            return Err(crate::error::Error::Other(format!(
+                "{} has {under} task(s) filed under it, and a {node_type} is never a task's \
+                 parent — re-file them (`task-project`) before retyping",
+                node.name
+            )));
+        }
+    }
+    conn.execute_batch("SAVEPOINT retype_node")?;
+    let moved = (|| -> Result<Option<serde_json::Value>> {
+        let mut wrote = None;
+        if converting_task {
+            // The row is the one thing the conversion does not keep, so it
+            // is kept on the node instead: its status, its completion, and
+            // — as a detachment, since a consumer may have cited it — the
+            // parent it was filed under (found on review).
+            // Every column of the row, by name, so the record is the row —
+            // not three fields of it with the estimate and the context tag
+            // deleted silently (found on review) — and a column added later
+            // is kept without this being told.
+            let mut stmt = conn.prepare("SELECT * FROM task_detail WHERE node_id = ?1")?;
+            let names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+            let mut row_json = serde_json::Map::new();
+            let mut parent_id: Option<String> = None;
+            stmt.query_row(params![node_id], |r| {
+                for (i, name) in names.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(n) => serde_json::Value::from(n),
+                        rusqlite::types::ValueRef::Real(f) => serde_json::Value::from(f),
+                        rusqlite::types::ValueRef::Text(t) => {
+                            serde_json::Value::from(String::from_utf8_lossy(t).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => {
+                            serde_json::Value::from(format!("<{} bytes>", b.len()))
+                        }
+                    };
+                    if name == "parent_id" {
+                        parent_id = v.as_str().map(str::to_string);
+                    }
+                    row_json.insert(name.clone(), v);
+                }
+                Ok(())
+            })?;
+            drop(stmt);
+            // The row nested under its own key, the two synthetic fields
+            // beside it under names no column will carry: written into the
+            // same map, `to`/`at` would win a collision with a column added
+            // later and replace its value silently (found on review).
+            let converted = serde_json::json!({
+                "row": serde_json::Value::Object(row_json),
+                "converted_to": node_type,
+                "converted_at": crate::ids::now(),
+            });
+            conn.execute(
+                "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.converted_task', json(?2)) WHERE id = ?1",
+                params![node_id, converted.to_string()],
+            )?;
+            wrote = Some(converted);
+            if let Some(pid) = parent_id {
+                crate::gtd::record_detachment(conn, node_id, &pid, "retype_node")?;
+            }
+            conn.execute(
+                "DELETE FROM task_detail WHERE node_id = ?1",
+                params![node_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![node_id, node_type],
+        )?;
+        Ok(wrote)
+    })();
+    let converted = match moved {
+        Ok(c) => {
+            conn.execute_batch("RELEASE retype_node")?;
+            c
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO retype_node; RELEASE retype_node");
+            return Err(e);
+        }
+    };
     // The id keeps its old prefix, and that is deliberate. It is an opaque
     // key that every fact, mention and rollup already references; rewriting
     // it to match the new type would mean rewriting all of them to gain a
     // string nobody resolves on.
-    Ok((node.node_type, node_type.to_string()))
+    Ok((node.node_type, node_type.to_string(), converted))
 }
 
 /// Is `name` free for `exclude_id` to take? The public face of
@@ -1421,6 +1558,19 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         .ok_or_else(|| crate::error::Error::Other(format!("no node {keep_id}")))?;
     let dup = get_node(conn, dup_id)?
         .ok_or_else(|| crate::error::Error::Other(format!("no node {dup_id}")))?;
+    // A task cannot be merged into a container: the task row would move
+    // onto the kept node, which would then be a task on the board and — its
+    // type still reading `project` — a legal parent the survey cannot see
+    // (found on review). Refused before anything moves; two tasks merge as
+    // before, and a task may absorb a stray node of another type.
+    if keep.node_type != "task" && crate::gtd::is_task(conn, dup_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "{} is a task on the board and {} is a {} — a task row cannot be merged onto another \
+             node; convert it first (`retype` a done or dropped task with nothing filed under \
+             it) or delete the duplicate task",
+            dup.name, keep.name, keep.node_type
+        )));
+    }
 
     let tx_active = conn.is_autocommit();
     if tx_active {
@@ -1500,10 +1650,25 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
             "DELETE FROM fact WHERE subject_id = ?1 OR object_id = ?1",
             params![dup_id],
         )?;
-        conn.execute(
-            "UPDATE task_detail SET parent_id = ?1 WHERE parent_id = ?2",
-            params![keep_id, dup_id],
-        )?;
+        // Tasks filed under the duplicate follow it onto the kept node —
+        // unless the kept node is something a task can never sit under (a
+        // stray `project` duplicate that turned out to be the person), in
+        // which case they are detached with a record of where they were,
+        // never re-pointed onto a parent the guard would have refused
+        // (found on review).
+        // The row is the fact, as everywhere else: a kept node that is a
+        // task by row and a container by type is not a parent either
+        // (found on review).
+        if crate::gtd::NEVER_A_PARENT.contains(&keep.node_type.as_str())
+            || crate::gtd::is_task(conn, keep_id)?
+        {
+            crate::gtd::detach_tasks_under(conn, dup_id, "merge_nodes")?;
+        } else {
+            conn.execute(
+                "UPDATE task_detail SET parent_id = ?1 WHERE parent_id = ?2",
+                params![keep_id, dup_id],
+            )?;
+        }
         // Facts between keep and dup became self-loops when the endpoints
         // merged ("X and X frequently co-occur") — meaningless, drop them.
         conn.execute(
@@ -1527,7 +1692,6 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         )?;
         // Cascades take mention/alias/identifier leftovers and detail rows.
         conn.execute("DELETE FROM nodes WHERE id = ?1", params![dup_id])?;
-        let _ = keep;
         Ok(())
     })();
 
@@ -2310,8 +2474,9 @@ mod tests {
         .unwrap();
         add_alias(&conn, "topic-obic", "OBIC", "manual").unwrap();
 
-        let (was, now) = retype_node(&conn, "topic-obic", "org").unwrap();
+        let (was, now, converted) = retype_node(&conn, "topic-obic", "org").unwrap();
         assert_eq!((was.as_str(), now.as_str()), ("topic", "org"));
+        assert!(converted.is_none(), "no row, no conversion");
 
         let after = get_node(&conn, "topic-obic").unwrap().unwrap();
         assert_eq!(after.node_type, "org");

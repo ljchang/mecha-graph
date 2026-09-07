@@ -822,6 +822,17 @@ enum Command {
         #[arg(long)]
         remove: Vec<String>,
     },
+    /// Re-file a task under a project (by name or node id), or under none
+    /// with "" — the direct correction channel for a parent the board hands
+    /// out as `project_id`; `repair-parents --apply` detaches, this re-files
+    TaskProject {
+        /// The task's node id, e.g. 'task-1a2b3c4d'
+        task: String,
+        /// The parent — a project, goal, area, topic or org, by name or node
+        /// id; "" clears. Omit to print the current parent and where the
+        /// task was filed before any detachment
+        project: Option<String>,
+    },
     /// Scan task titles for entities the graph already knows, filing matches
     /// as unreviewed (`shadow`) `about` associations. Dry unless --apply
     ScanTasks {
@@ -838,6 +849,18 @@ enum Command {
         /// Actually null the malformed values; omit to survey only
         #[arg(long)]
         apply: bool,
+    },
+    /// Report tasks filed under a node that is never a parent (a person, a
+    /// place, another task…) — rows from before the write guard. Dry unless
+    /// --apply, which detaches them
+    RepairParents {
+        /// Actually detach the tasks; omit to survey only
+        #[arg(long)]
+        apply: bool,
+        /// With --apply, also detach filings the survey marks plausible (a
+        /// place, an event, a recurring series); omitted, those are kept
+        #[arg(long)]
+        include_plausible: bool,
     },
     /// List duplicate-person merge candidates (same full name)
     Dups,
@@ -2315,6 +2338,268 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
             }
         }
+        Command::RepairParents {
+            apply,
+            include_plausible,
+        } => {
+            let report = gtd::repair_unfit_parents_with(&conn, apply, include_plausible)?;
+            if want_json(cli_json, cli_text) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            if report.found.is_empty() && report.pending.is_empty() {
+                println!("no task is filed under a node that is never a parent, and none waits re-filing");
+                return Ok(());
+            }
+            if !report.pending.is_empty() {
+                println!(
+                    "{} task(s) detached earlier and not re-filed since (`task-project <task> <parent>` re-files):",
+                    report.pending.len()
+                );
+                for d in &report.pending {
+                    println!(
+                        "  {}  {}  was under {} ({}) — {} at {}",
+                        d.task_id, d.task_name, d.parent_name, d.parent_id, d.reason, d.at
+                    );
+                }
+            }
+            if report.found.is_empty() {
+                return Ok(());
+            }
+            println!(
+                "{} task(s) filed under a node that is never a parent:",
+                report.found.len()
+            );
+            for u in &report.found {
+                println!(
+                    "  {}  {}  -> {} ({}, {}){}",
+                    u.task_id,
+                    u.task_name,
+                    u.parent_name,
+                    u.parent_type,
+                    u.parent_id,
+                    // The one thing the survey knows that the reader must
+                    // weigh before --apply: a filing that was legal and may
+                    // have been meant, or a slip.
+                    match (u.plausible, apply, u.detached) {
+                        (true, true, false) if !include_plausible => {
+                            "  — kept: plausible under the old rule; --include-plausible detaches it"
+                        }
+                        (_, true, false) => {
+                            "  — NOT detached: re-filed since the survey's read; run again"
+                        }
+                        // The survey reflects the flag it was given, so a dry
+                        // run of the wider apply reads as one (found on
+                        // review: the flag was a silent no-op without --apply).
+                        (true, false, _) if include_plausible => {
+                            "  — plausible under the old rule; --apply --include-plausible WOULD \
+                             detach it"
+                        }
+                        (true, false, _) => {
+                            "  — plausible under the old rule; re-file, or `task-project <task> \
+                             <this parent's id>` to say it was meant"
+                        }
+                        (true, true, true) => {
+                            "  — was plausible under the old rule; `task-project` can re-file it \
+                             from the record"
+                        }
+                        (false, _, _) => "",
+                    }
+                );
+            }
+            if apply {
+                println!(
+                    "detached {} — re-file with `mecha-graph task-project <task> <project>`",
+                    report.detached
+                );
+            } else if include_plausible {
+                println!("survey only; --apply --include-plausible detaches every row above");
+            } else {
+                println!("survey only; --apply detaches the slips (--include-plausible the rest)");
+            }
+        }
+        Command::TaskProject { task, project } => {
+            let Some(project) = project else {
+                // The reader for the record the detach writes: the store
+                // remembers, and this is where it says so (found on
+                // review — written and read by nothing). JSON too, like
+                // `repair-parents`: the history is the store's only record
+                // of where a task was filed, and prose is not a record.
+                // A node that was a task and converted is off the board,
+                // and this is the reader for what its row held too (found
+                // on review — the conversion's records had none).
+                let Some(t) = gtd::get_task(&conn, &task)? else {
+                    let node = graph::get_node(&conn, &task)?
+                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                    let converted = node.properties.get("converted_task").cloned();
+                    let history = node.properties.get("detached_parents").cloned();
+                    // Either record makes the node readable here: a task
+                    // row removed by a redact or by hand leaves the
+                    // history behind, and this is its only reader — it
+                    // used to answer "never was one" over a node that
+                    // carried one (found on review).
+                    if converted.is_none() && history.is_none() {
+                        return Err(mecha_graph_core::Error::Other(format!(
+                            "{task} is not a task on the board, and never was one"
+                        )));
+                    }
+                    if want_json(cli_json, cli_text) {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "task": node.id, "name": node.name, "node_type": node.node_type,
+                                "converted_task": converted,
+                                "detached_parents": history.unwrap_or(serde_json::Value::Array(vec![])),
+                            }))?
+                        );
+                        return Ok(());
+                    }
+                    match converted {
+                        Some(c) => println!(
+                            "{} — now a {}; was a task ({}, completed {}) filed under {}, converted {}",
+                            node.name,
+                            node.node_type,
+                            c["row"]["status"].as_str().unwrap_or("?"),
+                            c["row"]["completed_at"].as_str().unwrap_or("never"),
+                            c["row"]["parent_id"].as_str().unwrap_or("no project"),
+                            c["converted_at"].as_str().unwrap_or("?")
+                        ),
+                        None => println!(
+                            "{} — a {}, not a task on the board; its row is gone, the filing history stays:",
+                            node.name, node.node_type
+                        ),
+                    }
+                    if let Some(h) = history.as_ref().and_then(|h| h.as_array()) {
+                        for r in h {
+                            println!(
+                                "  was under {} ({}, {}) — detached {} by {}",
+                                r["name"].as_str().unwrap_or("?"),
+                                r["type"].as_str().unwrap_or("?"),
+                                r["id"].as_str().unwrap_or("?"),
+                                r["at"].as_str().unwrap_or("?"),
+                                r["reason"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                    return Ok(());
+                };
+                if want_json(cli_json, cli_text) {
+                    let node = graph::get_node(&conn, &task)?
+                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                    // The raw column beside the joined pair, so a parent
+                    // whose node row is gone is visible here too — the
+                    // JSON branch is the default off a terminal, and it
+                    // used to read as no parent (found on review).
+                    let raw: Option<String> = conn.query_row(
+                        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+                        mecha_graph_core::rusqlite::params![task],
+                        |r| r.get(0),
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "task": t.node_id, "name": t.name,
+                            "project": t.project, "project_id": t.project_id,
+                            "parent_id": raw,
+                            "detached_parents": node.properties.get("detached_parents")
+                                .cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                        }))?
+                    );
+                    return Ok(());
+                }
+                match (&t.project, &t.project_id) {
+                    (Some(name), Some(id)) => println!("{} — filed under {name} ({id})", t.name),
+                    _ => {
+                        // The raw column, because the join hides a parent
+                        // whose node row is gone — the one state the
+                        // correction channel exists to make visible (found
+                        // on review).
+                        let raw: Option<String> = conn.query_row(
+                            "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+                            mecha_graph_core::rusqlite::params![task],
+                            |r| r.get(0),
+                        )?;
+                        match raw {
+                            Some(id) => println!(
+                                "{} — filed under {id} ({}) — `repair-parents` sees it",
+                                t.name,
+                                gtd::MISSING_PARENT
+                            ),
+                            None => println!("{} — filed under no project", t.name),
+                        }
+                    }
+                }
+                let node = graph::get_node(&conn, &task)?
+                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                if let Some(history) = node.properties["detached_parents"].as_array() {
+                    for h in history {
+                        println!(
+                            "  was under {} ({}, {}) — detached {} by {}",
+                            h["name"].as_str().unwrap_or("?"),
+                            h["type"].as_str().unwrap_or("?"),
+                            h["id"].as_str().unwrap_or("?"),
+                            h["at"].as_str().unwrap_or("?"),
+                            h["reason"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
+                return Ok(());
+            };
+            let parent = gtd::set_task_project(&conn, &task, &project)?;
+            let t = gtd::get_task(&conn, &task)?
+                .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+            // A vouch the writer refused (a slip is a slip whoever vouches)
+            // must not report as one that took (found on review).
+            let vouched = gtd::vouch_stands(&conn, &task)?;
+            // Re-filing under the parent a task already has is the vouch
+            // gesture, and one the writer declined is worth a line — but
+            // only where there was something to vouch for. On a task filed
+            // under a project it is a confirmation of a correct filing, and
+            // it printed as a failure (found on review). The survey itself
+            // decides, not a re-derivation of its predicate.
+            let on_survey = parent.as_deref() == Some(project.trim())
+                && !vouched
+                && gtd::repair_unfit_parents(&conn, false)?
+                    .found
+                    .iter()
+                    .any(|u| u.task_id == t.node_id);
+            // JSON here too — the write is the call a script most needs to
+            // confirm, and JSON is the default off a terminal (found on
+            // review).
+            if want_json(cli_json, cli_text) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "task": t.node_id, "name": t.name,
+                        "project": t.project, "project_id": t.project_id,
+                        "vouched": vouched,
+                    }))?
+                );
+                return Ok(());
+            }
+            match parent {
+                Some(parent) => println!(
+                    "{} — filed under {} ({parent}){}",
+                    t.name,
+                    t.project.as_deref().unwrap_or("?"),
+                    // Off `vouched` and the survey, never a re-derivation
+                    // of the writer's predicate: a vouch attempt is a
+                    // re-file to the parent the task already had, and one
+                    // that came back without the mark did not take,
+                    // whatever the reason — a slip, a task by row, a parent
+                    // whose node row is gone (found on review).
+                    if vouched {
+                        " — vouched for; off the survey"
+                    } else if on_survey {
+                        " — no vouch written: only a plausible old filing (a place, an event, a \
+                         series) with its node present can be vouched for"
+                    } else {
+                        ""
+                    }
+                ),
+                None => println!("{} — filed under no project", t.name),
+            }
+        }
         Command::TaskAbout { task, add, remove } => {
             // The direct interface is the unmediated correction channel and
             // the audit surface for autonomy (ARCHITECTURE). `scan-tasks
@@ -2853,8 +3138,25 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Retype { target, node_type } => {
             let id = resolve_one(&conn, &target)?;
-            let (was, now) = graph::retype_node(&conn, &id, &node_type)?;
+            let (was, now, converted) = graph::retype_node(&conn, &id, &node_type)?;
             println!("{id}: {was} → {now}");
+            // The one retype that shrinks the board says so: a done task
+            // converted to a container had its row removed and, if it was
+            // filed somewhere, a detachment recorded (found on review — the
+            // line above was the whole output).
+            // Gated on the record this call returned, not on the old type
+            // and not on the node's `converted_task`: the conversion is
+            // decided by the row, and the node's record outlives the retype
+            // that wrote it, so a later retype onto the same type read it
+            // back as its own (found on review, twice).
+            if let Some(c) = converted {
+                println!(
+                    "  board row removed (was {}, filed under {}); the row is kept on the \
+                     node — `task-project {id}` reads it",
+                    c["row"]["status"].as_str().unwrap_or("?"),
+                    c["row"]["parent_id"].as_str().unwrap_or("no project")
+                );
+            }
         }
 
         Command::NewNode { node_type, name } => {
@@ -3451,15 +3753,22 @@ reject: it was never true (retracted; the class learns)"
             for id in &r.placeholders_orphaned {
                 println!("  placeholder {id}  →  names no live node, LEFT ALONE");
             }
+            for id in &r.placeholders_skipped {
+                println!(
+                    "  placeholder {id}  →  is a task on the board, SKIPPED (a task row cannot \
+                     be merged into a container; re-file or rename it by hand)"
+                );
+            }
             for id in &r.unresolvable {
                 println!("  candidate #{id}  →  names no live node, still pending");
             }
             println!(
-                "\n{} placeholder node(s) {}merged · {} orphaned\n\
+                "\n{} placeholder node(s) {}merged · {} orphaned · {} skipped (tasks)\n\
                  {} of {} pending candidate(s) {}rewritten to names · {} unresolvable",
                 r.placeholders_merged.len(),
                 if dry_run { "would be " } else { "" },
                 r.placeholders_orphaned.len(),
+                r.placeholders_skipped.len(),
                 r.payloads_repaired,
                 r.candidates_scanned,
                 if dry_run { "would be " } else { "" },

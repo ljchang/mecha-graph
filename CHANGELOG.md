@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A task row carries its parent project's node id beside the name.**
+  `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
+  `project_id`, absent exactly when `project` is — the create echo now
+  carries the whole row under `task` through the same renderer as the
+  update echo, beside the top-level keys callers already read. And
+  `kg_task_create` accepts that id back as `project`: a pointer the server
+  hands out is one it accepts, so a consumer filing a task under the
+  project it just read is not refused for citing what it was told to cite.
+  With the id path, the name path tightened to match: a name matching
+  several nodes is refused with their ids rather than resolved by access
+  count (`validate_about_target`'s rule — the guess now minted a citable
+  pointer), and a task, person, agent, place, event, event_series, document or
+  artifact is never a parent, whichever way it was named. A parent can now be
+  corrected — `kg_task_update` takes `project` (`""` clears), resolved
+  exactly as capture resolves it — because a pointer another repo cites
+  must have a correction path that keeps the task's id; and
+  `mecha-graph repair-parents` surveys the rows written before the guard
+  (a task filed under a person, say), detaching them only with `--apply`
+  — `stats` and the nightly's alert line count the slips alone, since
+  the plausible ones are kept, and `task-project <task> <its parent's id>`
+  says a plausible filing was meant (the vouch names that parent, lapses
+  if the parent changes or is retyped or its row is deleted — a vouch
+  reads as standing only where the survey honours it, and a declined
+  vouch takes a stale mark with it — and is never inferred from an
+  MCP update that echoes the row it read) and takes it off the
+  survey —
+  and `mecha-graph task-project` re-files one from the direct interface
+  (the survey's JSON echoes both of its flags, `applied` and
+  `include_plausible`);
+  it also finds a parent whose node is gone (reported as `missing`), and
+  a task on the board cannot be retyped into anything, nor merged into
+  a container — only the type would move, or the row would land on a
+  project, and the task would be a legal parent the survey could not
+  see — except that a finished task with nothing under it *converts*:
+  `retype` removes its task row with the type, keeping the id, the facts
+  and the associations a drop-and-recreate would lose, and keeps the whole
+  row it removes on the node (`properties.converted_task`, every column,
+  plus a detachment record for the parent it was filed under). A parent name is resolved
+  over every container that matches it — exact name or alias, then
+  substring, with no limit — so a second container cannot hide outside
+  a window and task titles cannot fill one. `project_id` comes from the same join as `project`, so a parent
+  whose node row is gone is handed out by neither. A parent argument
+  that is a node id resolves to that node before any name, so the id
+  the board hands out always comes back to the same node. Everywhere the
+  rule is applied, the row is the fact: a node that is on the board is a
+  task whatever its type says, and is never a parent — to the resolver,
+  the id writer, the merge, or the survey. `mecha-graph task-project <task>` with no
+  parent prints the current one and every detachment the store recorded;
+  the survey's text output says which filings are plausible; `--apply`
+  runs as one transaction, recording a detachment only where it landed,
+  and keeps the plausible filings unless `--include-plausible`;
+  and the survey also lists every task detached earlier — by an apply or
+  a merge; a converted node has no task row and is read by `task-project`
+  — and not re-filed since, so a merge's silent detach stays reviewable
+  as a set; the JSON report echoes the flag it was computed under and
+  says per row whether the apply it previews would detach it; `task-project <task> ""` on a task
+  already under nothing marks its record reviewed ("no project is
+  right"), so the list is not a standing pile, and a finished task is
+  not on it; a deliberate re-file or
+  clear records the parent it leaves, reviewed; a task node keeps its
+  twenty newest records. On `kg_task_update`, a
+  list or number where a string belongs refuses the call rather than
+  skipping the field and answering `updated`, and on `kg_task_create` a
+  non-string `due` or `context` refuses the create. A filing under a single
+  event is plausible like one under a series. `task-project <task>` reads a
+  converted node's record too. On `kg_task_update` the parent is resolved before anything is
+  written, and so are the dates and `waiting_on`, so a refused one changes
+  nothing — not a status that already landed. A name shared with a node
+  that could never be a parent is not ambiguous: the container of that
+  name is the parent.
+  A refused `captured_from` refuses `kg_task_create` before the insert,
+  where it used to leave a task the error said was never created.
+  The rule binds every writer of a parent, not only the resolver: the
+  id writer re-checks what it is handed, `retype` refuses to turn a
+  parent into a non-container while tasks sit under it, `merge` detaches
+  rather than re-points onto one, and a detached task keeps where it was
+  on its own node (appended to `properties.detached_parents`) so the record is in the
+  store rather than a terminal. The survey marks a filing under a place
+  or a recurring event `plausible` — legal under the old rule — apart
+  from a slip under a person, the agent or another task. `NEVER_A_PARENT`
+  and `CONTAINER_TYPES` partition the closed type set, held by a test. The name is prose (spaces,
+  and two nodes can share one); a consumer recording *which* project a task
+  served cites `project:<node id>` and refuses whitespace in an id, so the
+  name alone could never be cited. mecha's goal record is that consumer.
+
 ## [0.1.5] - 2026-09-06
 
 ### Added
