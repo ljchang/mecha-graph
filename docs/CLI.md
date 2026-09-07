@@ -84,7 +84,7 @@ contradictions and near-duplicates, and unresolvable subjects.
 | `probe-targets` | Rank entities by demand × slot-gaps × staleness (SQL only). Feeds the gossip harness. |
 | `recompute-confidence` | Re-derive stored confidence from the observation history. |
 | `invalidate-phantoms` | One-shot repair: retract co-occurrence beliefs with zero remaining support. |
-| `repair-parents` | Survey tasks filed under a node that is never a parent (a person, the agent, a place, another task, a parent whose row is gone); `--apply` detaches them, recording where each was on the task node. Nightly as a survey; `stats` counts them. |
+| `repair-parents` | Survey tasks filed under a node that is never a parent (a person, the agent, a place, another task, a parent whose row is gone), marking a filing under a place or an event *plausible*, and list tasks detached earlier and not re-filed. `--apply` detaches the slips, recording where each was on the task node, and keeps the plausible ones unless `--include-plausible`. Nightly as a survey; `stats` alerts on the slips. |
 | `task-project <task> [<parent>]` | Re-file a task under a container by name or node id, clear its parent with `""`, or with no parent print where it is filed and every detachment recorded on it. |
 | `backfill-derivation` | Retrofit provenance onto derived facts written before derived-fact provenance existed. |
 | `tombstone` | Deletion tombstones — what re-ingest is blocked from resurrecting; `tombstone rm` lifts one. |

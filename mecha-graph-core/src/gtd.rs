@@ -879,12 +879,21 @@ pub struct ParentRepairReport {
     pub pending: Vec<DetachedPending>,
 }
 
-/// The survey's own predicate as one count, for `stats::health` — which
+/// The survey's *slips* as one count, for `stats::health` — which
 /// refreshes on every TUI stats pane and wants the alert, not the rows,
 /// and not the JSON walk `detached_pending` does over every task node
-/// (found on review).
+/// (found on review). Slips only: a filing the survey marks plausible
+/// (a place, an event, a series) is one `--apply` keeps by design, so
+/// counting it here made an alert the command it names could never clear
+/// (found on review — the standing pile, one surface over). The survey
+/// still lists the plausible ones.
 pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
     let placeholders = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plausible = PLAUSIBLE_OLD_PARENTS
         .iter()
         .map(|t| format!("'{t}'"))
         .collect::<Vec<_>>()
@@ -896,7 +905,8 @@ pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
              WHERE td.parent_id IS NOT NULL
                AND (p.id IS NULL
                     OR p.node_type IN ({placeholders})
-                    OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))"
+                    OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
+               AND COALESCE(p.node_type, '') NOT IN ({plausible})"
         ),
         [],
         |r| r.get(0),

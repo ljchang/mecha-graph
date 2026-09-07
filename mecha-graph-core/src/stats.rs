@@ -19,12 +19,14 @@ pub struct HealthStats {
     pub merge_queue_depth: i64,
     /// >1 live fact on same (subject, predicate) — usually a missed supersession.
     pub live_contradictions: i64,
-    /// Tasks filed under a node that is never a parent — a person, the
-    /// agent, a place, another task, a parent whose row is gone — rows
-    /// from before the write guard, which the board goes on rendering as
-    /// `project_id` for a consumer to cite until `repair-parents` runs
-    /// (found on review: the guard binds new writes only, and nothing
-    /// reported the old rows).
+    /// Tasks filed under a node that is never a parent and is not a
+    /// plausible old filing — a person, the agent, another task, a parent
+    /// whose row is gone — rows from before the write guard, which the
+    /// board goes on rendering as `project_id` for a consumer to cite
+    /// until `repair-parents --apply` runs (found on review: the guard
+    /// binds new writes only, and nothing reported the old rows). The
+    /// plausible ones the survey lists and `--apply` keeps are not counted:
+    /// an alert its remedy cannot clear is a standing pile.
     pub unfit_parents: i64,
     /// Facts asserted only by LLM extraction, never corroborated (§11.5).
     pub llm_only_facts: i64,
