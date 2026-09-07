@@ -3267,6 +3267,21 @@ mod tests {
             "a building was a legal filing under the old rule"
         );
         assert!(!by_id(&b), "a person never was");
+        // The survey says what the apply it previews would do, under the
+        // flag it was given.
+        let row = |id: &str| {
+            survey
+                .found
+                .iter()
+                .find(|u| u.task_id == id)
+                .unwrap()
+                .would_detach
+        };
+        assert!(!row(&a) && row(&b));
+        assert!(!survey.include_plausible);
+        let wider = repair_unfit_parents_with(&conn, false, true).unwrap();
+        assert!(wider.include_plausible);
+        assert!(wider.found.iter().all(|u| u.would_detach));
         // The health count is the slips: the plausible filing is not an
         // alert the command it names could never clear.
         assert_eq!(unfit_parent_count(&conn).unwrap(), 1);
