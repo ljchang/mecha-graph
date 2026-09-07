@@ -789,19 +789,29 @@ pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Resu
     require_task(conn, node_id)?;
     let parent_id = resolve_project_arg(conn, project)?;
     if parent_id.is_none() {
-        // Clearing a parent that is already clear is the operator saying
-        // "no project is right" about a detachment: mark the last record
-        // reviewed, so it leaves the pending list while staying a record.
-        conn.execute(
-            "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
-             WHERE id = ?1
-               AND json_extract(properties, '$.detached_parents') IS NOT NULL
-               AND (SELECT parent_id FROM task_detail WHERE node_id = ?1) IS NULL",
-            params![node_id],
-        )?;
+        mark_detachment_reviewed(conn, node_id)?;
     }
     set_task_parent_id(conn, node_id, parent_id.as_deref())?;
     Ok(parent_id)
+}
+
+/// Clearing a parent that is already clear is the operator — or the agent,
+/// over `kg_task_update` — saying "no project is right" about a
+/// detachment: the last record is marked reviewed, so the task leaves the
+/// pending list while the record stays. A no-op on a task with a parent
+/// or with no record. Public because the MCP update writes the parent
+/// through `set_task_parent_id` after its pre-flight and needs the same
+/// mark, or the pile was drainable from the terminal alone (found on
+/// review).
+pub fn mark_detachment_reviewed(conn: &Connection, node_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+         WHERE id = ?1
+           AND json_extract(properties, '$.detached_parents') IS NOT NULL
+           AND (SELECT parent_id FROM task_detail WHERE node_id = ?1) IS NULL",
+        params![node_id],
+    )?;
+    Ok(())
 }
 
 /// A task whose parent is a node type that is never a parent — written

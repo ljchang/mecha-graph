@@ -1740,6 +1740,26 @@ mod tests {
         assert_eq!(moved["task"]["project_id"], "proj-tide");
         assert!(kg_task_update(&conn, &json!({ "task": id, "project": id })).is_err());
 
+        // Clearing an already-clear parent over MCP marks a detachment
+        // record reviewed, so the pending pile drains from this surface too.
+        upsert_node(&conn, &Node::new("p-nadia", "person", "Nadia")).unwrap();
+        let t = kg_task_create(&conn, &json!({ "name": "For Nadia" })).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-nadia' WHERE node_id = ?1",
+            mecha_graph_core::rusqlite::params![t],
+        )
+        .unwrap();
+        assert_eq!(gtd::repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(gtd::detached_pending(&conn).unwrap().len(), 1);
+        kg_task_update(&conn, &json!({ "task": t, "project": "" })).unwrap();
+        assert!(
+            gtd::detached_pending(&conn).unwrap().is_empty(),
+            "reviewed over MCP"
+        );
+
         // A refused provenance pointer creates nothing: the board is the
         // same size after the call as before, so a caller told "no task
         // was created" can retry without staging a duplicate.
@@ -2575,6 +2595,11 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // consumer cites must not be re-filed by a call that then fails and
     // reports nothing landed (found on review).
     if let Some(parent) = parent {
+        if parent.is_none() {
+            // `project: ""` on a task already under nothing is the "no
+            // project is right" acknowledgement, over this surface too.
+            gtd::mark_detachment_reviewed(conn, task)?;
+        }
         gtd::set_task_parent_id(conn, task, parent.as_deref())?;
     }
 
