@@ -571,8 +571,10 @@ pub fn parse_due(input: &str) -> Result<Option<String>> {
 }
 
 /// Create a task by hand (TUI `a` / manual capture). `project` resolves
-/// against the graph (project/topic node); unknown names are an error rather
-/// than an implicit node — typo protection.
+/// against the graph by name, alias or node id; unknown names are an error
+/// rather than an implicit node — typo protection — an ambiguous name is
+/// refused rather than guessed, and a task, person, event, document or
+/// artifact is not a parent.
 pub fn create_task(
     conn: &Connection,
     name: &str,
@@ -584,39 +586,8 @@ pub fn create_task(
     if name.is_empty() {
         return Err(Error::Other("task needs a name".into()));
     }
-    // By name or alias first, then by node id: the board hands out
-    // `project_id` beside the name, and a pointer a server hands out must
-    // be one it accepts back — a consumer filing a task under the project
-    // it just read would otherwise be refused for citing the id it was
-    // told to cite (found on review). Names first, as `resolve_about`
-    // orders it: a name is what a caller normally has, and an id shaped
-    // like a name is not a thing here.
     let parent_id = match project_name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => {
-            let node = match crate::graph::resolve_entity(conn, p)? {
-                Some(node) => node,
-                None => match crate::graph::get_node(conn, p)? {
-                    Some(node) => node,
-                    None => return Err(Error::Other(format!("no node matches project '{p}'"))),
-                },
-            };
-            // A task is not a parent, whichever tier found it: the id path
-            // accepts every node id the server hands out, and a board row
-            // carries the task's own id beside its `project_id` — the
-            // confusion two adjacent id fields invite — so without this a
-            // follow-up filed under `task-…` would render as a project and
-            // the goal record would cite a task as one (found on review;
-            // `validate_about_target`'s rule, one field over). The type
-            // check covers the name path too.
-            if node.node_type == "task" {
-                return Err(Error::Other(format!(
-                    "'{}' is a task, not a project — a task's parent is a project or topic \
-                     node, by name or node id",
-                    node.name
-                )));
-            }
-            Some(node.id)
-        }
+        Some(p) => Some(resolve_parent(conn, p)?.id),
         None => None,
     };
     let task_id = format!("task-{}", &crate::ids::new_uid()[..8]);
@@ -634,6 +605,68 @@ pub fn create_task(
         ],
     )?;
     Ok(task_id)
+}
+
+/// Node types that are never a task's parent. Not a whitelist: `project`,
+/// `goal`, `area`, `topic` and the rest are containers a task can sit under,
+/// and the set is open at that end. What is closed is the other end — a
+/// node that is itself a unit of work, a person, or a record of something
+/// that happened is not a container, and filing a task under one renders
+/// it on the board as a project and hands a consumer `project_id` to cite
+/// (found on review, twice: a task's own id sits beside its `project_id`
+/// on every row, and a person's name resolves like any other).
+const NEVER_A_PARENT: &[&str] = &[
+    "task",
+    "person",
+    "event",
+    "event_series",
+    "document",
+    "artifact",
+];
+
+/// The project a task is filed under, from a name, alias or node id.
+///
+/// Names first, then the id, as `resolve_about` orders it: a name is what a
+/// caller normally has, and an id shaped like a name is not a thing here.
+/// The board hands out `project_id` beside the name, and a pointer a server
+/// hands out must be one it accepts back — a consumer filing a task under
+/// the project it just read would otherwise be refused for citing the id it
+/// was told to cite. **Ambiguity is surfaced, never resolved by sort
+/// order**, `validate_about_target`'s rule: `resolve_entity` takes the
+/// first of several matches by access count, so two projects sharing a
+/// name meant whichever was busier, silently — and since the echo now
+/// mints `project_id` from that guess and another repo's goal record cites
+/// it, the guess became a durable pointer (found on review). Now that the
+/// id path exists, "name the id instead" is advice the caller can follow.
+fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
+    let matches = crate::graph::resolve_entity_all(conn, what)?;
+    let node = match matches.len() {
+        1 => matches.into_iter().next().expect("one match"),
+        0 => match crate::graph::get_node(conn, what)? {
+            Some(node) => node,
+            None => return Err(Error::Other(format!("no node matches project '{what}'"))),
+        },
+        n => {
+            let names: Vec<String> = matches
+                .iter()
+                .map(|n| format!("{} ({})", n.name, n.id))
+                .collect();
+            return Err(Error::Other(format!(
+                "'{what}' matches {n} nodes — name the id instead, since a task's parent is \
+                 durable and echoed as `project_id`: {}",
+                names.join(", ")
+            )));
+        }
+    };
+    if NEVER_A_PARENT.contains(&node.node_type.as_str()) {
+        return Err(Error::Other(format!(
+            "'{}' is a {}, not a container — a task's parent is a project, goal, area or \
+             topic node (never a task, person, event, document or artifact), by name or \
+             node id",
+            node.name, node.node_type
+        )));
+    }
+    Ok(node)
 }
 
 /// Edit scheduling fields on an existing task (TUI `e`). `Some("")` clears a
@@ -1791,10 +1824,67 @@ mod tests {
         // refused rather than rendered as a project.
         let e = create_task(&conn, "Under a task", None, Some(&by_id.node_id), None)
             .expect_err("a task id as a parent is refused");
-        assert!(e.to_string().contains("is a task, not a project"), "{e}");
+        assert!(e.to_string().contains("is a task, not a container"), "{e}");
         let e = create_task(&conn, "Under a task", None, Some("Write it up"), None)
             .expect_err("a task name as a parent is refused");
-        assert!(e.to_string().contains("is a task, not a project"), "{e}");
+        assert!(e.to_string().contains("is a task, not a container"), "{e}");
+        // Nor is a person, an event, a document or an artifact — the same
+        // mis-citation from another type.
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let e = create_task(&conn, "Send the figures", None, Some("Wren"), None)
+            .expect_err("a person as a parent is refused");
+        assert!(
+            e.to_string().contains("is a person, not a container"),
+            "{e}"
+        );
+        // A goal or an area is a container, and stays one.
+        upsert_node(&conn, &Node::new("goal-tenure", "goal", "Tenure")).unwrap();
+        let under_goal = create_task(&conn, "Publish", None, Some("goal-tenure"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &under_goal)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("goal-tenure")
+        );
+    }
+
+    /// Ambiguity is surfaced, never resolved by sort order: two projects
+    /// sharing a name are refused with both ids, and either id is accepted.
+    #[test]
+    fn an_ambiguous_project_name_is_refused_and_the_id_names_one() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-r01", "project", "R01 renewal")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-r01s", "project", "R01 renewal supplement"),
+        )
+        .unwrap();
+        let e = create_task(&conn, "Draft the aims", None, Some("renewal"), None)
+            .expect_err("a name matching two projects is refused");
+        let msg = e.to_string();
+        assert!(msg.contains("matches 2 nodes"), "{msg}");
+        assert!(
+            msg.contains("proj-r01") && msg.contains("proj-r01s"),
+            "{msg}"
+        );
+        let ok = create_task(&conn, "Draft the aims", None, Some("proj-r01s"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &ok).unwrap().unwrap().project_id.as_deref(),
+            Some("proj-r01s")
+        );
+        // An exact name still resolves alone even though it is a prefix of
+        // the other: tier one is the exact canonical match.
+        let exact = create_task(&conn, "Budget", None, Some("R01 renewal"), None).unwrap();
+        assert_eq!(
+            get_task(&conn, &exact)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("proj-r01")
+        );
     }
 
     #[test]
