@@ -1147,7 +1147,10 @@ pub fn set_task_captured_from(
         Some(n) => n,
         None => return Err(Error::Other(format!("{node_id} is not a node"))),
     };
-    if node.node_type != "task" {
+    // The row is the fact, as every other mutator reads it: refusing on
+    // the type here was the last writer that could refuse after a status
+    // had landed (found on review).
+    if !is_task(conn, node_id)? {
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     match captured_from {

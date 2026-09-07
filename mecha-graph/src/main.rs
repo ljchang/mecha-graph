@@ -3595,6 +3595,12 @@ reject: it was never true (retracted; the class learns)"
             for id in &r.placeholders_orphaned {
                 println!("  placeholder {id}  →  names no live node, LEFT ALONE");
             }
+            for id in &r.placeholders_skipped {
+                println!(
+                    "  placeholder {id}  →  is a task on the board, SKIPPED (a task row cannot \
+                     be merged into a container; re-file or rename it by hand)"
+                );
+            }
             for id in &r.unresolvable {
                 println!("  candidate #{id}  →  names no live node, still pending");
             }
