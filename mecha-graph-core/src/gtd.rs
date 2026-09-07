@@ -653,6 +653,17 @@ pub const NEVER_A_PARENT: &[&str] = &[
 /// silent admission.
 pub const CONTAINER_TYPES: &[&str] = &["org", "project", "goal", "area", "topic"];
 
+/// Whether `node_id` has a row on the board — a `task_detail` row — which
+/// is what makes it a task regardless of what `nodes.node_type` says.
+pub fn is_task(conn: &Connection, node_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// How many tasks are filed under `node_id`.
 pub fn tasks_under(conn: &Connection, node_id: &str) -> Result<usize> {
     let n: i64 = conn.query_row(
@@ -744,6 +755,13 @@ pub struct UnfitParent {
     pub plausible: bool,
 }
 
+/// The parent type the survey reports for a `parent_id` whose node row is
+/// gone — a store attached with foreign keys off can carry one, and the
+/// board hands the raw column out as `project_id` beside a `project` of
+/// null, a pointer the resolver would refuse if cited back (found on
+/// review). Not a node type; a word the survey owns.
+pub const MISSING_PARENT: &str = "missing";
+
 /// The types of `NEVER_A_PARENT` that were reachable parents before the
 /// guard and read as deliberate filings rather than slips.
 const PLAUSIBLE_OLD_PARENTS: &[&str] = &["place", "event_series"];
@@ -774,22 +792,29 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
     // The type list is a private `const` of string literals interpolated
     // because SQLite has no array parameter — never caller input.
     let sql = format!(
-        "SELECT td.node_id, n.name, p.id, p.name, p.node_type
+        // LEFT JOIN, so a parent whose node row is gone is found rather than
+        // dropped — `detach_tasks_under` defends the same case, and a survey
+        // blind to it would print "nothing to fix" over a board still
+        // handing the orphan out as `project_id`.
+        "SELECT td.node_id, n.name, td.parent_id, p.name, p.node_type
          FROM task_detail td
          JOIN nodes n ON n.id = td.node_id
-         JOIN nodes p ON p.id = td.parent_id
-         WHERE p.node_type IN ({placeholders})
+         LEFT JOIN nodes p ON p.id = td.parent_id
+         WHERE td.parent_id IS NOT NULL
+           AND (p.id IS NULL OR p.node_type IN ({placeholders}))
          ORDER BY td.node_id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let found: Vec<UnfitParent> = stmt
         .query_map([], |r| {
-            let parent_type: String = r.get(4)?;
+            let parent_type: String = r
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| MISSING_PARENT.to_string());
             Ok(UnfitParent {
                 task_id: r.get(0)?,
                 task_name: r.get(1)?,
                 parent_id: r.get(2)?,
-                parent_name: r.get(3)?,
+                parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 plausible: PLAUSIBLE_OLD_PARENTS.contains(&parent_type.as_str()),
                 parent_type,
             })
@@ -2326,6 +2351,40 @@ mod tests {
                 .len(),
             2
         );
+        // And the survey sees an orphan parent too, and detaches it on apply.
+        upsert_node(&conn, &Node::new("proj-gone2", "project", "Gone")).unwrap();
+        set_task_project(&conn, &t, "proj-gone2").unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'proj-gone2'", [])
+            .unwrap();
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
+        assert_eq!(survey.found[0].parent_id, "proj-gone2");
+        assert_eq!(survey.found[0].parent_type, MISSING_PARENT);
+        assert!(!survey.found[0].plausible);
+        assert_eq!(repair_unfit_parents(&conn, true).unwrap().detached, 1);
+        assert_eq!(get_task(&conn, &t).unwrap().unwrap().project_id, None);
+    }
+
+    /// A task on the board cannot be retyped into anything: only the type
+    /// would move and the row would stay, a task that is now a legal parent
+    /// the survey cannot see.
+    #[test]
+    fn a_task_on_the_board_cannot_be_retyped_into_a_container() {
+        let conn = open_memory().unwrap();
+        let t = create_task(&conn, "Ship the pilot", None, None, None).unwrap();
+        let e = crate::graph::retype_node(&conn, &t, "project")
+            .expect_err("a task row cannot become a project");
+        assert!(e.to_string().contains("is a task on the board"), "{e}");
+        assert!(crate::graph::retype_node(&conn, &t, "topic").is_err());
+        assert_eq!(
+            crate::graph::get_node(&conn, &t)
+                .unwrap()
+                .unwrap()
+                .node_type,
+            "task"
+        );
+        // And so it can never be cited as a parent.
+        assert!(create_task(&conn, "Child", None, Some(&t), None).is_err());
     }
 
     /// A survey tells a plausible old filing from a slip.

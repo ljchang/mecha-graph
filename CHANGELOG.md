@@ -27,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must have a correction path that keeps the task's id; and
   `mecha-graph repair-parents` surveys the rows written before the guard
   (a task filed under a person, say), detaching them only with `--apply`,
-  and `mecha-graph task-project` re-files one from the direct interface.
+  and `mecha-graph task-project` re-files one from the direct interface;
+  it also finds a parent whose node is gone (reported as `missing`), and
+  a task on the board cannot be retyped into anything — only the type
+  would move, the row would stay, and the task would be a legal parent
+  the survey could not see.
   On `kg_task_update` the parent is resolved before anything is written,
   so a refused one changes nothing — not a status that already landed.
   A refused `captured_from` refuses `kg_task_create` before the insert,
