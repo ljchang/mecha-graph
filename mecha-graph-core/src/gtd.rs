@@ -904,8 +904,11 @@ pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
     Ok(n)
 }
 
-/// Tasks with a detachment record and no parent, whose last record has not
-/// been marked reviewed — `task-project <task> ""` on a task already under
+/// Open tasks with a detachment record and no parent, whose last record
+/// has not been marked reviewed — a finished task is not waiting to be
+/// re-filed, and forty pre-guard filings under people would otherwise be
+/// forty nightly rows drained one terminal command at a time (found on
+/// review) — `task-project <task> ""` on a task already under
 /// nothing is that mark, the operator's "no project is right", and without
 /// it this list was a standing pile the nightly printed forever (found on
 /// review; the shape `invalidate-phantoms` was added to end).
@@ -919,6 +922,7 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
          FROM task_detail td
          LEFT JOIN nodes n ON n.id = td.node_id
          WHERE td.parent_id IS NULL
+           AND td.status NOT IN ('done', 'dropped')
            AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
            AND COALESCE(json_extract(n.properties, '$.detached_parents[#-1].reviewed'), 0) = 0
          ORDER BY td.node_id",
@@ -3126,6 +3130,14 @@ mod tests {
         assert!(repair_unfit_parents(&conn, true).unwrap().found.is_empty());
         // The count the health pane reads agrees with the survey.
         assert_eq!(unfit_parent_count(&conn).unwrap(), 0);
+        // A finished task is not waiting to be re-filed: closed, it leaves
+        // the pending list; reopened, it is back.
+        set_task_status(&conn, &legacy, "done").unwrap();
+        assert!(
+            detached_pending(&conn).unwrap().is_empty(),
+            "finished: not pending"
+        );
+        set_task_status(&conn, &legacy, "next").unwrap();
         // "No project is right": clearing an already-clear parent marks the
         // record reviewed, and it leaves the pending list while staying.
         assert_eq!(detached_pending(&conn).unwrap().len(), 1);

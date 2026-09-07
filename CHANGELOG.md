@@ -53,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merge, or a conversion — and not re-filed since, so a merge's silent
   detach stays reviewable as a set; `task-project <task> ""` on a task
   already under nothing marks its record reviewed ("no project is
-  right"), so the list is not a standing pile; a deliberate re-file or
+  right"), so the list is not a standing pile, and a finished task is
+  not on it; a deliberate re-file or
   clear records the parent it leaves, reviewed. On `kg_task_update`, a
   list or number where a string belongs refuses the call rather than
   skipping the field and answering `updated`, and on `kg_task_create` a
