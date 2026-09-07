@@ -254,7 +254,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "name": { "type": "string", "description": "The task, phrased as an action" },
                     "due": { "type": "string", "description": "YYYY-MM-DD, 'today', 'tomorrow', or '+Nd'" },
-                    "project": { "type": "string", "description": "Parent project, goal, area or topic, by name or node id — must resolve to exactly one existing container node; never a task, person, event, document or artifact" },
+                    "project": { "type": "string", "description": "Parent project, goal, area or topic, by name or node id — must resolve to exactly one existing container node; never a task, person, place, event, document or artifact" },
                     "context": { "type": "string", "description": "GTD context tag, e.g. '@email', '@lab'" },
                     "about": {
                         "type": "array",
@@ -289,6 +289,7 @@ fn tool_definitions() -> Value {
                     "due": { "type": "string", "description": "New due date (YYYY-MM-DD, 'today', 'tomorrow', '+Nd'); \"\" clears" },
                     "defer": { "type": "string", "description": "Hide until this date; \"\" clears" },
                     "context": { "type": "string", "description": "New context tag; \"\" clears" },
+                    "project": { "type": "string", "description": "Re-file under this parent — a project, goal, area or topic, by name or node id, resolved exactly as kg_task_create resolves it (one existing container node, never a task, person, place, event, document or artifact); \"\" clears the parent. The correction path for a `project_id` a consumer cited." },
                     "waiting_on": { "type": "string", "description": "Who has the ball — a person or agent the graph already knows, by name; '@owner' means whoever this graph is about; \"\" clears. Use with status 'waiting'. Cleared automatically when the task moves to done/dropped, because nobody owes a finished task; the task stays findable under that person through its `about` association." },
                     "about_add": { "type": "array", "items": { "type": "string" }, "description": "Also file this task under these people/projects/topics. Permanent association that survives completion — see kg_task_create's `about`. Adds; it never replaces what is already there." },
                     "about_remove": { "type": "array", "items": { "type": "string" }, "description": "Stop filing this task under these entities. A valid-time close (the association ended), not a retraction of something that was never true." },
@@ -2340,6 +2341,10 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     }
     if let Some(session) = args["session"].as_str() {
         gtd::set_task_session(conn, task, session)?;
+    }
+    // Re-file, through the same resolver as capture; `""` clears.
+    if let Some(project) = args["project"].as_str() {
+        gtd::set_task_project(conn, task, project)?;
     }
     // Add and remove rather than set, because `about` is multi-valued: a
     // `set` would make "also file this under Nadia" silently drop whoever

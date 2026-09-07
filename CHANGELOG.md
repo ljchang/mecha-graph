@@ -20,8 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With the id path, the name path tightened to match: a name matching
   several nodes is refused with their ids rather than resolved by access
   count (`validate_about_target`'s rule — the guess now minted a citable
-  pointer), and a task, person, event, document or artifact is never a
-  parent, whichever way it was named. The name is prose (spaces,
+  pointer), and a task, person, place, event, document or artifact is
+  never a parent, whichever way it was named. A parent can now be
+  corrected — `kg_task_update` takes `project` (`""` clears), resolved
+  exactly as capture resolves it — because a pointer another repo cites
+  must have a correction path that keeps the task's id; and
+  `mecha-graph repair-parents` surveys the rows written before the guard
+  (a task filed under a person, say), detaching them only with `--apply`. The name is prose (spaces,
   and two nodes can share one); a consumer recording *which* project a task
   served cites `project:<node id>` and refuses whitespace in an id, so the
   name alone could never be cited. mecha's goal record is that consumer.

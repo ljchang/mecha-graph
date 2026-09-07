@@ -608,21 +608,117 @@ pub fn create_task(
 }
 
 /// Node types that are never a task's parent. Not a whitelist: `project`,
-/// `goal`, `area`, `topic` and the rest are containers a task can sit under,
-/// and the set is open at that end. What is closed is the other end — a
-/// node that is itself a unit of work, a person, or a record of something
-/// that happened is not a container, and filing a task under one renders
-/// it on the board as a project and hands a consumer `project_id` to cite
-/// (found on review, twice: a task's own id sits beside its `project_id`
-/// on every row, and a person's name resolves like any other).
-const NEVER_A_PARENT: &[&str] = &[
+/// `goal`, `area`, `topic`, `org` and the rest are containers a task can
+/// sit under, and the set is open at that end. What is closed is the other
+/// end — a node that is itself a unit of work, a person, a place the work
+/// happens at, or a record of something that happened is not a container,
+/// and filing a task under one renders it on the board as a project and
+/// hands a consumer `project_id` to cite (found on review, three times: a
+/// task's own id sits beside its `project_id` on every row, a person's name
+/// resolves like any other, and so does a building's). `org` stays a
+/// container on purpose: a task filed under a department reads as filed
+/// under one. `repair_unfit_parents` is the same rule over rows written
+/// before it existed.
+pub const NEVER_A_PARENT: &[&str] = &[
     "task",
     "person",
+    "place",
     "event",
     "event_series",
     "document",
     "artifact",
 ];
+
+/// Re-file a task under another project, or under none (`""`). The one
+/// correction path for a parent — and there has to be one, because the
+/// board hands the parent out as `project_id` for another repo's goal record
+/// to cite, so a parent chosen wrong at capture (a fuzzy match on `R01`
+/// that meant the supplement) used to be permanent for that task id, and
+/// dropping the task and re-creating it minted a second id the consumer may
+/// also have cited (found on review). Resolves exactly as `create_task`
+/// does, so the two cannot disagree about what a parent may be. Returns the
+/// parent's id, `None` when cleared.
+pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
+    require_task(conn, node_id)?;
+    let parent_id = match project.trim() {
+        "" => None,
+        p => Some(resolve_parent(conn, p)?.id),
+    };
+    conn.execute(
+        "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+        params![node_id, parent_id],
+    )?;
+    Ok(parent_id)
+}
+
+/// A task whose parent is a node type that is never a parent — written
+/// before `NEVER_A_PARENT` guarded the write, or by a writer this crate
+/// does not own.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnfitParent {
+    pub task_id: String,
+    pub task_name: String,
+    pub parent_id: String,
+    pub parent_name: String,
+    pub parent_type: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ParentRepairReport {
+    pub found: Vec<UnfitParent>,
+    /// Rows actually detached. Zero on a dry run, however many were found.
+    pub detached: usize,
+}
+
+/// Find (and optionally detach) tasks filed under a node that is never a
+/// parent. `NEVER_A_PARENT` runs on every new write; this is the same rule
+/// over the rows already there, because the board hands every row's parent
+/// out as `project_id` and a consumer records it — so a task captured under
+/// a person's name before the guard existed would go on minting exactly the
+/// pointer the guard exists to prevent (found on review). **Reporting is
+/// the default and `apply` is opt-in**, `repair_unparseable_dates`'s shape:
+/// detaching loses where a task was filed, and a pass that can do that
+/// should not do it to somebody who ran it expecting a survey. Detached,
+/// not re-filed: nothing here can know which container was meant.
+pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepairReport> {
+    let placeholders = NEVER_A_PARENT
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The type list is a private `const` of string literals interpolated
+    // because SQLite has no array parameter — never caller input.
+    let sql = format!(
+        "SELECT td.node_id, n.name, p.id, p.name, p.node_type
+         FROM task_detail td
+         JOIN nodes n ON n.id = td.node_id
+         JOIN nodes p ON p.id = td.parent_id
+         WHERE p.node_type IN ({placeholders})
+         ORDER BY td.node_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let found: Vec<UnfitParent> = stmt
+        .query_map([], |r| {
+            Ok(UnfitParent {
+                task_id: r.get(0)?,
+                task_name: r.get(1)?,
+                parent_id: r.get(2)?,
+                parent_name: r.get(3)?,
+                parent_type: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut report = ParentRepairReport { found, detached: 0 };
+    if apply {
+        for u in &report.found {
+            report.detached += conn.execute(
+                "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1 AND parent_id = ?2",
+                params![u.task_id, u.parent_id],
+            )?;
+        }
+    }
+    Ok(report)
+}
 
 /// The project a task is filed under, from a name, alias or node id.
 ///
@@ -1885,6 +1981,94 @@ mod tests {
                 .as_deref(),
             Some("proj-r01")
         );
+    }
+
+    /// A parent can be corrected: re-filed by name or id under the same
+    /// rule as capture, or cleared with `""`.
+    #[test]
+    fn a_task_can_be_refiled_under_another_project_or_none() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-r01", "project", "R01 renewal")).unwrap();
+        upsert_node(
+            &conn,
+            &Node::new("proj-r01s", "project", "R01 renewal supplement"),
+        )
+        .unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        let t = create_task(&conn, "Draft the aims", None, Some("R01 renewal"), None).unwrap();
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(
+            set_task_project(&conn, &t, "proj-r01s").unwrap().as_deref(),
+            Some("proj-r01s")
+        );
+        assert_eq!(pid(&t).as_deref(), Some("proj-r01s"));
+        assert_eq!(set_task_project(&conn, &t, "").unwrap(), None);
+        assert_eq!(pid(&t), None);
+        // The same refusals as capture: a person, an ambiguous name, an
+        // unknown one — and the row is untouched by a refused call.
+        assert_eq!(
+            set_task_project(&conn, &t, "R01 renewal")
+                .unwrap()
+                .as_deref(),
+            Some("proj-r01")
+        );
+        assert!(set_task_project(&conn, &t, "Wren").is_err());
+        assert!(set_task_project(&conn, &t, "renewal").is_err());
+        assert!(set_task_project(&conn, &t, "proj-nope").is_err());
+        assert_eq!(pid(&t).as_deref(), Some("proj-r01"));
+        assert!(
+            set_task_project(&conn, "task-nope", "proj-r01").is_err(),
+            "not a task"
+        );
+    }
+
+    /// The guard on new writes, applied to the rows already there: a task
+    /// filed under a person before the guard is found, and detached only
+    /// on `apply`.
+    #[test]
+    fn unfit_parents_are_surveyed_and_detached_only_on_apply() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("p-wren", "person", "Wren")).unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let fine = create_task(&conn, "Ship the pilot", None, Some("Tidelab"), None).unwrap();
+        let legacy = create_task(&conn, "Send the figures", None, None, None).unwrap();
+        // Written before the guard existed: straight into the column.
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'p-wren' WHERE node_id = ?1",
+            params![legacy],
+        )
+        .unwrap();
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(
+            pid(&legacy).as_deref(),
+            Some("p-wren"),
+            "the board hands the unfit parent out like any other"
+        );
+
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert_eq!(
+            survey.found,
+            vec![UnfitParent {
+                task_id: legacy.clone(),
+                task_name: "Send the figures".into(),
+                parent_id: "p-wren".into(),
+                parent_name: "Wren".into(),
+                parent_type: "person".into(),
+            }]
+        );
+        assert_eq!(survey.detached, 0, "a survey detaches nothing");
+        assert_eq!(pid(&legacy).as_deref(), Some("p-wren"));
+
+        let applied = repair_unfit_parents(&conn, true).unwrap();
+        assert_eq!(applied.found.len(), 1);
+        assert_eq!(applied.detached, 1);
+        assert_eq!(pid(&legacy), None);
+        assert_eq!(
+            pid(&fine).as_deref(),
+            Some("proj-tide"),
+            "a task under a real container is untouched"
+        );
+        assert!(repair_unfit_parents(&conn, true).unwrap().found.is_empty());
     }
 
     #[test]

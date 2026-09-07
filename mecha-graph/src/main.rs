@@ -839,6 +839,14 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Report tasks filed under a node that is never a parent (a person, a
+    /// place, another task…) — rows from before the write guard. Dry unless
+    /// --apply, which detaches them
+    RepairParents {
+        /// Actually detach the tasks; omit to survey only
+        #[arg(long)]
+        apply: bool,
+    },
     /// List duplicate-person merge candidates (same full name)
     Dups,
     /// Show or set the graph's owner — the person whose life this is
@@ -2313,6 +2321,35 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         report.found.len()
                     );
                 }
+            }
+        }
+        Command::RepairParents { apply } => {
+            let report = gtd::repair_unfit_parents(&conn, apply)?;
+            if want_json(cli_json, cli_text) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            if report.found.is_empty() {
+                println!("no task is filed under a node that is never a parent");
+                return Ok(());
+            }
+            println!(
+                "{} task(s) filed under a node that is never a parent:",
+                report.found.len()
+            );
+            for u in &report.found {
+                println!(
+                    "  {}  {}  -> {} ({}, {})",
+                    u.task_id, u.task_name, u.parent_name, u.parent_type, u.parent_id
+                );
+            }
+            if apply {
+                println!(
+                    "detached {} — re-file with `kg_task_update project`",
+                    report.detached
+                );
+            } else {
+                println!("survey only; --apply detaches them");
             }
         }
         Command::TaskAbout { task, add, remove } => {
