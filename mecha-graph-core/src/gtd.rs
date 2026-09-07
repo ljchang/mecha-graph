@@ -937,7 +937,12 @@ pub fn unfit_parent_count(conn: &Connection) -> Result<i64> {
 }
 
 /// Open tasks with a detachment record and no parent, whose last record
-/// has not been marked reviewed — a finished task is not waiting to be
+/// has not been marked reviewed. An inner join on the task's own node, on
+/// purpose: the record lives on that node, so a task row whose node is
+/// gone has no record to surface here — the survey and the count keep
+/// that orphan visible while it still has a parent, and this list is
+/// about what comes after (found on review: a LEFT JOIN read as if it
+/// handled the case) — a finished task is not waiting to be
 /// re-filed, and forty pre-guard filings under people would otherwise be
 /// forty nightly rows drained one terminal command at a time (found on
 /// review) — `task-project <task> ""` on a task already under
@@ -952,7 +957,7 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
                 json_extract(n.properties, '$.detached_parents[#-1].reason'),
                 json_extract(n.properties, '$.detached_parents[#-1].at')
          FROM task_detail td
-         LEFT JOIN nodes n ON n.id = td.node_id
+         JOIN nodes n ON n.id = td.node_id
          WHERE td.parent_id IS NULL
            AND td.status NOT IN ('done', 'dropped')
            AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
@@ -963,9 +968,7 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
         .query_map([], |r| {
             Ok(DetachedPending {
                 task_id: r.get(0)?,
-                task_name: r
-                    .get::<_, Option<String>>(1)?
-                    .unwrap_or_else(|| "(missing)".to_string()),
+                task_name: r.get(1)?,
                 parent_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 reason: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
@@ -1030,8 +1033,11 @@ pub fn repair_unfit_parents_with(
                 OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
            -- a plausible filing the operator has vouched for is off the list;
            -- a slip stays whoever vouches for it
+           -- COALESCE, because a parent whose row is gone has a NULL type and
+           -- a NULL conjunct drops the row from the survey while the count
+           -- still holds it — the standing pile again (found on review)
            AND NOT (COALESCE(json_extract(n.properties, '$.parent_reviewed') = td.parent_id, 0)
-                    AND p.node_type IN ({plausible})
+                    AND COALESCE(p.node_type, '') IN ({plausible})
                     AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
          ORDER BY td.node_id"
     );
@@ -3291,6 +3297,32 @@ mod tests {
             "vouched for: off the survey"
         );
         assert!(after.found.iter().any(|u| u.task_id == b), "a slip stays");
+        // A vouched filing whose parent row is gone is a finding to the
+        // survey as it is to the count — never a NULL that drops it.
+        upsert_node(&conn, &Node::new("pl-gone", "place", "Gone Hall")).unwrap();
+        let g = create_task(&conn, "Under a hall that goes", None, None, None).unwrap();
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-gone' WHERE node_id = ?1",
+            params![g],
+        )
+        .unwrap();
+        set_task_project(&conn, &g, "pl-gone").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute("DELETE FROM nodes WHERE id = 'pl-gone'", [])
+            .unwrap();
+        let survey = repair_unfit_parents(&conn, false).unwrap();
+        assert!(
+            survey.found.iter().any(|u| u.task_id == g),
+            "{:?}",
+            survey.found
+        );
+        assert_eq!(
+            unfit_parent_count(&conn).unwrap(),
+            survey.found.iter().filter(|u| !u.plausible).count() as i64,
+            "the count and the survey agree on the orphan"
+        );
+        assert_eq!(detach_tasks_under(&conn, "pl-gone", "test").unwrap(), 1);
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
         // The vouch names its parent: one given under a project that a type
         // rewrite later turns into an event does not carry.
         upsert_node(&conn, &Node::new("proj-z2", "project", "Z2")).unwrap();
