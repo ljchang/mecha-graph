@@ -955,6 +955,18 @@ pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
 /// should not do it to somebody who ran it expecting a survey. Detached,
 /// not re-filed: nothing here can know which container was meant.
 pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepairReport> {
+    repair_unfit_parents_with(conn, apply, false)
+}
+
+/// The survey, with `--apply` acting on what the survey tells apart: a
+/// plausible old filing is listed and **kept** unless `include_plausible`,
+/// so the classification the survey computes is the one thing an operator
+/// can act on rather than a prompt with no answer (found on review).
+pub fn repair_unfit_parents_with(
+    conn: &Connection,
+    apply: bool,
+    include_plausible: bool,
+) -> Result<ParentRepairReport> {
     let placeholders = NEVER_A_PARENT
         .iter()
         .map(|t| format!("'{t}'"))
@@ -1017,6 +1029,9 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         // — the store remembers, not the terminal.
         let tx = conn.unchecked_transaction()?;
         for u in &mut report.found {
+            if u.plausible && !include_plausible {
+                continue;
+            }
             let detached = tx.execute(
                 "UPDATE task_detail SET parent_id = NULL WHERE node_id = ?1 AND parent_id = ?2",
                 params![u.task_id, u.parent_id],
@@ -1060,7 +1075,7 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
 /// mints `project_id` from that guess and another repo's goal record cites
 /// it, the guess became a durable pointer (found on review). Now that the
 /// id path exists, "name the id instead" is advice the caller can follow.
-pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Node> {
+pub fn resolve_parent(conn: &Connection, what: &str) -> Result<ParentCandidate> {
     // The id first, exactly: the round-trip this feature sells — a pointer
     // the server hands out is one it accepts back — holds only if an
     // argument that *is* a node id resolves to that node, and this graph
@@ -1070,7 +1085,7 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
     // to tell the two apart (found on review). A name that collides with
     // an existing id loses to the id, by this rule.
     let node = if let Some(node) = crate::graph::get_node(conn, what)? {
-        node
+        ParentCandidate::from(node)
     } else {
         // Only nodes that could be a parent are candidates, and the query is
         // the parent's own — not `resolve_entity_all`, whose fuzzy tier
@@ -1144,11 +1159,28 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
 /// be a parent and no other (the type not in `NEVER_A_PARENT`, no task
 /// row), and **no limit**, so a count over the result is a count over the
 /// matching set.
-fn parent_candidates(
-    conn: &Connection,
-    what: &str,
-    fuzzy: bool,
-) -> Result<Vec<crate::graph::Node>> {
+/// What a parent lookup needs of a node — the three columns, without the
+/// alias load `get_node` pays: a substring that matches a thousand
+/// containers must not run two thousand statements to print ten names and
+/// a count (found on review).
+#[derive(Debug, Clone)]
+pub struct ParentCandidate {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+}
+
+impl From<crate::graph::Node> for ParentCandidate {
+    fn from(n: crate::graph::Node) -> Self {
+        ParentCandidate {
+            id: n.id,
+            name: n.name,
+            node_type: n.node_type,
+        }
+    }
+}
+
+fn parent_candidates(conn: &Connection, what: &str, fuzzy: bool) -> Result<Vec<ParentCandidate>> {
     let canonical = crate::ids::canonicalize(what);
     if canonical.is_empty() {
         return Ok(Vec::new());
@@ -1184,22 +1216,22 @@ fn parent_candidates(
     // The type list is a private `const` of string literals interpolated
     // because SQLite has no array parameter — never caller input.
     let sql = format!(
-        "SELECT n.id FROM nodes n
+        "SELECT n.id, n.name, n.node_type FROM nodes n
          WHERE {predicate}
            AND n.node_type NOT IN ({never})
            AND n.id NOT IN (SELECT node_id FROM task_detail)
          ORDER BY n.id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let ids: Vec<String> = stmt
-        .query_map(params![needle], |r| r.get(0))?
+    let out = stmt
+        .query_map(params![needle], |r| {
+            Ok(ParentCandidate {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                node_type: r.get(2)?,
+            })
+        })?
         .collect::<std::result::Result<_, _>>()?;
-    let mut out = Vec::new();
-    for id in ids {
-        if let Some(n) = crate::graph::get_node(conn, &id)? {
-            out.push(n);
-        }
-    }
     Ok(out)
 }
 
@@ -1243,26 +1275,44 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
     // the parent being left is recorded like a detachment, and — since the
     // operator or agent chose it — marked reviewed at once, so it is a
     // record and not a pending finding.
-    let was: Option<String> = conn.query_row(
-        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
-        params![node_id],
-        |r| r.get(0),
-    )?;
-    let moving = matches!(&was, Some(old) if Some(old.as_str()) != parent_id);
-    conn.execute(
-        "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
-        params![node_id, parent_id],
-    )?;
-    if moving {
-        let old = was.expect("moving implies a former parent");
-        record_detachment(conn, node_id, &old, "re-filed")?;
-        conn.execute(
-            "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
-             WHERE id = ?1",
+    // One savepoint for the move and its record, the discipline the other
+    // writers keep: moved first with the record failing after, the parent
+    // a consumer cited would be gone from the store while the call reported
+    // the re-file had not happened (found on review).
+    conn.execute_batch("SAVEPOINT set_task_parent_id")?;
+    let result = (|| -> Result<()> {
+        let was: Option<String> = conn.query_row(
+            "SELECT parent_id FROM task_detail WHERE node_id = ?1",
             params![node_id],
+            |r| r.get(0),
         )?;
+        let moving = matches!(&was, Some(old) if Some(old.as_str()) != parent_id);
+        if moving {
+            let old = was.expect("moving implies a former parent");
+            record_detachment(conn, node_id, &old, "re-filed")?;
+            conn.execute(
+                "UPDATE nodes SET properties = json_set(properties, '$.detached_parents[#-1].reviewed', json('true'))
+                 WHERE id = ?1",
+                params![node_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE task_detail SET parent_id = ?2 WHERE node_id = ?1",
+            params![node_id, parent_id],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE set_task_parent_id")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO set_task_parent_id; RELEASE set_task_parent_id");
+            Err(e)
+        }
     }
-    Ok(())
 }
 
 /// Edit scheduling fields on an existing task (TUI `e`). `Some("")` clears a
@@ -3060,6 +3110,20 @@ mod tests {
             "a building was a legal filing under the old rule"
         );
         assert!(!by_id(&b), "a person never was");
+        // --apply acts on the distinction: the slip goes, the plausible
+        // filing stays until asked for.
+        let applied = repair_unfit_parents(&conn, true).unwrap();
+        assert_eq!(applied.detached, 1);
+        let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
+        assert_eq!(pid(&a).as_deref(), Some("pl-hall"), "kept");
+        assert_eq!(pid(&b), None, "detached");
+        assert_eq!(
+            repair_unfit_parents_with(&conn, true, true)
+                .unwrap()
+                .detached,
+            1
+        );
+        assert_eq!(pid(&a), None, "detached when asked");
     }
 
     /// The guard on new writes, applied to the rows already there: a task

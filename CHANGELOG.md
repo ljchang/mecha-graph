@@ -48,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the id writer, the merge, or the survey. `mecha-graph task-project <task>` with no
   parent prints the current one and every detachment the store recorded;
   the survey's text output says which filings are plausible; `--apply`
-  runs as one transaction, recording a detachment only where it landed;
+  runs as one transaction, recording a detachment only where it landed,
+  and keeps the plausible filings unless `--include-plausible`;
   and the survey also lists every task detached earlier — by an apply, a
   merge, or a conversion — and not re-filed since, so a merge's silent
   detach stays reviewable as a set; `task-project <task> ""` on a task

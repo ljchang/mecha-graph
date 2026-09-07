@@ -857,6 +857,10 @@ enum Command {
         /// Actually detach the tasks; omit to survey only
         #[arg(long)]
         apply: bool,
+        /// With --apply, also detach filings the survey marks plausible (a
+        /// place, an event, a recurring series); omitted, those are kept
+        #[arg(long)]
+        include_plausible: bool,
     },
     /// List duplicate-person merge candidates (same full name)
     Dups,
@@ -2334,8 +2338,11 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 }
             }
         }
-        Command::RepairParents { apply } => {
-            let report = gtd::repair_unfit_parents(&conn, apply)?;
+        Command::RepairParents {
+            apply,
+            include_plausible,
+        } => {
+            let report = gtd::repair_unfit_parents_with(&conn, apply, include_plausible)?;
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
@@ -2375,7 +2382,10 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     // weigh before --apply: a filing that was legal and may
                     // have been meant, or a slip.
                     match (u.plausible, apply, u.detached) {
-                        (_, true, false) => {
+                        (true, true, false) => {
+                            "  — kept: plausible under the old rule; --include-plausible detaches it"
+                        }
+                        (false, true, false) => {
                             "  — NOT detached: re-filed since the survey's read; run again"
                         }
                         (true, false, _) => {
