@@ -29,7 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a task filed under a person, say), detaching them only with `--apply`,
   and `mecha-graph task-project` re-files one from the direct interface.
   On `kg_task_update` the parent is resolved before anything is written,
-  so a refused one changes nothing — not a status that already landed. The name is prose (spaces,
+  so a refused one changes nothing — not a status that already landed.
+  The rule binds every writer of a parent, not only the resolver: the
+  id writer re-checks what it is handed, `retype` refuses to turn a
+  parent into a non-container while tasks sit under it, `merge` detaches
+  rather than re-points onto one, and a detached task keeps where it was
+  on its own node (`properties.detached_parent`) so the record is in the
+  store rather than a terminal. The survey marks a filing under a place
+  or a recurring event `plausible` — legal under the old rule — apart
+  from a slip under a person, the agent or another task. `NEVER_A_PARENT`
+  and `CONTAINER_TYPES` partition the closed type set, held by a test. The name is prose (spaces,
   and two nodes can share one); a consumer recording *which* project a task
   served cites `project:<node id>` and refuses whitespace in an id, so the
   name alone could never be cited. mecha's goal record is that consumer.

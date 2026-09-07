@@ -890,6 +890,22 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
             node.name
         )));
     }
+    // A parent cannot be turned into something that is never one while
+    // tasks sit under it: the rows would keep their `parent_id`, the board
+    // would render a person under `project` and mint their id as
+    // `project_id` for a consumer to cite, and no call would have been
+    // refused (found on review). Refused rather than detached — the
+    // operator chose the retype and can re-file first.
+    if crate::gtd::NEVER_A_PARENT.contains(&node_type) {
+        let under = crate::gtd::tasks_under(conn, node_id)?;
+        if under > 0 {
+            return Err(crate::error::Error::Other(format!(
+                "{} has {under} task(s) filed under it, and a {node_type} is never a task's \
+                 parent — re-file them (`task-project`) before retyping",
+                node.name
+            )));
+        }
+    }
     conn.execute(
         "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
         params![node_id, node_type],
@@ -1500,10 +1516,25 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
             "DELETE FROM fact WHERE subject_id = ?1 OR object_id = ?1",
             params![dup_id],
         )?;
-        conn.execute(
-            "UPDATE task_detail SET parent_id = ?1 WHERE parent_id = ?2",
-            params![keep_id, dup_id],
+        // Tasks filed under the duplicate follow it onto the kept node —
+        // unless the kept node is something a task can never sit under (a
+        // stray `project` duplicate that turned out to be the person), in
+        // which case they are detached with a record of where they were,
+        // never re-pointed onto a parent the guard would have refused
+        // (found on review).
+        let keep_type: String = conn.query_row(
+            "SELECT node_type FROM nodes WHERE id = ?1",
+            params![keep_id],
+            |r| r.get(0),
         )?;
+        if crate::gtd::NEVER_A_PARENT.contains(&keep_type.as_str()) {
+            crate::gtd::detach_tasks_under(conn, dup_id, "merge_nodes")?;
+        } else {
+            conn.execute(
+                "UPDATE task_detail SET parent_id = ?1 WHERE parent_id = ?2",
+                params![keep_id, dup_id],
+            )?;
+        }
         // Facts between keep and dup became self-loops when the endpoints
         // merged ("X and X frequently co-occur") — meaningless, drop them.
         conn.execute(
