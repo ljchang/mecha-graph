@@ -1783,6 +1783,22 @@ mod tests {
             "the status change did not land"
         );
         assert_eq!(row["task"]["project_id"], "proj-tide");
+
+        // And the other direction: a re-file in a call that fails on a later
+        // field does not land either — the parent is written last.
+        upsert_node(&conn, &Node::new("proj-other", "project", "Other")).unwrap();
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "project": "proj-other",
+                     "captured_from": { "kind": "mail", "id": "t9", "body": "…" } }),
+        )
+        .expect_err("a bad captured_from refuses the call");
+        assert!(e.to_string().contains("captured_from"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(
+            row["task"]["project_id"], "proj-tide",
+            "the re-file did not land"
+        );
     }
 
     /// `kg_upsert` cannot write prose into a date column.
@@ -2422,10 +2438,6 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if let Some(session) = args["session"].as_str() {
         gtd::set_task_session(conn, task, session)?;
     }
-    // Re-file, with the parent resolved above; `""` cleared it to `None`.
-    if let Some(parent) = parent {
-        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
-    }
     // Add and remove rather than set, because `about` is multi-valued: a
     // `set` would make "also file this under Nadia" silently drop whoever
     // was already there.
@@ -2448,6 +2460,14 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
             gtd::set_task_captured_from(conn, task, None)?;
         }
         value => gtd::set_task_captured_from(conn, task, Some(value))?,
+    }
+    // Re-file, with the parent resolved above (`""` cleared it to `None`) —
+    // and written **last**, after `captured_from`, the one writer left
+    // whose argument is validated inside its setter: a durable pointer a
+    // consumer cites must not be re-filed by a call that then fails and
+    // reports nothing landed (found on review).
+    if let Some(parent) = parent {
+        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
     }
 
     // `task_json`, not a second literal. The reason this response echoes
