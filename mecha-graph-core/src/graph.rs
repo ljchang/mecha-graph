@@ -896,6 +896,19 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     // `project_id` for a consumer to cite, and no call would have been
     // refused (found on review). Refused rather than detached — the
     // operator chose the retype and can re-file first.
+    // The other direction: a node that is a task on the board — it has a
+    // `task_detail` row — cannot be retyped into anything else, because
+    // only `nodes.node_type` would move and the row would stay: still on
+    // the board, and now a legal parent that the survey cannot see either,
+    // since its type reads `project` (found on review). Dropping or
+    // converting the task row is a different operation, and not this one.
+    if node.node_type == "task" && crate::gtd::is_task(conn, node_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "{} is a task on the board (it has a task row), and a task cannot be retyped into \
+             a {node_type} — drop or complete it instead",
+            node.name
+        )));
+    }
     if crate::gtd::NEVER_A_PARENT.contains(&node_type) {
         let under = crate::gtd::tasks_under(conn, node_id)?;
         if under > 0 {
