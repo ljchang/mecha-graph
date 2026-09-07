@@ -2387,11 +2387,21 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 if want_json(cli_json, cli_text) {
                     let node = graph::get_node(&conn, &task)?
                         .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                    // The raw column beside the joined pair, so a parent
+                    // whose node row is gone is visible here too — the
+                    // JSON branch is the default off a terminal, and it
+                    // used to read as no parent (found on review).
+                    let raw: Option<String> = conn.query_row(
+                        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+                        mecha_graph_core::rusqlite::params![task],
+                        |r| r.get(0),
+                    )?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "task": t.node_id, "name": t.name,
                             "project": t.project, "project_id": t.project_id,
+                            "parent_id": raw,
                             "detached_parents": node.properties.get("detached_parents")
                                 .cloned().unwrap_or(serde_json::Value::Array(vec![])),
                         }))?

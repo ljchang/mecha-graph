@@ -1801,10 +1801,7 @@ mod tests {
             )
             .expect_err("a refused parent refuses the call");
             let msg = e.to_string();
-            assert!(
-                msg.contains("nothing was changed") || msg.contains("must be a string"),
-                "{msg}"
-            );
+            assert!(msg.contains("nothing was changed"), "{msg}");
         }
         let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
         assert_eq!(
@@ -2357,7 +2354,9 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // an ambiguous name is the refusal a consumer most likely retries
     // blind (found on review). `create_task` resolves the id again, which
     // is a lookup by id and cannot disagree.
-    let parent = match project_arg(args)? {
+    let parent = match project_arg(args)
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+    {
         Some(p) => gtd::resolve_project_arg(conn, p)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
         None => None,
@@ -2454,7 +2453,9 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // landed and retired the live `waiting_on` claim, which reopening does
     // not restore (found on review). Pure reads; the write is last.
     let parent =
-        match project_arg(args)? {
+        match project_arg(args)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?
+        {
             Some(p) => Some(gtd::resolve_project_arg(conn, p).map_err(|e| {
                 mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
             })?),

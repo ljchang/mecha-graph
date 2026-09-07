@@ -695,23 +695,42 @@ pub fn detach_tasks_under(conn: &Connection, parent_id: &str, reason: &str) -> R
     // the name reads `(missing)` and the type `missing`, as the survey
     // reports the same case (found on review: the one detachment that left no record was
     // the one hardest to reconstruct).
-    let record = match crate::graph::get_node(conn, parent_id)? {
-        Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
-        None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
-    };
-    conn.execute(
-        &format!(
-            "UPDATE nodes SET properties = {}
-             WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
-            APPEND_DETACHED
-        ),
-        params![parent_id, record],
-    )?;
-    let n = conn.execute(
-        "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
-        params![parent_id],
-    )?;
-    Ok(n)
+    // A savepoint of its own, so the record and the detach land together
+    // or not at all: written outside one, the record would land first and
+    // a failed detach would leave `detached_parents` entries for filings
+    // still in place — a record worse than none (found on review). A
+    // savepoint rather than a transaction because `merge_nodes` calls this
+    // inside its own, and SQLite refuses a transaction within one. The
+    // record targets the rows still under the parent, so it goes first.
+    conn.execute_batch("SAVEPOINT detach_tasks_under")?;
+    let result = (|| -> Result<usize> {
+        let record = match crate::graph::get_node(conn, parent_id)? {
+            Some(parent) => detached_record(&parent.id, &parent.name, &parent.node_type, reason),
+            None => detached_record(parent_id, "(missing)", MISSING_PARENT, reason),
+        };
+        conn.execute(
+            &format!(
+                "UPDATE nodes SET properties = {}
+                 WHERE id IN (SELECT node_id FROM task_detail WHERE parent_id = ?1)",
+                APPEND_DETACHED
+            ),
+            params![parent_id, record],
+        )?;
+        Ok(conn.execute(
+            "UPDATE task_detail SET parent_id = NULL WHERE parent_id = ?1",
+            params![parent_id],
+        )?)
+    })();
+    match result {
+        Ok(n) => {
+            conn.execute_batch("RELEASE detach_tasks_under")?;
+            Ok(n)
+        }
+        Err(e) => {
+            conn.execute_batch("ROLLBACK TO detach_tasks_under; RELEASE detach_tasks_under")?;
+            Err(e)
+        }
+    }
 }
 
 /// The SQL that appends one record to a task node's `detached_parents`
@@ -1051,7 +1070,11 @@ pub fn set_task_session(conn: &Connection, node_id: &str, session: &str) -> Resu
         Some(n) => n,
         None => return Err(Error::Other(format!("{node_id} is not a node"))),
     };
-    if node.node_type != "task" {
+    // The row is the fact, as every other mutator reads it: a node with a
+    // task row is a task whatever its type says, and refusing on the type
+    // here was the one writer left that could refuse after a status had
+    // landed (found on review).
+    if !is_task(conn, node_id)? {
         return Err(Error::Other(format!("{node_id} is not a task")));
     }
     let session = session.trim();
@@ -1221,7 +1244,6 @@ pub const OWNER: &str = "@owner";
 /// error on a call that had already closed the task and retired the live
 /// claim it was trying to set (found on review).
 pub fn resolve_waiting_on(conn: &Connection, who: &str) -> Result<Option<crate::graph::Node>> {
-    let who = who.trim();
     let who = who.trim();
     Ok(if who.is_empty() {
         None
