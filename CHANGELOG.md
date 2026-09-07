@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With the id path, the name path tightened to match: a name matching
   several nodes is refused with their ids rather than resolved by access
   count (`validate_about_target`'s rule — the guess now minted a citable
-  pointer), and a task, person, agent, place, event, document or artifact is
-  never a parent, whichever way it was named. A parent can now be
+  pointer), and a task, person, agent, place, event, event_series, document or
+  artifact is never a parent, whichever way it was named. A parent can now be
   corrected — `kg_task_update` takes `project` (`""` clears), resolved
   exactly as capture resolves it — because a pointer another repo cites
   must have a correction path that keeps the task's id; and
