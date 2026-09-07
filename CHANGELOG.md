@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — `stats` and the nightly's alert line count the slips alone, since
   the plausible ones are kept, and `task-project <task> <its parent's id>`
   says a plausible filing was meant (the vouch names that parent, lapses
-  if the parent changes or is retyped, and is never inferred from an
+  if the parent changes or is retyped or its row is deleted — a vouch
+  reads as standing only where the survey honours it, and a declined
+  vouch takes a stale mark with it — and is never inferred from an
   MCP update that echoes the row it read) and takes it off the
   survey —
   and `mecha-graph task-project` re-files one from the direct interface;

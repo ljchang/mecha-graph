@@ -1893,6 +1893,22 @@ mod tests {
         let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
         assert_eq!(row["task"]["status"], "next");
 
+        // An unknown status is refused before the first write, with the
+        // clause — a consumer keying its retry on the clause could not tell
+        // this refusal from a mid-call failure (found on review).
+        let e = kg_task_update(
+            &conn,
+            &json!({ "task": id, "status": "finished", "due": "tomorrow" }),
+        )
+        .expect_err("an unknown status is refused");
+        assert!(e.to_string().contains("nothing was changed"), "{e}");
+        let row = kg_task_update(&conn, &json!({ "task": id, "context": "@lab" })).unwrap();
+        assert_eq!(row["task"]["status"], "next");
+        assert!(
+            row["task"]["due"].is_null(),
+            "the due in the same payload never landed"
+        );
+
         // A typo in waiting_on refuses the call before the status write —
         // the case that used to close the task and retire the live claim.
         let e = kg_task_update(
@@ -2608,6 +2624,12 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     // where a string belongs refuses the call rather than skipping the
     // field and answering `updated`.
     let status_arg = scalar_arg(args, "status").map_err(changed_nothing)?;
+    // And for value, not only shape: the status write is first, so a
+    // refused one wrote nothing, but its refusal came back without the
+    // clause every other pre-flight refusal carries (found on review).
+    if let Some(s) = status_arg {
+        gtd::validate_status(s).map_err(changed_nothing)?;
+    }
     let context_arg = scalar_arg(args, "context").map_err(changed_nothing)?;
     let waiting_on_arg = scalar_arg(args, "waiting_on").map_err(changed_nothing)?;
     let session_arg = scalar_arg(args, "session").map_err(changed_nothing)?;

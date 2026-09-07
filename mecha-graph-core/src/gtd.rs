@@ -806,22 +806,6 @@ fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> Strin
 /// also have cited (found on review). Resolves exactly as `create_task`
 /// does, so the two cannot disagree about what a parent may be. Returns the
 /// parent's id, `None` when cleared.
-/// Whether the task's current parent carries the operator's vouch — the
-/// `parent_reviewed` mark naming that parent. What a caller reports after
-/// a vouch attempt, since the writer refuses one for a slip silently and
-/// a report that says "filed under Wren" reads as if it took (found on
-/// review).
-pub fn vouch_stands(conn: &Connection, node_id: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM task_detail td JOIN nodes n ON n.id = td.node_id
-         WHERE td.node_id = ?1 AND td.parent_id IS NOT NULL
-           AND json_extract(n.properties, '$.parent_reviewed') = td.parent_id",
-        params![node_id],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
 pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
     require_task(conn, node_id)?;
     let parent_id = resolve_project_for(conn, node_id, project)?;
@@ -856,20 +840,65 @@ pub fn vouch_for_parent(conn: &Connection, node_id: &str) -> Result<bool> {
         params![node_id],
         |r| r.get(0),
     )?;
-    let Some(cur) = current else {
-        return Ok(false);
+    let plausible_now = match current.as_deref() {
+        Some(cur) => {
+            crate::graph::get_node(conn, cur)?
+                .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
+                && !is_task(conn, cur)?
+        }
+        None => false,
     };
-    let plausible_now = crate::graph::get_node(conn, &cur)?
-        .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
-        && !is_task(conn, &cur)?;
     if !plausible_now {
+        // A declined vouch takes any mark with it: one written while the
+        // parent qualified is stale once it does not — the parent's row
+        // gone, its type rewritten under it — and a stale mark left in
+        // place answered `vouch_stands` for a row the survey listed (found
+        // on review).
+        conn.execute(
+            "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed')
+             WHERE id = ?1 AND json_extract(properties, '$.parent_reviewed') IS NOT NULL",
+            params![node_id],
+        )?;
         return Ok(false);
     }
+    let cur = current.expect("checked above");
     conn.execute(
         "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', ?2) WHERE id = ?1",
         params![node_id, cur],
     )?;
     Ok(true)
+}
+
+/// Whether the task's current parent carries the operator's vouch *and
+/// the survey honours it*: the `parent_reviewed` mark naming that parent,
+/// the parent's node present, its type a plausible old filing, and no task
+/// row under it — the survey's exclusion predicate, whole. What a caller
+/// reports after a vouch attempt, since the writer refuses one for a slip
+/// silently and a report that says "filed under Wren" reads as if it took
+/// (found on review). The mark alone was not enough: a mark written while
+/// the parent qualified outlives the parent's row, and a second vouch
+/// attempt then read the stale mark and said "off the survey" about a row
+/// the survey listed (found on review).
+pub fn vouch_stands(conn: &Connection, node_id: &str) -> Result<bool> {
+    let plausible = PLAUSIBLE_OLD_PARENTS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM task_detail td
+             JOIN nodes n ON n.id = td.node_id
+             JOIN nodes p ON p.id = td.parent_id
+             WHERE td.node_id = ?1
+               AND json_extract(n.properties, '$.parent_reviewed') = td.parent_id
+               AND p.node_type IN ({plausible})
+               AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id)"
+        ),
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Clearing a parent that is already clear is the operator — or the agent,
@@ -2347,6 +2376,20 @@ fn require_task(conn: &Connection, node_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one check `set_task_status` makes before it writes, on its own so
+/// the MCP update's pre-flight can make it before the first write — a
+/// status the writer would refuse came back without the "nothing was
+/// changed" clause every other refusal carries, though nothing had been
+/// written (found on review).
+pub fn validate_status(status: &str) -> Result<()> {
+    if !TASK_STATUSES.contains(&status) {
+        return Err(Error::Other(format!(
+            "unknown task status '{status}' (one of {})",
+            TASK_STATUSES.join("|")
+        )));
+    }
+    Ok(())
+}
 /// Move a task through its lifecycle. Sets/clears `completed_at` so 'done'
 /// carries a timestamp and reopening clears it.
 ///
@@ -2366,12 +2409,7 @@ fn require_task(conn: &Connection, node_id: &str) -> Result<()> {
 /// task is a new question with a new answer, and guessing the old one is how
 /// a person silently re-acquires an obligation nobody gave them.
 pub fn set_task_status(conn: &Connection, node_id: &str, status: &str) -> Result<()> {
-    if !TASK_STATUSES.contains(&status) {
-        return Err(Error::Other(format!(
-            "unknown task status '{status}' (one of {})",
-            TASK_STATUSES.join("|")
-        )));
-    }
+    validate_status(status)?;
     let n = conn.execute(
         "UPDATE task_detail SET status = ?2,
                 completed_at = CASE WHEN ?2 IN ('done','dropped')
@@ -3379,6 +3417,8 @@ mod tests {
             "vouched for: off the survey"
         );
         assert!(after.found.iter().any(|u| u.task_id == b), "a slip stays");
+        assert!(vouch_stands(&conn, &a).unwrap(), "the vouch stands");
+        assert!(!vouch_stands(&conn, &b).unwrap(), "no vouch for a slip");
         // A vouched filing whose parent row is gone is a finding to the
         // survey as it is to the count — never a NULL that drops it.
         upsert_node(&conn, &Node::new("pl-gone", "place", "Gone Hall")).unwrap();
@@ -3397,6 +3437,29 @@ mod tests {
             survey.found.iter().any(|u| u.task_id == g),
             "{:?}",
             survey.found
+        );
+        // The mark outlived the parent's row; the vouch does not — the
+        // survey lists the row, so "vouched" must not stand, and a second
+        // vouch attempt takes the stale mark with it rather than reading
+        // it back as standing (found on review).
+        assert!(
+            !vouch_stands(&conn, &g).unwrap(),
+            "a lapsed vouch does not stand"
+        );
+        set_task_project(&conn, &g, "pl-gone").unwrap();
+        assert!(!vouch_stands(&conn, &g).unwrap());
+        let gn = crate::graph::get_node(&conn, &g).unwrap().unwrap();
+        assert!(
+            gn.properties.get("parent_reviewed").is_none(),
+            "the declined vouch removed the stale mark"
+        );
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .found
+                .iter()
+                .any(|u| u.task_id == g),
+            "still a finding"
         );
         assert_eq!(
             unfit_parent_count(&conn).unwrap(),

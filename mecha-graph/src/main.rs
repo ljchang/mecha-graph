@@ -2433,7 +2433,12 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
                     let converted = node.properties.get("converted_task").cloned();
                     let history = node.properties.get("detached_parents").cloned();
-                    if converted.is_none() {
+                    // Either record makes the node readable here: a task
+                    // row removed by a redact or by hand leaves the
+                    // history behind, and this is its only reader — it
+                    // used to answer "never was one" over a node that
+                    // carried one (found on review).
+                    if converted.is_none() && history.is_none() {
                         return Err(mecha_graph_core::Error::Other(format!(
                             "{task} is not a task on the board, and never was one"
                         )));
@@ -2449,16 +2454,21 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         );
                         return Ok(());
                     }
-                    let c = converted.unwrap_or(serde_json::Value::Null);
-                    println!(
-                        "{} — now a {}; was a task ({}, completed {}) filed under {}, converted {}",
-                        node.name,
-                        node.node_type,
-                        c["row"]["status"].as_str().unwrap_or("?"),
-                        c["row"]["completed_at"].as_str().unwrap_or("never"),
-                        c["row"]["parent_id"].as_str().unwrap_or("no project"),
-                        c["converted_at"].as_str().unwrap_or("?")
-                    );
+                    match converted {
+                        Some(c) => println!(
+                            "{} — now a {}; was a task ({}, completed {}) filed under {}, converted {}",
+                            node.name,
+                            node.node_type,
+                            c["row"]["status"].as_str().unwrap_or("?"),
+                            c["row"]["completed_at"].as_str().unwrap_or("never"),
+                            c["row"]["parent_id"].as_str().unwrap_or("no project"),
+                            c["converted_at"].as_str().unwrap_or("?")
+                        ),
+                        None => println!(
+                            "{} — a {}, not a task on the board; its row is gone, the filing history stays:",
+                            node.name, node.node_type
+                        ),
+                    }
                     if let Some(h) = history.as_ref().and_then(|h| h.as_array()) {
                         for r in h {
                             println!(
@@ -2541,6 +2551,18 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             // A vouch the writer refused (a slip is a slip whoever vouches)
             // must not report as one that took (found on review).
             let vouched = gtd::vouch_stands(&conn, &task)?;
+            // Re-filing under the parent a task already has is the vouch
+            // gesture, and one the writer declined is worth a line — but
+            // only where there was something to vouch for. On a task filed
+            // under a project it is a confirmation of a correct filing, and
+            // it printed as a failure (found on review). The survey itself
+            // decides, not a re-derivation of its predicate.
+            let on_survey = parent.as_deref() == Some(project.trim())
+                && !vouched
+                && gtd::repair_unfit_parents(&conn, false)?
+                    .found
+                    .iter()
+                    .any(|u| u.task_id == t.node_id);
             // JSON here too — the write is the call a script most needs to
             // confirm, and JSON is the default off a terminal (found on
             // review).
@@ -2560,15 +2582,15 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     "{} — filed under {} ({parent}){}",
                     t.name,
                     t.project.as_deref().unwrap_or("?"),
-                    // Off `vouched` alone, never a re-derivation of the
-                    // writer's predicate: a vouch attempt is a re-file to the
-                    // parent the task already had, and one that came back
-                    // without the mark did not take, whatever the reason —
-                    // a slip, a task by row, a parent whose node row is gone
-                    // (found on review).
+                    // Off `vouched` and the survey, never a re-derivation
+                    // of the writer's predicate: a vouch attempt is a
+                    // re-file to the parent the task already had, and one
+                    // that came back without the mark did not take,
+                    // whatever the reason — a slip, a task by row, a parent
+                    // whose node row is gone (found on review).
                     if vouched {
                         " — vouched for; off the survey"
-                    } else if project.trim() == parent {
+                    } else if on_survey {
                         " — no vouch written: only a plausible old filing (a place, an event, a \
                          series) with its node present can be vouched for"
                     } else {
