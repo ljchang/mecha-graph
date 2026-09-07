@@ -29,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a task filed under a person, say), detaching them only with `--apply`,
   and `mecha-graph task-project` re-files one from the direct interface;
   it also finds a parent whose node is gone (reported as `missing`), and
-  a task on the board cannot be retyped into anything — only the type
-  would move, the row would stay, and the task would be a legal parent
-  the survey could not see. `mecha-graph task-project <task>` with no
+  a task on the board cannot be retyped into anything, nor merged into
+  a container — only the type would move, or the row would land on a
+  project, and the task would be a legal parent the survey could not
+  see. `project_id` comes from the same join as `project`, so a parent
+  whose node row is gone is handed out by neither. `mecha-graph task-project <task>` with no
   parent prints the current one and every detachment the store recorded.
   On `kg_task_update` the parent is resolved before anything is written,
   so a refused one changes nothing — not a status that already landed.

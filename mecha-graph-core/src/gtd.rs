@@ -238,8 +238,14 @@ fn list_tasks_filtered(
                    GROUP BY pn.id
                    ORDER BY last_held DESC)),
                 -- The parent's id beside its name (which is column 11):
-                -- appended last, at column 15, so no earlier index moves.
-                td.parent_id
+                -- appended last, at column 15, so no earlier index moves —
+                -- and from the SAME join as the name, never the raw column,
+                -- so the two are absent together: a `parent_id` whose node
+                -- row is gone (a store restored with foreign keys off) is
+                -- handed out by neither, where the raw column minted a
+                -- pointer to nothing for a consumer to cite (found on
+                -- review). The survey reads the raw column and reports it.
+                (SELECT p.id FROM nodes p WHERE p.id = td.parent_id)
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?3 IS NULL OR n.id = ?3)
@@ -756,10 +762,11 @@ pub struct UnfitParent {
 }
 
 /// The parent type the survey reports for a `parent_id` whose node row is
-/// gone — a store attached with foreign keys off can carry one, and the
-/// board hands the raw column out as `project_id` beside a `project` of
-/// null, a pointer the resolver would refuse if cited back (found on
-/// review). Not a node type; a word the survey owns.
+/// gone — a store attached with foreign keys off can carry one. The board
+/// hands it out as neither `project` nor `project_id` (both come from the
+/// join to `nodes`), so nothing cites it; the survey reads the raw column
+/// and is where it is seen (found on review). Not a node type; a word the
+/// survey owns.
 pub const MISSING_PARENT: &str = "missing";
 
 /// The types of `NEVER_A_PARENT` that were reachable parents before the
@@ -2356,6 +2363,11 @@ mod tests {
         set_task_project(&conn, &t, "proj-gone2").unwrap();
         conn.execute("DELETE FROM nodes WHERE id = 'proj-gone2'", [])
             .unwrap();
+        assert_eq!(
+            get_task(&conn, &t).unwrap().unwrap().project_id,
+            None,
+            "the board hands out neither the name nor the id of a parent that is gone"
+        );
         let survey = repair_unfit_parents(&conn, false).unwrap();
         assert_eq!(survey.found.len(), 1, "{:?}", survey.found);
         assert_eq!(survey.found[0].parent_id, "proj-gone2");
@@ -2385,6 +2397,38 @@ mod tests {
         );
         // And so it can never be cited as a parent.
         assert!(create_task(&conn, "Child", None, Some(&t), None).is_err());
+
+        // The row, not the type, is what makes it a task: a project node
+        // that somehow holds a task row is refused the same way.
+        upsert_node(&conn, &Node::new("proj-odd", "project", "Odd")).unwrap();
+        conn.execute(
+            "INSERT INTO task_detail (node_id, status, task_type) VALUES ('proj-odd', 'inbox', 'action')",
+            [],
+        )
+        .unwrap();
+        assert!(crate::graph::retype_node(&conn, "proj-odd", "person").is_err());
+    }
+
+    /// A task cannot be merged into a container: the row would move and
+    /// the container would be a task on the board and a legal parent the
+    /// survey cannot see.
+    #[test]
+    fn a_task_cannot_be_merged_into_a_container() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tidelab")).unwrap();
+        let t = create_task(&conn, "Tidelab", None, None, None).unwrap();
+        let e = crate::graph::merge_nodes(&conn, "proj-tide", &t)
+            .expect_err("a task row cannot land on a project");
+        assert!(e.to_string().contains("is a task on the board"), "{e}");
+        assert!(
+            get_task(&conn, &t).unwrap().is_some(),
+            "refused, not applied"
+        );
+        assert!(!is_task(&conn, "proj-tide").unwrap());
+        // Two tasks merge as before.
+        let u = create_task(&conn, "Tidelab (dup)", None, None, None).unwrap();
+        crate::graph::merge_nodes(&conn, &t, &u).unwrap();
+        assert!(get_task(&conn, &u).unwrap().is_none());
     }
 
     /// A survey tells a plausible old filing from a slip.

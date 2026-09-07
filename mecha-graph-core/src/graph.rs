@@ -897,12 +897,14 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     // refused (found on review). Refused rather than detached — the
     // operator chose the retype and can re-file first.
     // The other direction: a node that is a task on the board — it has a
-    // `task_detail` row — cannot be retyped into anything else, because
-    // only `nodes.node_type` would move and the row would stay: still on
-    // the board, and now a legal parent that the survey cannot see either,
-    // since its type reads `project` (found on review). Dropping or
-    // converting the task row is a different operation, and not this one.
-    if node.node_type == "task" && crate::gtd::is_task(conn, node_id)? {
+    // `task_detail` row, whatever `nodes.node_type` says — cannot be
+    // retyped into anything else, because only the type would move and
+    // the row would stay: still on the board, and now a legal parent that
+    // the survey cannot see either, since its type reads `project` (found
+    // on review, twice: the row is the fact, and a type check beside it
+    // let a row a merge had moved through). Dropping or converting the
+    // task row is a different operation, and not this one.
+    if crate::gtd::is_task(conn, node_id)? {
         return Err(crate::error::Error::Other(format!(
             "{} is a task on the board (it has a task row), and a task cannot be retyped into \
              a {node_type} — drop or complete it instead",
@@ -1450,6 +1452,18 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
         .ok_or_else(|| crate::error::Error::Other(format!("no node {keep_id}")))?;
     let dup = get_node(conn, dup_id)?
         .ok_or_else(|| crate::error::Error::Other(format!("no node {dup_id}")))?;
+    // A task cannot be merged into a container: the task row would move
+    // onto the kept node, which would then be a task on the board and — its
+    // type still reading `project` — a legal parent the survey cannot see
+    // (found on review). Refused before anything moves; two tasks merge as
+    // before, and a task may absorb a stray node of another type.
+    if keep.node_type != "task" && crate::gtd::is_task(conn, dup_id)? {
+        return Err(crate::error::Error::Other(format!(
+            "{} is a task on the board and {} is a {} — a task row cannot be merged into a \
+             container; drop or complete the task instead",
+            dup.name, keep.name, keep.node_type
+        )));
+    }
 
     let tx_active = conn.is_autocommit();
     if tx_active {
