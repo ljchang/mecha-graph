@@ -808,7 +808,7 @@ fn detached_record(id: &str, name: &str, node_type: &str, reason: &str) -> Strin
 /// parent's id, `None` when cleared.
 pub fn set_task_project(conn: &Connection, node_id: &str, project: &str) -> Result<Option<String>> {
     require_task(conn, node_id)?;
-    let parent_id = resolve_project_arg(conn, project)?;
+    let parent_id = resolve_project_for(conn, node_id, project)?;
     if parent_id.is_none() {
         mark_detachment_reviewed(conn, node_id)?;
     }
@@ -1004,7 +1004,12 @@ pub fn repair_unfit_parents_with(
         .map(|t| format!("'{t}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    // The type list is a private `const` of string literals interpolated
+    let plausible = PLAUSIBLE_OLD_PARENTS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The type lists are private `const`s of string literals interpolated
     // because SQLite has no array parameter — never caller input.
     let sql = format!(
         // LEFT JOIN, so a parent whose node row is gone is found rather than
@@ -1023,6 +1028,11 @@ pub fn repair_unfit_parents_with(
            AND (p.id IS NULL
                 OR p.node_type IN ({placeholders})
                 OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
+           -- a plausible filing the operator has vouched for is off the list;
+           -- a slip stays whoever vouches for it
+           AND NOT (COALESCE(json_extract(n.properties, '$.parent_reviewed'), 0) = 1
+                    AND p.node_type IN ({plausible})
+                    AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
          ORDER BY td.node_id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1268,6 +1278,37 @@ fn parent_candidates(conn: &Connection, what: &str, fuzzy: bool) -> Result<Vec<P
     Ok(out)
 }
 
+/// `resolve_project_arg`, with one exception a task's own parent earns:
+/// the parent the task already has — named by id or by name — resolves
+/// to itself even when the rule would refuse it as a parent now (a place,
+/// a series, from before the guard), because re-filing under the parent
+/// you already have is the "this filing was meant" gesture and nothing
+/// else could say it (found on review — the resolver refused the vouch).
+/// A slip stays a slip: the mark it earns is honoured by the survey only
+/// for a plausible type.
+pub fn resolve_project_for(
+    conn: &Connection,
+    node_id: &str,
+    project: &str,
+) -> Result<Option<String>> {
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if let Some(cur) = current.as_deref() {
+        let what = project.trim();
+        let names_current = what == cur
+            || crate::graph::get_node(conn, cur)?.is_some_and(|n| {
+                crate::ids::canonicalize(&n.name) == crate::ids::canonicalize(what)
+            });
+        if names_current {
+            return Ok(Some(cur.to_string()));
+        }
+    }
+    resolve_project_arg(conn, project)
+}
+
 /// The parent a `project` argument resolves to, or `None` for `""` —
 /// resolution alone, so a caller that writes several fields can refuse
 /// before its first write (`kg_task_update`'s rule: a refused call changed
@@ -1287,6 +1328,22 @@ pub fn resolve_project_arg(conn: &Connection, project: &str) -> Result<Option<St
 /// node of a type that is never a parent, is refused before the write.
 pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&str>) -> Result<()> {
     require_task(conn, node_id)?;
+    // The parent the task already has: nothing to write, and the guard
+    // below does not apply — this is the vouch (see `resolve_project_for`).
+    let current: Option<String> = conn.query_row(
+        "SELECT parent_id FROM task_detail WHERE node_id = ?1",
+        params![node_id],
+        |r| r.get(0),
+    )?;
+    if let (Some(cur), Some(new)) = (current.as_deref(), parent_id) {
+        if cur == new {
+            conn.execute(
+                "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', json('true')) WHERE id = ?1",
+                params![node_id],
+            )?;
+            return Ok(());
+        }
+    }
     if let Some(pid) = parent_id {
         let Some(parent) = crate::graph::get_node(conn, pid)? else {
             return Err(Error::Other(format!(
@@ -1320,7 +1377,17 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
             |r| r.get(0),
         )?;
         let moving = matches!(&was, Some(old) if Some(old.as_str()) != parent_id);
+        // Re-filing a task under the parent it already has is the operator
+        // saying "this filing was meant" — the acknowledgement a plausible
+        // old filing had no other way to receive, so the survey printed it
+        // every night (found on review). The mark is dropped by any move,
+        // and the survey honours it only for a plausible type: a filing
+        // under a person is a slip whoever vouches for it.
         if moving {
+            conn.execute(
+                "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed') WHERE id = ?1",
+                params![node_id],
+            )?;
             let old = was.expect("moving implies a former parent");
             record_detachment(conn, node_id, &old, "re-filed")?;
             conn.execute(
@@ -3196,6 +3263,31 @@ mod tests {
         .unwrap();
         conn.execute("DELETE FROM task_detail WHERE node_id = 'ev-odd'", [])
             .unwrap();
+        // "This one was meant": re-filing under the same parent marks it,
+        // and the plausible row leaves the survey; a slip does not, whoever
+        // vouches; a move drops the mark.
+        set_task_project(&conn, &a, "pl-hall").unwrap();
+        // The slip's owner may vouch too — the call succeeds and marks —
+        // but the survey does not honour it for a person.
+        set_task_project(&conn, &b, "p-wren").unwrap();
+        let after = repair_unfit_parents(&conn, false).unwrap();
+        assert!(
+            after.found.iter().all(|u| u.task_id != a),
+            "vouched for: off the survey"
+        );
+        assert!(after.found.iter().any(|u| u.task_id == b), "a slip stays");
+        upsert_node(&conn, &Node::new("proj-z", "project", "Z")).unwrap();
+        set_task_project(&conn, &a, "proj-z").unwrap();
+        let node = crate::graph::get_node(&conn, &a).unwrap().unwrap();
+        assert!(
+            node.properties.get("parent_reviewed").is_none(),
+            "a move drops the mark"
+        );
+        conn.execute(
+            "UPDATE task_detail SET parent_id = 'pl-hall' WHERE node_id = ?1",
+            params![a],
+        )
+        .unwrap();
         // --apply acts on the distinction: the slip goes, the plausible
         // filing stays until asked for.
         let applied = repair_unfit_parents(&conn, true).unwrap();

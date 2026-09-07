@@ -27,7 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must have a correction path that keeps the task's id; and
   `mecha-graph repair-parents` surveys the rows written before the guard
   (a task filed under a person, say), detaching them only with `--apply`
-  — `stats` alerts on the slips alone, since the plausible ones are kept —
+  — `stats` and the nightly's alert line count the slips alone, since
+  the plausible ones are kept, and re-filing a plausible filing under
+  the parent it already has says it was meant and takes it off the
+  survey —
   and `mecha-graph task-project` re-files one from the direct interface;
   it also finds a parent whose node is gone (reported as `missing`), and
   a task on the board cannot be retyped into anything, nor merged into

@@ -239,6 +239,7 @@ alerts=[]
 if h['merge_queue_depth']>10: alerts.append(f\"merge queue {h['merge_queue_depth']}\")
 if h['isolated_pct']>25: alerts.append(f\"isolated {h['isolated_pct']:.0f}%\")
 if h['live_contradictions']>0: alerts.append(f\"{h['live_contradictions']} contradictions\")
+if h.get('unfit_parents',0)>0: alerts.append(f\"{h['unfit_parents']} task(s) under a non-parent\")
 for s in h['ingest_state']:
     if s['stale']: alerts.append(f\"{s['source']} stale\")
 print('; '.join(alerts))

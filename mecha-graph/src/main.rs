@@ -2396,7 +2396,8 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                              detach it"
                         }
                         (true, false, _) => {
-                            "  — plausible under the old rule; re-file rather than detach?"
+                            "  — plausible under the old rule; re-file, or `task-project <task> \
+                             <this parent>` to say it was meant"
                         }
                         (true, true, true) => {
                             "  — was plausible under the old rule; `task-project` can re-file it \
@@ -3705,11 +3706,12 @@ reject: it was never true (retracted; the class learns)"
                 println!("  candidate #{id}  →  names no live node, still pending");
             }
             println!(
-                "\n{} placeholder node(s) {}merged · {} orphaned\n\
+                "\n{} placeholder node(s) {}merged · {} orphaned · {} skipped (tasks)\n\
                  {} of {} pending candidate(s) {}rewritten to names · {} unresolvable",
                 r.placeholders_merged.len(),
                 if dry_run { "would be " } else { "" },
                 r.placeholders_orphaned.len(),
+                r.placeholders_skipped.len(),
                 r.payloads_repaired,
                 r.candidates_scanned,
                 if dry_run { "would be " } else { "" },

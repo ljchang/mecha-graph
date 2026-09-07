@@ -2514,7 +2514,7 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         match project_arg(args)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?
         {
-            Some(p) => Some(gtd::resolve_project_arg(conn, p).map_err(|e| {
+            Some(p) => Some(gtd::resolve_project_for(conn, task, p).map_err(|e| {
                 mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
             })?),
             None => None,
