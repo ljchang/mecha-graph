@@ -2397,7 +2397,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                         }
                         (true, false, _) => {
                             "  — plausible under the old rule; re-file, or `task-project <task> \
-                             <this parent>` to say it was meant"
+                             <this parent's id>` to say it was meant"
                         }
                         (true, true, true) => {
                             "  — was plausible under the old rule; `task-project` can re-file it \

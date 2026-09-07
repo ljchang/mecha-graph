@@ -1030,7 +1030,7 @@ pub fn repair_unfit_parents_with(
                 OR EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
            -- a plausible filing the operator has vouched for is off the list;
            -- a slip stays whoever vouches for it
-           AND NOT (COALESCE(json_extract(n.properties, '$.parent_reviewed'), 0) = 1
+           AND NOT (COALESCE(json_extract(n.properties, '$.parent_reviewed') = td.parent_id, 0)
                     AND p.node_type IN ({plausible})
                     AND NOT EXISTS (SELECT 1 FROM task_detail pt WHERE pt.node_id = td.parent_id))
          ORDER BY td.node_id"
@@ -1079,6 +1079,10 @@ pub fn repair_unfit_parents_with(
                 params![u.task_id, u.parent_id],
             )?;
             if detached == 1 {
+                tx.execute(
+                    "UPDATE nodes SET properties = json_remove(properties, '$.parent_reviewed') WHERE id = ?1",
+                    params![u.task_id],
+                )?;
                 let record = detached_record(
                     &u.parent_id,
                     &u.parent_name,
@@ -1297,12 +1301,10 @@ pub fn resolve_project_for(
         |r| r.get(0),
     )?;
     if let Some(cur) = current.as_deref() {
-        let what = project.trim();
-        let names_current = what == cur
-            || crate::graph::get_node(conn, cur)?.is_some_and(|n| {
-                crate::ids::canonicalize(&n.name) == crate::ids::canonicalize(what)
-            });
-        if names_current {
+        // By id only: a name would skip the ambiguity refusal every other
+        // path gives it (found on review), and the survey prints the id
+        // beside the name for exactly this call.
+        if project.trim() == cur {
             return Ok(Some(cur.to_string()));
         }
     }
@@ -1337,10 +1339,23 @@ pub fn set_task_parent_id(conn: &Connection, node_id: &str, parent_id: Option<&s
     )?;
     if let (Some(cur), Some(new)) = (current.as_deref(), parent_id) {
         if cur == new {
-            conn.execute(
-                "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', json('true')) WHERE id = ?1",
-                params![node_id],
-            )?;
+            // The vouch is written only for a parent that is unfit *now*
+            // and plausibly meant — a place, an event, a series — and it
+            // names that parent, never a bare flag: a flag set by an
+            // idempotent re-send under an ordinary project survived onto
+            // the event a type rewrite later made of it, and the survey
+            // honoured it there — the one net for that writer, failing
+            // open for any task ever re-filed onto its own parent (found on
+            // review). Honoured only while the id still matches the row's.
+            let plausible_now = crate::graph::get_node(conn, cur)?
+                .is_some_and(|p| PLAUSIBLE_OLD_PARENTS.contains(&p.node_type.as_str()))
+                && !is_task(conn, cur)?;
+            if plausible_now {
+                conn.execute(
+                    "UPDATE nodes SET properties = json_set(COALESCE(properties, '{}'), '$.parent_reviewed', ?2) WHERE id = ?1",
+                    params![node_id, cur],
+                )?;
+            }
             return Ok(());
         }
     }
@@ -3276,6 +3291,31 @@ mod tests {
             "vouched for: off the survey"
         );
         assert!(after.found.iter().any(|u| u.task_id == b), "a slip stays");
+        // The vouch names its parent: one given under a project that a type
+        // rewrite later turns into an event does not carry.
+        upsert_node(&conn, &Node::new("proj-z2", "project", "Z2")).unwrap();
+        let v = create_task(
+            &conn,
+            "Vouched under a project",
+            None,
+            Some("proj-z2"),
+            None,
+        )
+        .unwrap();
+        set_task_project(&conn, &v, "proj-z2").unwrap();
+        conn.execute(
+            "UPDATE nodes SET node_type = 'event' WHERE id = 'proj-z2'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .found
+                .iter()
+                .any(|u| u.task_id == v),
+            "the vouch was for proj-z2 the project; the event is a finding"
+        );
         upsert_node(&conn, &Node::new("proj-z", "project", "Z")).unwrap();
         set_task_project(&conn, &a, "proj-z").unwrap();
         let node = crate::graph::get_node(&conn, &a).unwrap().unwrap();
@@ -3291,15 +3331,17 @@ mod tests {
         // --apply acts on the distinction: the slip goes, the plausible
         // filing stays until asked for.
         let applied = repair_unfit_parents(&conn, true).unwrap();
-        assert_eq!(applied.detached, 1);
+        assert_eq!(applied.detached, 1, "{:?}", applied.found);
         let pid = |t: &str| get_task(&conn, t).unwrap().unwrap().project_id;
         assert_eq!(pid(&a).as_deref(), Some("pl-hall"), "kept");
         assert_eq!(pid(&b), None, "detached");
+        // Two plausible rows now: `a` under the building and the task
+        // vouched under a project that a type rewrite made an event.
         assert_eq!(
             repair_unfit_parents_with(&conn, true, true)
                 .unwrap()
                 .detached,
-            1
+            2
         );
         assert_eq!(pid(&a), None, "detached when asked");
     }

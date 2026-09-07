@@ -2505,6 +2505,15 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         gtd::validate_about_target(conn, name)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
     }
+    // That the target is a task at all, ahead of every other pre-check:
+    // `resolve_project_for` reads the task's row first and would answer
+    // "no rows" for a non-task where this says what it is (found on
+    // review).
+    if !gtd::is_task(conn, task)? {
+        return Err(mecha_graph_core::Error::Other(format!(
+            "{task} is not a task on the board — nothing was changed"
+        )));
+    }
     // `project` resolved here too, before the first write, for the same
     // reason: a refused parent — ambiguous, unknown, a person, a non-string
     // — used to return an error on a call whose status change had already
@@ -2549,13 +2558,6 @@ fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
     if let Some(who) = waiting_on_arg {
         gtd::resolve_waiting_on(conn, who)
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
-    }
-    // And that the target is a task at all, which `session` refuses inside
-    // its setter.
-    if !gtd::is_task(conn, task)? {
-        return Err(mecha_graph_core::Error::Other(format!(
-            "{task} is not a task on the board — nothing was changed"
-        )));
     }
     // And the provenance pointer. After these, no writer below can refuse.
     match args.get("captured_from") {

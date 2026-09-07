@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a task filed under a person, say), detaching them only with `--apply`
   — `stats` and the nightly's alert line count the slips alone, since
   the plausible ones are kept, and re-filing a plausible filing under
-  the parent it already has says it was meant and takes it off the
+  the parent id it already has says it was meant (the vouch names that
+  parent, and lapses if the parent changes or is retyped) and takes it off the
   survey —
   and `mecha-graph task-project` re-files one from the direct interface;
   it also finds a parent whose node is gone (reported as `missing`), and
