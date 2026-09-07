@@ -1740,6 +1740,25 @@ mod tests {
         assert_eq!(moved["task"]["project_id"], "proj-tide");
         assert!(kg_task_update(&conn, &json!({ "task": id, "project": id })).is_err());
 
+        // A refused provenance pointer creates nothing: the board is the
+        // same size after the call as before, so a caller told "no task
+        // was created" can retry without staging a duplicate.
+        let before = kg_task_list(&conn, &json!({ "include_closed": true })).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len();
+        let e = kg_task_create(
+            &conn,
+            &json!({ "name": "Ship it", "captured_from": { "kind": "mail", "id": "t9", "body": "…" } }),
+        )
+        .expect_err("a bad captured_from refuses the create");
+        assert!(e.to_string().contains("no task was created"), "{e}");
+        let after = kg_task_list(&conn, &json!({ "include_closed": true })).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "and it created nothing");
+
         // The object the id came in, re-sent instead of the string, is
         // refused — never an unfiled task that answers `created`.
         let e = kg_task_create(
@@ -2286,6 +2305,14 @@ fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<V
         // lets the create run and then refuses, which is the half-write this
         // pre-check exists to prevent.
         gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
+    }
+    // The provenance pointer is checked before the insert for the same
+    // reason `about` is: refused after it, the task existed while the
+    // error said nothing was created, and a caller retrying without the
+    // pointer staged a duplicate (found on review).
+    if !args["captured_from"].is_null() {
+        gtd::validate_captured_from(&args["captured_from"])
             .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
     }
     let task_id = gtd::create_task(

@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `mecha-graph task-project` re-files one from the direct interface.
   On `kg_task_update` the parent is resolved before anything is written,
   so a refused one changes nothing — not a status that already landed.
+  A refused `captured_from` refuses `kg_task_create` before the insert,
+  where it used to leave a task the error said was never created.
   The rule binds every writer of a parent, not only the resolver: the
   id writer re-checks what it is handed, `retype` refuses to turn a
   parent into a non-container while tasks sit under it, `merge` detaches
