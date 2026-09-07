@@ -236,7 +236,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_task_list",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project, who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
+            "description": "The GTD board: every open task, actionable statuses first (next, inbox, scheduled, waiting), then by due date. Each task carries its status, due/defer dates, parent project (`project` is its name, `project_id` its node id — cite the id), who it is waiting on, the entities it is `about` (each `{name, unreviewed}`, where `unreviewed: true` means a title-scan guess nobody has vetted — say so rather than reporting it as established), and — when it was captured from something — a `captured_from` pointer at the original (the email that asked, the request, the conversation). Use it to answer 'what should Ada do next', to check whether something is already tracked before creating it, and to find overdue items (due_at earlier than today). include_closed adds done/dropped history. `entity` narrows to one person, project or topic — pair it with include_closed to answer 'everything, open and finished, involving X'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2105,6 +2105,9 @@ fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
         "id": t.node_id, "name": t.name, "status": t.status,
         "due_at": t.due_at, "defer_until": t.defer_until,
         "context": t.context_tag, "project": t.project,
+        // The parent's node id beside its name — the pointer a consumer
+        // cites (`project:<id>`), where the name is prose.
+        "project_id": t.project_id,
         "waiting_on": t.waiting_on, "about": t.about,
         // Why a task with no live association is on this entity's card.
         "previously_waiting_on": t.previously_waiting_on,

@@ -21,6 +21,14 @@ pub struct TaskItem {
     pub completed_at: Option<String>,
     /// Parent project name (task_detail.parent_id), if any.
     pub project: Option<String>,
+    /// The parent project's node id — the same `task_detail.parent_id`
+    /// `project` is the name of. Carried beside the name because a name is
+    /// prose (it has spaces, and two nodes can share one) and a consumer
+    /// that records *which* project a task served needs the pointer the
+    /// board minted: mecha's goal record cites `project:<node id>` and
+    /// refuses an id with whitespace in it, so the name alone could never be
+    /// cited. Absent exactly when `project` is.
+    pub project_id: Option<String>,
     /// Who this waits on (live `waiting_on` fact), if anyone.
     pub waiting_on: Option<String>,
     /// Who held it before — names from `waiting_on` facts that have been
@@ -228,7 +236,10 @@ fn list_tasks_filtered(
                    -- back and forth listed the same holder repeatedly, and
                    -- this reads as a list of people rather than of events.
                    GROUP BY pn.id
-                   ORDER BY last_held DESC))
+                   ORDER BY last_held DESC)),
+                -- The parent's id beside its name (column 11): appended
+                -- last so no earlier column index moves.
+                td.parent_id
          FROM nodes n JOIN task_detail td ON td.node_id = n.id
          WHERE (?1 OR td.status NOT IN ('done','dropped'))
            AND (?3 IS NULL OR n.id = ?3)
@@ -328,6 +339,7 @@ fn list_tasks_filtered(
                     .get::<_, Option<String>>(14)?
                     .map(|joined| joined.split(NAME_SEP).map(str::to_string).collect())
                     .unwrap_or_default(),
+                project_id: r.get(15)?,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -1717,6 +1729,26 @@ mod tests {
         assert_eq!(review.waiting_on[0].1, "Nadia");
     }
 
+    /// A consumer that records which project a task served cites
+    /// `project:<node id>` and refuses whitespace in an id, so the name
+    /// alone could never be cited; the id rides beside it, and is absent
+    /// exactly when the name is.
+    #[test]
+    fn the_project_id_rides_beside_the_name_and_is_absent_with_it() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("proj-tide", "project", "Tide pool study")).unwrap();
+        let under =
+            create_task(&conn, "Ship the pilot", None, Some("Tide pool study"), None).unwrap();
+        let under = get_task(&conn, &under).unwrap().unwrap();
+        assert_eq!(under.project.as_deref(), Some("Tide pool study"));
+        assert_eq!(under.project_id.as_deref(), Some("proj-tide"));
+
+        let alone = create_task(&conn, "No project", None, None, None).unwrap();
+        let alone = get_task(&conn, &alone).unwrap().unwrap();
+        assert_eq!(alone.project, None);
+        assert_eq!(alone.project_id, None);
+    }
+
     #[test]
     fn test_list_tasks_ordering_and_joins() {
         let conn = open_memory().unwrap();
@@ -1756,6 +1788,9 @@ mod tests {
         let ids: Vec<&str> = open.iter().map(|t| t.node_id.as_str()).collect();
         assert_eq!(ids, vec!["t-next1", "t-next2", "t-in", "t-wait"]);
         assert_eq!(open[0].project.as_deref(), Some("R01 renewal"));
+        // The pointer rides beside the name: a consumer citing the project
+        // needs the id the board minted, never the prose.
+        assert_eq!(open[0].project_id.as_deref(), Some("p1"));
         assert_eq!(open[3].waiting_on.as_deref(), Some("Nadia"));
 
         let all = list_tasks(&conn, true).unwrap();

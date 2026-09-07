@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A task row carries its parent project's node id beside the name.**
+  `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
+  `project_id`, absent exactly when `project` is. The name is prose (spaces,
+  and two nodes can share one); a consumer recording *which* project a task
+  served cites `project:<node id>` and refuses whitespace in an id, so the
+  name alone could never be cited. mecha's goal record is that consumer.
+
 ## [0.1.5] - 2026-09-06
 
 ### Added
