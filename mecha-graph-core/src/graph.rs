@@ -897,21 +897,33 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
     // refused (found on review). Refused rather than detached — the
     // operator chose the retype and can re-file first.
     // The other direction: a node that is a task on the board — it has a
-    // `task_detail` row, whatever `nodes.node_type` says — cannot be
-    // retyped into anything else, because only the type would move and
-    // the row would stay: still on the board, and now a legal parent that
-    // the survey cannot see either, since its type reads `project` (found
-    // on review, twice: the row is the fact, and a type check beside it
-    // let a row a merge had moved through). Dropping or converting the
-    // task row is a different operation, and not this one.
-    // — except back *to* `task`, which is the one repair for a node that
-    // is a task by row and something else by type (found on review).
-    if node_type != "task" && crate::gtd::is_task(conn, node_id)? {
-        return Err(crate::error::Error::Other(format!(
-            "{} is a task on the board (it has a task row), and a task cannot be retyped into \
-             a {node_type} — drop or complete it instead",
-            node.name
-        )));
+    // `task_detail` row, whatever `nodes.node_type` says — cannot simply be
+    // retyped, because only the type would move and the row would stay:
+    // still on the board, and now a legal parent that the survey cannot
+    // see (found on review, twice: the row is the fact, and a type check
+    // beside it let a row a merge had moved through). But a captured task
+    // that turned out to be a project is a correction the direct interface
+    // exists to serve, and a rule with no exit was one more thing found on
+    // review: so a *finished* task with nothing filed under it converts —
+    // its task row is removed in the same transaction as the type moves,
+    // keeping the id, the facts, the mentions and the `about` edges the
+    // doc above says a drop-and-recreate would lose.
+    let converting_task = node_type != "task" && crate::gtd::is_task(conn, node_id)?;
+    if converting_task {
+        let status: String = conn.query_row(
+            "SELECT status FROM task_detail WHERE node_id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        let under = crate::gtd::tasks_under(conn, node_id)?;
+        if !matches!(status.as_str(), "done" | "dropped") || under > 0 {
+            return Err(crate::error::Error::Other(format!(
+                "{} is a task on the board ({status}, {under} task(s) filed under it) — a task \
+                 converts to a {node_type} only once it is done or dropped and nothing sits \
+                 under it; then retype again and the task row is removed with the type",
+                node.name
+            )));
+        }
     }
     if crate::gtd::NEVER_A_PARENT.contains(&node_type) {
         let under = crate::gtd::tasks_under(conn, node_id)?;
@@ -923,10 +935,27 @@ pub fn retype_node(conn: &Connection, node_id: &str, node_type: &str) -> Result<
             )));
         }
     }
-    conn.execute(
-        "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
-        params![node_id, node_type],
-    )?;
+    conn.execute_batch("SAVEPOINT retype_node")?;
+    let moved = (|| -> Result<()> {
+        if converting_task {
+            conn.execute(
+                "DELETE FROM task_detail WHERE node_id = ?1",
+                params![node_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE nodes SET node_type = ?2, updated_at = datetime('now') WHERE id = ?1",
+            params![node_id, node_type],
+        )?;
+        Ok(())
+    })();
+    match moved {
+        Ok(()) => conn.execute_batch("RELEASE retype_node")?,
+        Err(e) => {
+            conn.execute_batch("ROLLBACK TO retype_node; RELEASE retype_node")?;
+            return Err(e);
+        }
+    }
     // The id keeps its old prefix, and that is deliberate. It is an opaque
     // key that every fact, mention and rollup already references; rewriting
     // it to match the new type would mean rewriting all of them to gain a
