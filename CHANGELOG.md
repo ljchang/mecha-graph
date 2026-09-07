@@ -39,9 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule is applied, the row is the fact: a node that is on the board is a
   task whatever its type says, and is never a parent — to the resolver,
   the id writer, the merge, or the survey. `mecha-graph task-project <task>` with no
-  parent prints the current one and every detachment the store recorded.
-  On `kg_task_update` the parent is resolved before anything is written,
-  so a refused one changes nothing — not a status that already landed.
+  parent prints the current one and every detachment the store recorded;
+  the survey's text output says which filings are plausible; and
+  `--apply` runs as one transaction, recording a detachment only where it
+  landed. On `kg_task_update` the parent is resolved before anything is
+  written, and so are the dates, so a refused one changes nothing — not a
+  status that already landed.
   A refused `captured_from` refuses `kg_task_create` before the insert,
   where it used to leave a task the error said was never created.
   The rule binds every writer of a parent, not only the resolver: the
