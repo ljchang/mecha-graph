@@ -826,11 +826,60 @@ pub const MISSING_PARENT: &str = "missing";
 /// guard and read as deliberate filings rather than slips.
 const PLAUSIBLE_OLD_PARENTS: &[&str] = &["place", "event_series"];
 
+/// A task that was detached — by this survey's `--apply`, a merge onto a
+/// non-container, or a conversion — and has not been re-filed since: it
+/// carries a `detached_parents` record and no parent. Reported so the
+/// filings the survey exists to let a human review stay reviewable as a
+/// set after a merge has already detached them silently (found on review:
+/// the per-row record was queryable by nobody).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DetachedPending {
+    pub task_id: String,
+    pub task_name: String,
+    /// The most recent record: the parent it was last under, and why.
+    pub parent_id: String,
+    pub parent_name: String,
+    pub reason: String,
+    pub at: String,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct ParentRepairReport {
     pub found: Vec<UnfitParent>,
     /// Rows actually detached. Zero on a dry run, however many were found.
     pub detached: usize,
+    /// Tasks detached earlier and not re-filed since — nothing to apply,
+    /// something to review.
+    pub pending: Vec<DetachedPending>,
+}
+
+/// Tasks with a detachment record and no parent.
+pub fn detached_pending(conn: &Connection) -> Result<Vec<DetachedPending>> {
+    let mut stmt = conn.prepare(
+        "SELECT td.node_id, n.name,
+                json_extract(n.properties, '$.detached_parents[#-1].id'),
+                json_extract(n.properties, '$.detached_parents[#-1].name'),
+                json_extract(n.properties, '$.detached_parents[#-1].reason'),
+                json_extract(n.properties, '$.detached_parents[#-1].at')
+         FROM task_detail td
+         JOIN nodes n ON n.id = td.node_id
+         WHERE td.parent_id IS NULL
+           AND json_extract(n.properties, '$.detached_parents') IS NOT NULL
+         ORDER BY td.node_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DetachedPending {
+                task_id: r.get(0)?,
+                task_name: r.get(1)?,
+                parent_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                parent_name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                reason: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                at: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
 }
 
 /// Find (and optionally detach) tasks filed under a node that is never a
@@ -889,7 +938,11 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
-    let mut report = ParentRepairReport { found, detached: 0 };
+    let mut report = ParentRepairReport {
+        found,
+        detached: 0,
+        pending: Vec::new(),
+    };
     if apply {
         // One transaction for the pass, and per row the detach first and
         // the record only when it landed: a row re-filed between the survey
@@ -924,6 +977,9 @@ pub fn repair_unfit_parents(conn: &Connection, apply: bool) -> Result<ParentRepa
         }
         tx.commit()?;
     }
+    // Read after the apply, so what this pass just detached is on the
+    // list too.
+    report.pending = detached_pending(conn)?;
     Ok(report)
 }
 
@@ -975,10 +1031,21 @@ pub fn resolve_parent(conn: &Connection, what: &str) -> Result<crate::graph::Nod
                 )))
             }
             n => {
-                let names: Vec<String> = matches
+                // The count is exact; the enumeration is advice, and an
+                // unbounded one is kilobytes of tool error on the refusal a
+                // consumer most needs to read (found on review).
+                const SHOWN: usize = 10;
+                let mut names: Vec<String> = matches
                     .iter()
+                    .take(SHOWN)
                     .map(|n| format!("{} ({})", n.name, n.id))
                     .collect();
+                if n > SHOWN {
+                    names.push(format!(
+                        "…and {} more — narrow the name or name the id",
+                        n - SHOWN
+                    ));
+                }
                 return Err(Error::Other(format!(
                     "'{what}' matches {n} nodes — name the id instead, since a task's parent is \
                      durable and echoed as `project_id`: {}",
@@ -2496,6 +2563,15 @@ mod tests {
             row.project_id, None,
             "detached, never re-pointed onto a person"
         );
+        // A merge's silent detach is on the survey's pending list, so the
+        // set stays reviewable.
+        let pending = detached_pending(&conn).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.task_id == u && p.reason == "merge_nodes"),
+            "{pending:?}"
+        );
         let node = crate::graph::get_node(&conn, &u).unwrap().unwrap();
         assert_eq!(node.properties["detached_parents"][0]["id"], "proj-wren");
         assert_eq!(
@@ -2915,6 +2991,11 @@ mod tests {
             applied.found[0].detached,
             "the row says it was the one detached"
         );
+        // And it is now on the pending list, until re-filed.
+        assert_eq!(applied.pending.len(), 1);
+        assert_eq!(applied.pending[0].task_id, legacy);
+        assert_eq!(applied.pending[0].parent_id, "p-wren");
+        assert_eq!(applied.pending[0].reason, "repair_unfit_parents");
         assert_eq!(pid(&legacy), None);
         // The store remembers where it was, on the task itself.
         let node = crate::graph::get_node(&conn, &legacy).unwrap().unwrap();
@@ -2930,6 +3011,15 @@ mod tests {
             "a task under a real container is untouched"
         );
         assert!(repair_unfit_parents(&conn, true).unwrap().found.is_empty());
+        // Re-filed, it leaves the pending list.
+        set_task_project(&conn, &legacy, "Tidelab").unwrap();
+        assert!(
+            repair_unfit_parents(&conn, false)
+                .unwrap()
+                .pending
+                .is_empty(),
+            "re-filed: off the list"
+        );
     }
 
     #[test]

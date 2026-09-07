@@ -2340,8 +2340,23 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
             }
+            if report.found.is_empty() && report.pending.is_empty() {
+                println!("no task is filed under a node that is never a parent, and none waits re-filing");
+                return Ok(());
+            }
+            if !report.pending.is_empty() {
+                println!(
+                    "{} task(s) detached earlier and not re-filed since (`task-project <task> <parent>` re-files):",
+                    report.pending.len()
+                );
+                for d in &report.pending {
+                    println!(
+                        "  {}  {}  was under {} ({}) — {} at {}",
+                        d.task_id, d.task_name, d.parent_name, d.parent_id, d.reason, d.at
+                    );
+                }
+            }
             if report.found.is_empty() {
-                println!("no task is filed under a node that is never a parent");
                 return Ok(());
             }
             println!(
@@ -2390,8 +2405,54 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 // review — written and read by nothing). JSON too, like
                 // `repair-parents`: the history is the store's only record
                 // of where a task was filed, and prose is not a record.
-                let t = gtd::get_task(&conn, &task)?
-                    .ok_or_else(|| mecha_graph_core::Error::Other(format!("no task {task}")))?;
+                // A node that was a task and converted is off the board,
+                // and this is the reader for what its row held too (found
+                // on review — the conversion's records had none).
+                let Some(t) = gtd::get_task(&conn, &task)? else {
+                    let node = graph::get_node(&conn, &task)?
+                        .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
+                    let converted = node.properties.get("converted_task").cloned();
+                    let history = node.properties.get("detached_parents").cloned();
+                    if converted.is_none() {
+                        return Err(mecha_graph_core::Error::Other(format!(
+                            "{task} is not a task on the board, and never was one"
+                        )));
+                    }
+                    if want_json(cli_json, cli_text) {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "task": node.id, "name": node.name, "node_type": node.node_type,
+                                "converted_task": converted,
+                                "detached_parents": history.unwrap_or(serde_json::Value::Array(vec![])),
+                            }))?
+                        );
+                        return Ok(());
+                    }
+                    let c = converted.unwrap_or(serde_json::Value::Null);
+                    println!(
+                        "{} — now a {}; was a task ({}, completed {}) filed under {}, converted {}",
+                        node.name,
+                        node.node_type,
+                        c["status"].as_str().unwrap_or("?"),
+                        c["completed_at"].as_str().unwrap_or("never"),
+                        c["parent_id"].as_str().unwrap_or("no project"),
+                        c["at"].as_str().unwrap_or("?")
+                    );
+                    if let Some(h) = history.as_ref().and_then(|h| h.as_array()) {
+                        for r in h {
+                            println!(
+                                "  was under {} ({}, {}) — detached {} by {}",
+                                r["name"].as_str().unwrap_or("?"),
+                                r["type"].as_str().unwrap_or("?"),
+                                r["id"].as_str().unwrap_or("?"),
+                                r["at"].as_str().unwrap_or("?"),
+                                r["reason"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                    return Ok(());
+                };
                 if want_json(cli_json, cli_text) {
                     let node = graph::get_node(&conn, &task)?
                         .ok_or_else(|| mecha_graph_core::Error::Other(format!("no node {task}")))?;
