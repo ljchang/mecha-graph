@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PRECHECK_AUTO_ACCEPT`. The 08:00 half never read that file, so it now
   takes both precheck toggles from it (and no longer hardcodes
   `--auto-accept`) — an off-switch that reached one nightly would have left
-  the other making permanent rejects. The recurrence pool is read
+  the other making permanent rejects. It resolves the file through
+  `MECHA_GRAPH_DIR` as `nightly.sh` does, and a file that exists but does
+  not source cleanly fails closed: both toggles off, with an `ALERT` line. The recurrence pool is read
   once per sweep and shared by minting and the triage tally — it now holds
   every one-off reject permanently, and was being scanned twice — and the
   fold lane's stored reject prefix is pinned by a test, as the one-off

@@ -135,13 +135,25 @@ done
 # pkg's nightly already ran precheck hours ago, before these verdicts existed.
 # This second pass is what turns them into accepts.
 # Same flags as pkg's nightly, under the same toggles, read from the file
-# nightly.sh sources — cron exports nothing, so an off-switch written in
-# the documented place must reach both halves or it only half works. Only
-# these two are taken, each in a subshell, so nothing else in nightly.env
-# leaks into this script; the file wins, as it does in nightly.sh.
-NIGHTLY_ENV="$HOME/.mecha-graph/nightly.env"
+# nightly.sh sources (same path resolution) — cron exports nothing, so an
+# off-switch written in the documented place must reach both halves or it
+# only half works. Only these two are taken, each in a subshell, so nothing
+# else in nightly.env leaks into this script; the file wins, as it does in
+# nightly.sh.
+#
+# A file that EXISTS but cannot be sourced is not an absent one: failing
+# open there would switch on a lane that makes permanent rejects while its
+# off-switch sits unread. So an unreadable file fails closed — both
+# toggles off, loudly.
+NIGHTLY_ENV="${MECHA_GRAPH_DIR:-$HOME/.mecha-graph}/nightly.env"
+ENV_UNREADABLE=0
+if [ -f "$NIGHTLY_ENV" ] && ! (. "$NIGHTLY_ENV") >/dev/null 2>&1; then
+    ENV_UNREADABLE=1
+    log "ALERT: $NIGHTLY_ENV exists but does not source cleanly — precheck toggles forced OFF"
+fi
 env_toggle() {
     local name=$1 from_file=""
+    [ "$ENV_UNREADABLE" = "1" ] && { printf '0'; return; }
     [ -f "$NIGHTLY_ENV" ] && from_file="$(. "$NIGHTLY_ENV" >/dev/null 2>&1; printf '%s' "${!name:-}")"
     printf '%s' "${from_file:-${!name:-1}}"
 }
@@ -150,6 +162,11 @@ PRECHECK_TRIAGE="$(env_toggle PRECHECK_TRIAGE)"
 PRECHECK_ARGS=()
 [ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
 [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+# This pass is the only consumer of tonight's vet verdicts; without
+# --auto-accept they are filed and never banked. Say so, or the night reads
+# exactly like a banking one.
+[ "$PRECHECK_AUTO_ACCEPT" = "1" ] || \
+    log "precheck without --auto-accept: tonight's vet verdicts will not be banked"
 run_precheck() { "$PKG" precheck "${PRECHECK_ARGS[@]}" >>"$LOG" 2>&1 || log "precheck FAILED"; }
 log "precheck (banking tonight's verdicts)"
 run_precheck
