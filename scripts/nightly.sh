@@ -218,6 +218,10 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     PRECHECK_ARGS=()
     [ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
     [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+    # Where this run's precheck output starts: the blindness alarms read
+    # only from here, so a same-day re-run after the operator restarts the
+    # embedding server is judged on its own output, not the morning's.
+    PRECHECK_LOG_FROM=$(( $(wc -l <"$LOG") + 1 ))
     run "$PKG" precheck "${PRECHECK_ARGS[@]}"
     run "$PKG" summarize --limit "$SUMMARIZE_LIMIT" --model "$EXTRACT_MODEL"
 else
@@ -267,9 +271,11 @@ print('; '.join(alerts))
 # A precheck run whose embedding died mid-way prints its blindness marker
 # into this very log; surface it as an alert rather than leaving zeros
 # that read like a clean queue (grep target kept in step with main.rs).
-if grep -q "SEMANTIC TIERS SKIPPED" "$LOG"; then
+# Unset when precheck did not run tonight (GPU busy): nothing to judge.
+PRECHECK_OUT="$([ -n "${PRECHECK_LOG_FROM:-}" ] && tail -n +"$PRECHECK_LOG_FROM" "$LOG")"
+if grep -q "SEMANTIC TIERS SKIPPED" <<<"$PRECHECK_OUT"; then
     STALE="${STALE:+$STALE; }precheck ran blind: embedding failed mid-run"
-elif grep -q "embedding server unreachable" "$LOG"; then
+elif grep -q "embedding server unreachable" <<<"$PRECHECK_OUT"; then
     # Down before precheck started, so semantic_skipped was never set —
     # and with --triage on, "folded 0" is blindness, not a clean queue.
     STALE="${STALE:+$STALE; }precheck ran blind: embedding server unreachable"

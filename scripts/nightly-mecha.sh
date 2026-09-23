@@ -154,7 +154,7 @@ esac
 env_toggle() {
     local name=$1 from_file=""
     case "$NIGHTLY_ENV_STATUS" in
-        ok) from_file="$(. "$NIGHTLY_ENV" >/dev/null 2>&1; printf '%s' "${!name:-}")" ;;
+        ok) from_file="$(nightly_env_value "$NIGHTLY_ENV" "$name")" ;;
         absent) ;;
         *) printf '0'; return ;;
     esac
@@ -173,10 +173,13 @@ PRECHECK_ARGS=()
 # The blindness alarm nightly.sh has: with --triage on, a precheck that ran
 # without vectors reports "folded 0" beside real one-off rejects, and that
 # zero is blindness, not an absence of restatements.
+# Output streams into the log as it runs (tee), so a hang still leaves a
+# record; pipefail makes the substitution's status precheck's own, so the
+# exit code is kept and FAILED lands after the output that explains it.
 run_precheck() {
-    local out
-    out="$("$PKG" precheck "${PRECHECK_ARGS[@]}" 2>&1)" || log "precheck FAILED"
-    printf '%s\n' "$out" >>"$LOG"
+    local out rc=0
+    out="$("$PKG" precheck "${PRECHECK_ARGS[@]}" 2>&1 | tee -a "$LOG")" || rc=$?
+    [ "$rc" -eq 0 ] || log "precheck FAILED (exit $rc)"
     if printf '%s' "$out" | grep -qE "SEMANTIC TIERS SKIPPED|embedding server unreachable"; then
         log "ALERT: precheck ran blind — no embeddings; its semantic lanes (fold, dedup) did nothing"
     fi

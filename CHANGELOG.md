@@ -17,13 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--auto-accept`) — an off-switch that reached one nightly would have left
   the other making permanent rejects. Both halves judge that file through
   one helper, `scripts/nightly-env.sh`, so they cannot reach opposite
-  answers: a file that is unreadable, does not parse, or aborts when
-  sourced is skipped and fails closed — both precheck toggles off, with an
+  answers: a file that is unreadable (a dangling symlink included), does
+  not parse, or aborts when sourced — probed in one clean environment, so
+  the two callers' own variables cannot split the verdict — is skipped and
+  fails closed — both precheck toggles off, with an
   `ALERT` in each log — while a valid file whose last line merely returns
   false is fine. The 08:00 precheck also gains the blindness alarm the
   03:30 one has, and both now also alarm when the embedding server was
   down before precheck started: with `--triage` on, "folded 0" beside real
-  one-off rejects is blindness, not a clean queue. The recurrence pool is read
+  one-off rejects is blindness, not a clean queue. Each alarm reads only its
+  own run's precheck output, so a same-day re-run after the fix is judged
+  on its own. The recurrence pool is read
   once per sweep and shared by minting and the triage tally — it now holds
   every one-off reject permanently, and was being scanned twice — and the
   fold lane's stored reject prefix is pinned by a test, as the one-off
