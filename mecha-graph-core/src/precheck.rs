@@ -407,17 +407,92 @@ const ONE_OFF_REASON: &str = "precheck: one-off subject";
 /// graph that never ran the lane has no such rejects, so minting's own
 /// behaviour is unchanged. Read as TEXT so a subject stored as a JSON
 /// number counts rather than silently lowering a tally that rejects.
+///
+/// Pending rows count as they always have. A lane reject counts only as a
+/// DISTINCT claim (subject, normalized statement) not already in the pool:
+/// those rejects are permanent, and neither the queue-local dup tier nor
+/// rejection memory (human rejects only) collapses a re-queued copy, so a
+/// row count would let one sentence re-extracted across three
+/// prompt-version bumps reach the bar and mint a node. Pending rows are
+/// read first so a reject that repeats a waiting claim adds nothing.
 fn recurrence_pool_subjects(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT CAST(json_extract(payload, '$.subject') AS TEXT) FROM fact_candidate
+        "SELECT CAST(json_extract(payload, '$.subject') AS TEXT),
+                COALESCE(CAST(json_extract(payload, '$.statement') AS TEXT),
+                         CAST(json_extract(payload, '$.what') AS TEXT), ''),
+                status = 'proposed'
+         FROM fact_candidate
          WHERE (status = 'proposed'
                 OR (status = 'rejected' AND COALESCE(reject_reason, '') LIKE ?1 || '%'))
-           AND COALESCE(json_extract(payload, '$.subject'), '') != ''",
+           AND COALESCE(json_extract(payload, '$.subject'), '') != ''
+         ORDER BY status = 'proposed' DESC",
     )?;
-    let subjects = stmt
-        .query_map(params![ONE_OFF_REASON], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<_, _>>()?;
+    let rows = stmt.query_map(params![ONE_OFF_REASON], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+        ))
+    })?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut subjects = Vec::new();
+    for row in rows {
+        let (subject, statement, pending) = row?;
+        let fresh = seen.insert((subject.trim().to_lowercase(), normalize(&statement)));
+        if pending || fresh {
+            subjects.push(subject);
+        }
+    }
     Ok(subjects)
+}
+
+/// Whether minting could ever make a node for this (lowercased) subject.
+fn mint_eligible(key: &str) -> bool {
+    key.len() >= 3 && key.split_whitespace().count() <= 5 && !MINT_STOP.contains(&key)
+}
+
+/// Negation and change-of-state markers. A restatement must agree with its
+/// fact on these: "no longer uses the kiln" embeds right beside "uses the
+/// kiln daily", is shorter, and has the same predicate and object — it is
+/// the retraction, and folding it would count it as a confirmation.
+const NEGATION_MARKERS: &[&str] = &[
+    "not",
+    "no",
+    "never",
+    "none",
+    "nobody",
+    "nothing",
+    "neither",
+    "nor",
+    "without",
+    "stopped",
+    "quit",
+    "former",
+    "formerly",
+    "anymore",
+    "longer",
+    "used to",
+    "no longer",
+    "isn t",
+    "wasn t",
+    "doesn t",
+    "didn t",
+    "don t",
+    "won t",
+    "can t",
+    "cannot",
+    "aren t",
+    "weren t",
+    "hasn t",
+    "haven t",
+];
+
+/// True when a (normalized) statement carries a negation or state-change marker.
+fn negated(norm: &str) -> bool {
+    let padded = format!(" {norm} ");
+    NEGATION_MARKERS
+        .iter()
+        .any(|m| padded.contains(&format!(" {m} ")))
 }
 
 /// A subject named by 3+ distinct pending claims and known to nothing in
@@ -440,8 +515,7 @@ fn mint_recurring_subjects(conn: &Connection, dry_run: bool) -> Result<usize> {
     let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for s in subjects {
         let key = s.trim().to_lowercase();
-        let words = key.split_whitespace().count();
-        if key.len() < 3 || words > 5 || MINT_STOP.contains(&key.as_str()) {
+        if !mint_eligible(&key) {
             continue;
         }
         let e = counts.entry(key).or_insert((s.trim().to_string(), 0));
@@ -1072,7 +1146,8 @@ pub fn precheck_pending_with(
                         fact_object.as_deref().filter(|o| !o.is_empty()),
                         norm.split_whitespace().count(),
                         f.norm.split_whitespace().count(),
-                    ) {
+                    ) && negated(&norm) == negated(&f.norm)
+                    {
                         fold_target = Some(*i);
                     }
                 }
@@ -1126,8 +1201,13 @@ pub fn precheck_pending_with(
                     && !OWNER_WORDS.contains(&key.as_str())
                     && !NEVER_AUTO.contains(&predicate.as_str())
                     && !subject_known
+                    // A name minting can never mint (too short, too long)
+                    // is left for a human rather than counted toward a
+                    // node that will not come.
                     && (MINT_STOP.contains(&key.as_str())
-                        || subject_mentions.get(&key).copied().unwrap_or(0) < MINT_RECURRENCE);
+                        || (mint_eligible(&key)
+                            && subject_mentions.get(&key).copied().unwrap_or(0)
+                                < MINT_RECURRENCE));
                 if one_off {
                     if !dry_run {
                         fact::reject_candidate_opts(
@@ -1659,6 +1739,11 @@ mod tests {
         stage_llm(&conn, "Oriel Fenn", "Oriel Fenn runs a lab.");
         stage_llm(&conn, "Oriel Fenn", "Oriel Fenn studies bees.");
         let recurring = stage_llm(&conn, "Oriel Fenn", "Oriel Fenn moved labs.");
+        let unmintable = stage_llm(
+            &conn,
+            "the long winding river by the mill",
+            "The long winding river by the mill floods in spring.",
+        );
         let social = {
             let p = fact::ProposedFact {
                 subject: "Tamsin Rook".into(),
@@ -1716,6 +1801,10 @@ mod tests {
             (known, "a resolved subject is never one-off"),
             (owner, "the owner, however spelled, is never one-off"),
             (recurring, "a name with three claims is recurring"),
+            (
+                unmintable,
+                "a name minting can never mint is a human's, not a one-off",
+            ),
             (
                 social,
                 "a social-standing claim faces a human, known subject or not",
@@ -2068,6 +2157,81 @@ mod tests {
         assert_eq!(r.restatement_folded, 0, "{:?}", r.triage);
         assert_eq!(r.contradiction_flagged, 1);
         assert_eq!(status_of(&conn, restating), "proposed");
+    }
+
+    #[test]
+    fn one_sentence_re_extracted_three_times_is_still_one_claim() {
+        // The lane's rejects are permanent pool rows, and neither tier 2
+        // (queue-local) nor rejection memory (human rejects only) collapses
+        // a re-queued copy — so a row count reached the minting bar on the
+        // third prompt-version bump and made a phantom node.
+        let conn = open_memory().unwrap();
+        for night in 1..=3 {
+            let id = stage_llm(&conn, "Quillon Varga", "Quillon Varga sells kiosks.");
+            let r = triage_run(&conn, None);
+            assert_eq!(
+                r.subjects_minted, 0,
+                "night {night}: three copies are one claim"
+            );
+            assert_eq!(status_of(&conn, id), "rejected", "night {night}");
+        }
+    }
+
+    #[test]
+    fn negation_markers_are_read_on_word_boundaries() {
+        for yes in [
+            "nadia no longer uses the kiln",
+            "nadia doesn t use it",
+            "nadia is not here",
+            "the former chair",
+        ] {
+            assert!(negated(yes), "{yes}");
+        }
+        for no in [
+            "nadia uses the kiln",
+            "nadia notes the knot",
+            "a nonlinear model",
+            "known issues",
+        ] {
+            assert!(!negated(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_denial_never_folds_into_the_fact_it_denies() {
+        // Same subject, predicate and object, shorter, cosine 0.95: every
+        // other guard waves a retraction through.
+        static VECS: &[(&str, [f32; 3])] = &[("no longer", [0.95, 0.3122499, 0.0])];
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let fact_id = live_fact_with_vector(
+            &conn,
+            "Nadia uses the lab's shared kiln daily.",
+            "kiln",
+            [1.0, 0.0, 0.0],
+        );
+        let p = fact::ProposedFact {
+            subject: "Nadia".into(),
+            predicate: "uses".into(),
+            object: Some("Kiln".into()),
+            statement: "NADIA no longer uses the kiln.".into(),
+            ..Default::default()
+        };
+        let denial = fact::propose_fact(&conn, &p, "llm", None).unwrap();
+        let r = triage_run(&conn, Some(&stub_embedder(VECS)));
+        assert_eq!(r.restatement_folded, 0, "{:?}", r.triage);
+        assert_ne!(status_of(&conn, denial), "rejected");
+        let obs: i64 = conn
+            .query_row(
+                "SELECT observation_count FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            obs, 1,
+            "a retraction is not an observation of what it retracts"
+        );
     }
 
     #[test]
