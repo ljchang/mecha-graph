@@ -19,20 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Three mentions is the minting bar, and minting and the lane count ONE
   pool — pending claims plus the lane's own earlier rejects — so a name
   arriving once a night is rejected twice and minted on the third night,
-  rather than spared by one count and starved by the other. The
-  **fold** lane handles the calibration's surprise: at same-subject cosine
+  rather than spared by one count and starved by the other. A lane reject
+  counts only as a distinct claim, so one sentence re-extracted three times
+  is still one claim and mints nothing; a name minting could never mint
+  (too short, more than five words) is left for a human. The **fold** lane handles the calibration's surprise: at same-subject cosine
   ≥ 0.90 the owner accepted *more*, not less (81%), and each accept minted a
   second copy of a fact already held — a verdict of "true" is not a verdict
   of "new". A restatement (0.90–0.97, same predicate, the same normalized
   text object — a same-node restatement is tier 1's exact dup already — no
-  longer than the fact, not a
-  social-standing predicate) now bumps the existing fact's observation
+  longer than the fact, not a social-standing predicate, and agreeing with
+  the fact on negation — "no longer uses the kiln" embeds beside "uses the
+  kiln daily" and is the retraction, not a confirmation) now bumps the existing fact's observation
   count instead, decided after the contradiction tier so a fold never
   swallows a conflict. `--list` prints every decision tab-separated for a
   spot-check. The first dry run on the live queue caught the object guard's
   gap before anything was written: free-text objects compared as "no
   object" on both sides, which would have folded "uses tool X" into "uses
-  tool Y". On the live queue: 1,979 one-off rejects, 11 folds, of 4,439.
+  tool Y". On the live queue: 1,922 one-off rejects, 11 folds, of 4,439.
 
 - **A task row carries its parent project's node id beside the name.**
   `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
