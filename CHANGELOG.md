@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`precheck --triage`: two review-queue lanes set from the owner's own
+  verdicts, off by default.** A calibration replayed 4,362 human-decided
+  `llm` candidates against the graph as it stood when each was proposed.
+  A claim about a subject the graph knows nothing about, named by fewer than
+  three candidates of any status, was accepted 10% of the time (521 items);
+  a resolved subject, 76%. The **one-off-subject** lane rejects those
+  (`llm` only; never the owner however spelled; three mentions is the
+  minting bar, so the two lanes split unknown names between them). The
+  **fold** lane handles the calibration's surprise: at same-subject cosine
+  ≥ 0.90 the owner accepted *more*, not less (81%), and each accept minted a
+  second copy of a fact already held — a verdict of "true" is not a verdict
+  of "new". A restatement (0.90–0.97, same predicate, same object — node id
+  or normalized text, and an object at all — no longer than the fact, not a
+  social-standing predicate) now bumps the existing fact's observation
+  count instead, decided after the contradiction tier so a fold never
+  swallows a conflict. `--list` prints every decision tab-separated for a
+  spot-check. The first dry run on the live queue caught the object guard's
+  gap before anything was written: free-text objects compared as "no
+  object" on both sides, which would have folded "uses tool X" into "uses
+  tool Y". On the live queue: 1,925 one-off rejects, 11 folds, of 4,439.
+
 - **A task row carries its parent project's node id beside the name.**
   `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
   `project_id`, absent exactly when `project` is — the create echo now

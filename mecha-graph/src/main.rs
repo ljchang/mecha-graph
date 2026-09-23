@@ -515,6 +515,15 @@ enum Command {
         /// Count outcomes without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Also run the calibrated triage lanes: fold restatements of live
+        /// facts into them, and reject claims about one-off subjects the
+        /// graph knows nothing about (llm candidates only)
+        #[arg(long)]
+        triage: bool,
+        /// Print every triage decision (tab-separated: lane, candidate id,
+        /// statement, fact folded into / unresolved subject)
+        #[arg(long)]
+        list: bool,
     },
     /// Measure the global cluster threshold against the recorded human
     /// verdicts (review-on-use §4): at each cosine floor, how often two
@@ -3411,16 +3420,23 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
         }
 
-        Command::Precheck { auto_accept, no_semantic, dry_run } => {
+        Command::Precheck { auto_accept, no_semantic, dry_run, triage, list } => {
             let embedder = if no_semantic {
                 None
             } else {
                 let e = embed::Embedder::default();
                 e.available().then_some(e)
             };
-            let r = mecha_graph_core::precheck::precheck_pending_opts(
-                &conn, embedder.as_ref(), auto_accept, dry_run,
+            let r = mecha_graph_core::precheck::precheck_pending_with(
+                &conn,
+                embedder.as_ref(),
+                mecha_graph_core::precheck::PrecheckOpts { auto_accept, dry_run, triage },
             )?;
+            if list {
+                for d in &r.triage {
+                    println!("{}\t{}\t{}\t{}", d.lane, d.candidate_id, d.statement, d.detail);
+                }
+            }
             if dry_run {
                 println!("(dry run — nothing changed)");
             }
@@ -3430,13 +3446,14 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                  shadow-minted {} · left {} · subjects-backfilled {} · subjects-phrased {} · \
                  subjects-implied {} · subjects-minted {} · predicates-canonicalized {} · \
                  eventive {} · rejected-dup {} · rejected-semantic {} · commitment-dup {} · \
-                 commitment-stale {}",
+                 commitment-stale {} · folded {} · one-off-subject {}",
                 r.scanned, r.dup_of_fact, r.dup_in_queue, r.semantic_dup, r.ephemeral_rejected,
                 r.contradiction_flagged, r.similar_flagged, r.auto_accepted, r.shadow_minted,
                 r.left_for_review,
                 r.subject_backfilled, r.subject_phrased, r.subject_implied, r.subjects_minted,
                 r.predicate_canonicalized, r.eventive_rejected, r.rejected_dup,
-                r.rejected_semantic, r.commitment_dup, r.commitment_stale
+                r.rejected_semantic, r.commitment_dup, r.commitment_stale,
+                r.restatement_folded, r.one_off_subject_rejected
             );
             if embedder.is_none() && !no_semantic {
                 println!("(embedding server unreachable — semantic tier skipped)");
