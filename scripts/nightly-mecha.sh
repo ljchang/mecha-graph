@@ -3,10 +3,13 @@
 # llama-server, run after pkg's own sweep has finished with ollama.
 #
 #   1. vet    — judge pending candidates in the auto-accept classes
-#   2. precheck --auto-accept — bank the verdicts vet just filed
+#   2. precheck --auto-accept --triage — bank the verdicts vet just filed
 #   3. gossip — probe one or more entities, rotating
 #
 # Install:  crontab -e  →  0 8 * * *  .../scripts/nightly-mecha.sh
+#
+# Precheck toggles are shared with nightly.sh and read from the same file,
+# ~/.mecha-graph/nightly.env: PRECHECK_AUTO_ACCEPT=0, PRECHECK_TRIAGE=0.
 # (was gossip-nightly.sh; renamed 2026-08-16 when vet moved in.)
 #
 # ── Why vet is here and not in nightly.sh ────────────────────────────────────
@@ -131,9 +134,21 @@ done
 # ── 2. bank the verdicts ─────────────────────────────────────────────────────
 # pkg's nightly already ran precheck hours ago, before these verdicts existed.
 # This second pass is what turns them into accepts.
-# Same triage lanes as pkg's nightly, under the same toggle.
-PRECHECK_TRIAGE="${PRECHECK_TRIAGE:-1}"
-PRECHECK_ARGS=(--auto-accept)
+# Same flags as pkg's nightly, under the same toggles, read from the file
+# nightly.sh sources — cron exports nothing, so an off-switch written in
+# the documented place must reach both halves or it only half works. Only
+# these two are taken, each in a subshell, so nothing else in nightly.env
+# leaks into this script; the file wins, as it does in nightly.sh.
+NIGHTLY_ENV="$HOME/.mecha-graph/nightly.env"
+env_toggle() {
+    local name=$1 from_file=""
+    [ -f "$NIGHTLY_ENV" ] && from_file="$(. "$NIGHTLY_ENV" >/dev/null 2>&1; printf '%s' "${!name:-}")"
+    printf '%s' "${from_file:-${!name:-1}}"
+}
+PRECHECK_AUTO_ACCEPT="$(env_toggle PRECHECK_AUTO_ACCEPT)"
+PRECHECK_TRIAGE="$(env_toggle PRECHECK_TRIAGE)"
+PRECHECK_ARGS=()
+[ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
 [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
 run_precheck() { "$PKG" precheck "${PRECHECK_ARGS[@]}" >>"$LOG" 2>&1 || log "precheck FAILED"; }
 log "precheck (banking tonight's verdicts)"
