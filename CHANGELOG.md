@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **fold** lane handles the calibration's surprise: at same-subject cosine
   ≥ 0.90 the owner accepted *more*, not less (81%), and each accept minted a
   second copy of a fact already held — a verdict of "true" is not a verdict
-  of "new". A restatement (0.90–0.97, same predicate, same object — node id
-  or normalized text, and an object at all — no longer than the fact, not a
+  of "new". A restatement (0.90–0.97, same predicate, the same normalized
+  text object — a same-node restatement is tier 1's exact dup already — no
+  longer than the fact, not a
   social-standing predicate) now bumps the existing fact's observation
   count instead, decided after the contradiction tier so a fold never
   swallows a conflict. `--list` prints every decision tab-separated for a
