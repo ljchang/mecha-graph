@@ -32,9 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daily" and is the retraction, not a confirmation) is now recorded as an
   observation of the existing fact instead, by the corroboration rule (the
   counter moves once per new non-agent episode, so a re-extraction of the
-  same episode does not inflate it), decided after the contradiction tier so a fold never
+  same episode does not inflate it; sensitivity rises to the evidence's
+  MAX; confidence is recomputed), decided after the contradiction tier so a fold never
   swallows a conflict. `--list` prints every decision tab-separated for a
-  spot-check. The first dry run on the live queue caught the object guard's
+  spot-check. Neither lane's rejects count toward `fact::class_prior`:
+  they are selections, not verdicts on the class, and ~1,900 a sweep would
+  pull every future `llm` fact's prior toward the lane's own rate. The first dry run on the live queue caught the object guard's
   gap before anything was written: free-text objects compared as "no
   object" on both sides, which would have folded "uses tool X" into "uses
   tool Y". On the live queue: 1,922 one-off rejects, 11 folds, of 4,439.

@@ -354,11 +354,17 @@ fn resolve_unique(conn: &Connection, name: &str) -> Result<Option<String>> {
     }
 }
 
-/// A fold is a corroboration, so it follows the corroboration rule
-/// (`fact::propose`'s re-sighting path): every sighting is recorded as a
-/// `fact_observation` row, and the counter moves only for a NEW episode
-/// from a non-agent source — a prompt-version bump re-reads the same
-/// episode, and the same evidence read twice is not two observations.
+/// A fold is a corroboration, so it does everything `fact::propose`'s
+/// re-sighting path does, not a subset of it:
+/// - every sighting is recorded as a `fact_observation` row;
+/// - the counter moves only for a NEW episode from a non-agent source — a
+///   prompt-version bump re-reads the same episode, and the same evidence
+///   read twice is not two observations;
+/// - sensitivity rises to the MAX over contributing evidence — a personal
+///   fact restated in a private transcript becomes private (§10: hops don't
+///   launder, and a fold is a hop that skips the accept path);
+/// - confidence is recomputed from the trail, so the evidence moves the
+///   number retrieval ranks by.
 fn fold_observation(
     conn: &Connection,
     fact_id: i64,
@@ -395,6 +401,30 @@ fn fold_observation(
     if counts {
         bump_observation(conn, fact_id)?;
     }
+    if let Some(eid) = episode_id {
+        let episode_sens: Option<String> = conn
+            .query_row(
+                "SELECT sensitivity FROM episode WHERE id = ?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let fact_sens: String = conn.query_row(
+            "SELECT sensitivity FROM fact WHERE id = ?1",
+            params![fact_id],
+            |r| r.get(0),
+        )?;
+        if let Some(es) = episode_sens {
+            use crate::episode::sensitivity_rank;
+            if sensitivity_rank(&es) > sensitivity_rank(&fact_sens) {
+                conn.execute(
+                    "UPDATE fact SET sensitivity = ?2 WHERE id = ?1",
+                    params![fact_id, es],
+                )?;
+            }
+        }
+    }
+    fact::recompute_confidence(conn, fact_id)?;
     Ok(())
 }
 
@@ -439,7 +469,9 @@ const MINT_STOP: &[&str] = &[
 ];
 
 /// Reject reason of the triage one-off lane — a prefix other code matches.
-const ONE_OFF_REASON: &str = "precheck: one-off subject";
+pub(crate) const ONE_OFF_REASON: &str = "precheck: one-off subject";
+/// Reject reason of the triage fold lane — likewise matched by prefix.
+pub(crate) const FOLD_REASON: &str = "precheck: restatement of fact";
 
 /// The subjects recurrence is counted over — by minting AND by the triage
 /// one-off lane, which must share one denominator to split unknown names
@@ -1331,7 +1363,7 @@ pub fn precheck_pending_with(
                     conn,
                     c.id,
                     &format!(
-                        "precheck: restatement of fact {} folded in (observation recorded)",
+                        "{FOLD_REASON} {} folded in (observation recorded)",
                         live[i].uid
                     ),
                     false,
@@ -2297,7 +2329,7 @@ mod tests {
         upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
         let fact_id =
             live_fact_with_vector(&conn, "Nadia uses the kiln daily.", "kiln", [1.0, 0.0, 0.0]);
-        let ep = |source: &str, id: &str| -> i64 {
+        let ep = |source: &str, id: &str, sensitivity: &str| -> i64 {
             let e = Episode {
                 id: 0,
                 uid: String::new(),
@@ -2311,14 +2343,27 @@ mod tests {
                 lat: None,
                 lon: None,
                 location: None,
-                sensitivity: "personal".into(),
+                sensitivity: sensitivity.into(),
                 scope_id: None,
                 meta: None,
                 raw: None,
             };
             upsert_episode(&conn, &e).unwrap().0
         };
-        let (note, agent) = (ep("reflect.note", "n1"), ep("agent:mecha", "a1"));
+        let (note, agent) = (
+            ep("reflect.note", "n1", "private"),
+            ep("agent:mecha", "a1", "personal"),
+        );
+        let state = || -> (String, f64) {
+            conn.query_row(
+                "SELECT sensitivity, confidence FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (sens0, conf0) = state();
+        assert_eq!(sens0, "personal", "the premise");
         let obs = || -> (i64, i64) {
             conn.query_row(
                 "SELECT observation_count, (SELECT COUNT(*) FROM fact_observation WHERE fact_id = ?1)
@@ -2338,6 +2383,44 @@ mod tests {
             count - count0,
             1,
             "one new non-agent episode is one observation; a re-read and an agent's are not"
+        );
+        let (sens, conf) = state();
+        assert_eq!(
+            sens, "private",
+            "restated in a private episode, the fact is private: a fold is a hop, and hops don't launder"
+        );
+        assert!(
+            conf > conf0,
+            "the evidence moves the score: {conf0} -> {conf}"
+        );
+    }
+
+    #[test]
+    fn triage_rejects_are_not_verdicts_on_the_class_prior() {
+        // The one-off lane rejects a class's low-accept tail by selection,
+        // and a fold rejects a claim for being true: neither may drag the
+        // Beta prior every future fact of the class is born with.
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        for i in 0..6 {
+            let id = stage_llm(&conn, "Nadia", &format!("Nadia fact {i}."));
+            if i < 4 {
+                fact::accept_candidate(&conn, id).unwrap();
+            } else {
+                fact::reject_candidate(&conn, id, "not worth keeping").unwrap();
+            }
+        }
+        let before = fact::class_prior(&conn, "llm", "related_to").unwrap();
+        assert!(before.is_some(), "the premise: enough history for a prior");
+        for (i, reason) in [ONE_OFF_REASON, FOLD_REASON].iter().enumerate() {
+            for j in 0..20 {
+                let id = stage_llm(&conn, "Nadia", &format!("Nadia lane {i} {j}."));
+                fact::reject_candidate_opts(&conn, id, &format!("{reason} — test"), false).unwrap();
+            }
+        }
+        assert_eq!(
+            fact::class_prior(&conn, "llm", "related_to").unwrap(),
+            before
         );
     }
 
