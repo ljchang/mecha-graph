@@ -354,6 +354,50 @@ fn resolve_unique(conn: &Connection, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// A fold is a corroboration, so it follows the corroboration rule
+/// (`fact::propose`'s re-sighting path): every sighting is recorded as a
+/// `fact_observation` row, and the counter moves only for a NEW episode
+/// from a non-agent source — a prompt-version bump re-reads the same
+/// episode, and the same evidence read twice is not two observations.
+fn fold_observation(
+    conn: &Connection,
+    fact_id: i64,
+    episode_id: Option<i64>,
+    confidence: Option<f64>,
+) -> Result<()> {
+    fact::record_observation(
+        conn,
+        fact_id,
+        episode_id,
+        "corroborated",
+        "precheck:fold",
+        confidence,
+    )?;
+    let counts = match episode_id {
+        Some(eid) => {
+            let seen_before: bool = conn.query_row(
+                "SELECT COUNT(*) > 1 FROM fact_observation WHERE fact_id = ?1 AND episode_id = ?2",
+                params![fact_id, eid],
+                |r| r.get(0),
+            )?;
+            let agent_sourced: bool = conn
+                .query_row(
+                    "SELECT source LIKE 'probe%' OR source LIKE 'agent:%' FROM episode WHERE id = ?1",
+                    params![eid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            !seen_before && !agent_sourced
+        }
+        None => true,
+    };
+    if counts {
+        bump_observation(conn, fact_id)?;
+    }
+    Ok(())
+}
+
 fn bump_observation(conn: &Connection, fact_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE fact SET observation_count = observation_count + 1 WHERE id = ?1",
@@ -451,10 +495,13 @@ fn mint_eligible(key: &str) -> bool {
     key.len() >= 3 && key.split_whitespace().count() <= 5 && !MINT_STOP.contains(&key)
 }
 
-/// Negation and change-of-state markers. A restatement must agree with its
-/// fact on these: "no longer uses the kiln" embeds right beside "uses the
-/// kiln daily", is shorter, and has the same predicate and object — it is
-/// the retraction, and folding it would count it as a confirmation.
+/// Negation and change-of-state markers. A candidate carrying one never
+/// folds: "no longer uses the kiln" embeds right beside "uses the kiln
+/// daily", is shorter, and has the same predicate and object — it is the
+/// retraction, and folding it would count it as a confirmation. Checked on
+/// the candidate alone: live facts are positive by construction
+/// (`fact_current`), so a marker in a fact's wording ("the kiln, not the
+/// lathe") is a misread, and matching on it would admit the retraction.
 const NEGATION_MARKERS: &[&str] = &[
     "not",
     "no",
@@ -1146,7 +1193,7 @@ pub fn precheck_pending_with(
                         fact_object.as_deref().filter(|o| !o.is_empty()),
                         norm.split_whitespace().count(),
                         f.norm.split_whitespace().count(),
-                    ) && negated(&norm) == negated(&f.norm)
+                    ) && !negated(&norm)
                     {
                         fold_target = Some(*i);
                     }
@@ -1279,12 +1326,12 @@ pub fn precheck_pending_with(
         // claim is exactly what a human must see, however close it embeds.
         if let (Some(i), None) = (fold_target, &contradiction) {
             if !dry_run {
-                bump_observation(conn, live[i].id)?;
+                fold_observation(conn, live[i].id, c.episode_id, c.confidence)?;
                 fact::reject_candidate_opts(
                     conn,
                     c.id,
                     &format!(
-                        "precheck: restatement of fact {} folded in (observation bumped)",
+                        "precheck: restatement of fact {} folded in (observation recorded)",
                         live[i].uid
                     ),
                     false,
@@ -1827,6 +1874,13 @@ mod tests {
             reason.starts_with("precheck:"),
             "a machine reject must stay out of rejection memory and the human record"
         );
+        // Written inline, not via the constant: stored reasons are read back
+        // by prefix (`recurrence_pool_subjects`), so rewording the constant
+        // would silently drop every historical reject from the pool.
+        assert!(
+            reason.starts_with("precheck: one-off subject"),
+            "the stored prefix is persisted state: {reason}"
+        );
     }
 
     fn triage_run(conn: &Connection, embedder: Option<&Embedder>) -> PrecheckReport {
@@ -2206,7 +2260,9 @@ mod tests {
         upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
         let fact_id = live_fact_with_vector(
             &conn,
-            "Nadia uses the lab's shared kiln daily.",
+            // A stray "not" in the positive fact's wording: matching the
+            // two sides' markers would read this as agreement and fold.
+            "Nadia uses the lab's shared kiln, not the lathe, for glazing.",
             "kiln",
             [1.0, 0.0, 0.0],
         );
@@ -2231,6 +2287,57 @@ mod tests {
         assert_eq!(
             obs, 1,
             "a retraction is not an observation of what it retracts"
+        );
+    }
+
+    #[test]
+    fn a_fold_counts_each_episode_once_and_never_an_agent_s() {
+        use crate::episode::{upsert_episode, Episode};
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let fact_id =
+            live_fact_with_vector(&conn, "Nadia uses the kiln daily.", "kiln", [1.0, 0.0, 0.0]);
+        let ep = |source: &str, id: &str| -> i64 {
+            let e = Episode {
+                id: 0,
+                uid: String::new(),
+                source: source.into(),
+                source_id: id.into(),
+                source_ref: None,
+                body: format!("episode {id}"),
+                occurred_at: "2026-08-01 12:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: "personal".into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            };
+            upsert_episode(&conn, &e).unwrap().0
+        };
+        let (note, agent) = (ep("reflect.note", "n1"), ep("agent:mecha", "a1"));
+        let obs = || -> (i64, i64) {
+            conn.query_row(
+                "SELECT observation_count, (SELECT COUNT(*) FROM fact_observation WHERE fact_id = ?1)
+                 FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (count0, rows0) = obs();
+        fold_observation(&conn, fact_id, Some(note), Some(0.9)).unwrap();
+        fold_observation(&conn, fact_id, Some(note), Some(0.9)).unwrap();
+        fold_observation(&conn, fact_id, Some(agent), Some(0.9)).unwrap();
+        let (count, rows) = obs();
+        assert_eq!(rows - rows0, 3, "every sighting is recorded");
+        assert_eq!(
+            count - count0,
+            1,
+            "one new non-agent episode is one observation; a re-read and an agent's are not"
         );
     }
 

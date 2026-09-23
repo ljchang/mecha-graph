@@ -27,10 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second copy of a fact already held — a verdict of "true" is not a verdict
   of "new". A restatement (0.90–0.97, same predicate, the same normalized
   text object — a same-node restatement is tier 1's exact dup already — no
-  longer than the fact, not a social-standing predicate, and agreeing with
-  the fact on negation — "no longer uses the kiln" embeds beside "uses the
-  kiln daily" and is the retraction, not a confirmation) now bumps the existing fact's observation
-  count instead, decided after the contradiction tier so a fold never
+  longer than the fact, not a social-standing predicate, and carrying no
+  negation marker — "no longer uses the kiln" embeds beside "uses the kiln
+  daily" and is the retraction, not a confirmation) is now recorded as an
+  observation of the existing fact instead, by the corroboration rule (the
+  counter moves once per new non-agent episode, so a re-extraction of the
+  same episode does not inflate it), decided after the contradiction tier so a fold never
   swallows a conflict. `--list` prints every decision tab-separated for a
   spot-check. The first dry run on the live queue caught the object guard's
   gap before anything was written: free-text objects compared as "no
