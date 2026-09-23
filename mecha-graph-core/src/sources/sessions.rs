@@ -110,8 +110,11 @@ impl Source for HermesSource {
                 ended,
                 first_user,
             ) = row?;
+            // The cursor is the newest *start* the driver has seen, so a
+            // session is past it only if it was still active afterwards —
+            // compare its end, not its start (see `ClaudeSource::fetch`).
             if let Some(s) = since {
-                if started.as_str() <= s {
+                if ended.as_str() <= s {
                     continue;
                 }
             }
@@ -336,8 +339,16 @@ impl Source for ClaudeSource {
                     continue;
                 }
                 let occurred_at = s.first_ts.clone().unwrap();
+                // Filter on last activity, not start. The driver advances the
+                // cursor to the newest `occurred_at` (a start), so filtering on
+                // start froze every session at the snapshot of the night it was
+                // first seen: a session open across several nights never
+                // re-fetched, and its counts, touched projects and end time
+                // stayed as they were then. Re-fetching one whose content has
+                // not changed costs a hash compare (`Unchanged`).
+                let last_active = s.last_ts.as_deref().unwrap_or(&occurred_at);
                 if let Some(cursor) = since {
-                    if occurred_at.as_str() <= cursor {
+                    if last_active <= cursor {
                         continue;
                     }
                 }
@@ -462,5 +473,68 @@ mod tests {
         assert_eq!(project.name, "flowmail");
         let eps = crate::episode::episodes_for_node(&conn, &project.id, 10).unwrap();
         assert_eq!(eps.len(), 1);
+    }
+
+    /// A session still open when a later one starts must be re-fetched as it
+    /// grows. The cursor is the newest start, so filtering on start froze the
+    /// older session at its first-night snapshot (every nightly read `0 updated`).
+    #[test]
+    fn test_claude_session_open_across_cursor_is_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-home-user");
+        std::fs::create_dir_all(&proj).unwrap();
+        let line = |t: &str, ts: &str, text: &str| {
+            format!(
+                r#"{{"type":"{t}","timestamp":"{ts}","message":{{"role":"{t}","content":"{text}"}}}}"#
+            ) + "\n"
+        };
+        let long = proj.join("long.jsonl");
+        std::fs::write(
+            &long,
+            line("user", "2026-09-14T10:00:00.000Z", "start the long one"),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("later.jsonl"),
+            line("user", "2026-09-17T10:00:00.000Z", "a later session"),
+        )
+        .unwrap();
+
+        let conn = open_memory().unwrap();
+        let src = ClaudeSource::new(dir.path());
+        let first = crate::sources::ingest(&conn, &src, None).unwrap();
+        assert_eq!(first.inserted, 2);
+        let cursor = crate::sources::get_cursor(&conn, "session.claude").unwrap();
+        assert_eq!(cursor.as_deref(), Some("2026-09-17 10:00:00"));
+
+        // The long session keeps going past the cursor.
+        let mut body = std::fs::read_to_string(&long).unwrap();
+        body.push_str(&line("assistant", "2026-09-20T09:00:00.000Z", "more work"));
+        body.push_str(&line("user", "2026-09-20T09:05:00.000Z", "and more"));
+        std::fs::write(&long, body).unwrap();
+
+        let second = crate::sources::ingest(&conn, &src, cursor.as_deref()).unwrap();
+        assert_eq!(second.updated, 1, "the grown session is refreshed");
+        assert_eq!(second.inserted, 0);
+        let end: Option<String> = conn
+            .query_row(
+                "SELECT occurred_end FROM episode WHERE source_id = 'long'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(end.as_deref(), Some("2026-09-20 09:05:00"));
+        // The cursor tracks starts, so it does not move past the later session.
+        assert_eq!(
+            crate::sources::get_cursor(&conn, "session.claude")
+                .unwrap()
+                .as_deref(),
+            Some("2026-09-17 10:00:00")
+        );
+
+        // Nothing changed: the session active past the cursor is re-fetched but
+        // hashes `Unchanged`, and the one that ended at the cursor is not fetched.
+        let third = crate::sources::ingest(&conn, &src, cursor.as_deref()).unwrap();
+        assert_eq!((third.inserted, third.updated, third.unchanged), (0, 0, 1));
     }
 }
