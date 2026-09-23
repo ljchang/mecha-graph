@@ -60,7 +60,19 @@ mkdir -p "$LOG_DIR"
 # Keep 30 days of logs.
 find "$LOG_DIR" -name 'nightly-*.log' -mtime +30 -delete 2>/dev/null
 
-[ -f "$MECHA_GRAPH_DIR/nightly.env" ] && . "$MECHA_GRAPH_DIR/nightly.env"
+# A nightly.env that exists but will not source is not an absent one. It is
+# skipped whole (a partial source applies half an intent; an aborting one
+# would kill this run), and the precheck toggles fail CLOSED — the triage
+# lane makes permanent rejects, and its off-switch may be what sits unread.
+# nightly-mecha.sh applies the same rule through the same helper.
+. "$REPO_DIR/scripts/nightly-env.sh"
+NIGHTLY_ENV="$MECHA_GRAPH_DIR/nightly.env"
+NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
+case "$NIGHTLY_ENV_STATUS" in
+    ok) . "$NIGHTLY_ENV" ;;
+    absent) ;;
+    *) PRECHECK_AUTO_ACCEPT=0 PRECHECK_TRIAGE=0 ;;
+esac
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
@@ -77,6 +89,10 @@ GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
 run() { log "\$ $*"; "$@" >>"$LOG" 2>&1 || log "FAILED (exit $?): $*"; }
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — skipped; precheck toggles forced OFF" ;;
+esac
 
 log "=== nightly start ==="
 if [ -n "${BEE_BUS_MISSING:-}" ]; then
@@ -253,7 +269,15 @@ print('; '.join(alerts))
 # that read like a clean queue (grep target kept in step with main.rs).
 if grep -q "SEMANTIC TIERS SKIPPED" "$LOG"; then
     STALE="${STALE:+$STALE; }precheck ran blind: embedding failed mid-run"
+elif grep -q "embedding server unreachable" "$LOG"; then
+    # Down before precheck started, so semantic_skipped was never set —
+    # and with --triage on, "folded 0" is blindness, not a clean queue.
+    STALE="${STALE:+$STALE; }precheck ran blind: embedding server unreachable"
 fi
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) STALE="${STALE:+$STALE; }nightly.env $NIGHTLY_ENV_STATUS (precheck toggles forced off)" ;;
+esac
 
 if [ -n "$STALE" ]; then
     log "ALERTS: $STALE"

@@ -141,20 +141,23 @@ done
 # else in nightly.env leaks into this script; the file wins, as it does in
 # nightly.sh.
 #
-# A file that EXISTS but cannot be sourced is not an absent one: failing
-# open there would switch on a lane that makes permanent rejects while its
-# off-switch sits unread. So an unreadable file fails closed — both
-# toggles off, loudly.
+# A file that exists but will not source fails closed — both toggles off,
+# loudly — through the helper nightly.sh uses, so one file cannot get two
+# answers from the two halves.
+. "$REPO_DIR/scripts/nightly-env.sh"
 NIGHTLY_ENV="${MECHA_GRAPH_DIR:-$HOME/.mecha-graph}/nightly.env"
-ENV_UNREADABLE=0
-if [ -f "$NIGHTLY_ENV" ] && ! (. "$NIGHTLY_ENV") >/dev/null 2>&1; then
-    ENV_UNREADABLE=1
-    log "ALERT: $NIGHTLY_ENV exists but does not source cleanly — precheck toggles forced OFF"
-fi
+NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — precheck toggles forced OFF" ;;
+esac
 env_toggle() {
     local name=$1 from_file=""
-    [ "$ENV_UNREADABLE" = "1" ] && { printf '0'; return; }
-    [ -f "$NIGHTLY_ENV" ] && from_file="$(. "$NIGHTLY_ENV" >/dev/null 2>&1; printf '%s' "${!name:-}")"
+    case "$NIGHTLY_ENV_STATUS" in
+        ok) from_file="$(. "$NIGHTLY_ENV" >/dev/null 2>&1; printf '%s' "${!name:-}")" ;;
+        absent) ;;
+        *) printf '0'; return ;;
+    esac
     printf '%s' "${from_file:-${!name:-1}}"
 }
 PRECHECK_AUTO_ACCEPT="$(env_toggle PRECHECK_AUTO_ACCEPT)"
@@ -167,7 +170,17 @@ PRECHECK_ARGS=()
 # exactly like a banking one.
 [ "$PRECHECK_AUTO_ACCEPT" = "1" ] || \
     log "precheck without --auto-accept: tonight's vet verdicts will not be banked"
-run_precheck() { "$PKG" precheck "${PRECHECK_ARGS[@]}" >>"$LOG" 2>&1 || log "precheck FAILED"; }
+# The blindness alarm nightly.sh has: with --triage on, a precheck that ran
+# without vectors reports "folded 0" beside real one-off rejects, and that
+# zero is blindness, not an absence of restatements.
+run_precheck() {
+    local out
+    out="$("$PKG" precheck "${PRECHECK_ARGS[@]}" 2>&1)" || log "precheck FAILED"
+    printf '%s\n' "$out" >>"$LOG"
+    if printf '%s' "$out" | grep -qE "SEMANTIC TIERS SKIPPED|embedding server unreachable"; then
+        log "ALERT: precheck ran blind — no embeddings; its semantic lanes (fold, dedup) did nothing"
+    fi
+}
 log "precheck (banking tonight's verdicts)"
 run_precheck
 

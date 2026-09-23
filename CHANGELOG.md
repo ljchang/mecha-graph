@@ -15,9 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PRECHECK_AUTO_ACCEPT`. The 08:00 half never read that file, so it now
   takes both precheck toggles from it (and no longer hardcodes
   `--auto-accept`) — an off-switch that reached one nightly would have left
-  the other making permanent rejects. It resolves the file through
-  `MECHA_GRAPH_DIR` as `nightly.sh` does, and a file that exists but does
-  not source cleanly fails closed: both toggles off, with an `ALERT` line. The recurrence pool is read
+  the other making permanent rejects. Both halves judge that file through
+  one helper, `scripts/nightly-env.sh`, so they cannot reach opposite
+  answers: a file that is unreadable, does not parse, or aborts when
+  sourced is skipped and fails closed — both precheck toggles off, with an
+  `ALERT` in each log — while a valid file whose last line merely returns
+  false is fine. The 08:00 precheck also gains the blindness alarm the
+  03:30 one has, and both now also alarm when the embedding server was
+  down before precheck started: with `--triage` on, "folded 0" beside real
+  one-off rejects is blindness, not a clean queue. The recurrence pool is read
   once per sweep and shared by minting and the triage tally — it now holds
   every one-off reject permanently, and was being scanned twice — and the
   fold lane's stored reject prefix is pinned by a test, as the one-off
