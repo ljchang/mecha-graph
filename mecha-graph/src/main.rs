@@ -3432,9 +3432,21 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 embedder.as_ref(),
                 mecha_graph_core::precheck::PrecheckOpts { auto_accept, dry_run, triage },
             )?;
+            if list && !triage {
+                eprintln!("(--list prints triage decisions; add --triage to make any)");
+            }
             if list {
+                // One record per line: model-written text can carry tabs and
+                // newlines, and either would split a record mid-field.
+                let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
                 for d in &r.triage {
-                    println!("{}\t{}\t{}\t{}", d.lane, d.candidate_id, d.statement, d.detail);
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        d.lane,
+                        d.candidate_id,
+                        field(&d.statement),
+                        field(&d.detail)
+                    );
                 }
             }
             if dry_run {
