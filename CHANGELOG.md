@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`precheck --triage`: two review-queue lanes set from the owner's own
+  verdicts, off by default.** A calibration replayed 4,362 human-decided
+  `llm` candidates against the graph as it stood when each was proposed.
+  A claim about a subject the graph knows nothing about, named by only one
+  or two candidates, was accepted 10% of the time (521 items); a resolved
+  subject, 76%. The **one-off-subject** lane rejects those (`llm` only;
+  never the owner however spelled; never a `NEVER_AUTO` social claim).
+  Three mentions is the minting bar, and minting and the lane count ONE
+  pool — pending claims plus the lane's own earlier rejects — so a name
+  arriving once a night is rejected twice and minted on the third night,
+  rather than spared by one count and starved by the other. A lane reject
+  counts only as a distinct claim, so one sentence re-extracted three times
+  is still one claim and mints nothing; a name minting could never mint
+  (too short, more than five words) is left for a human. The **fold** lane handles the calibration's surprise: at same-subject cosine
+  ≥ 0.90 the owner accepted *more*, not less (81%), and each accept minted a
+  second copy of a fact already held — a verdict of "true" is not a verdict
+  of "new". A restatement (0.90–0.97, same predicate, the same normalized
+  text object — a same-node restatement is tier 1's exact dup already — no
+  longer than the fact, not a social-standing predicate, and carrying no
+  negation marker — "no longer uses the kiln" embeds beside "uses the kiln
+  daily" and is the retraction, not a confirmation) is now recorded as an
+  observation of the existing fact instead, by the corroboration rule (the
+  counter moves once per new non-agent episode, so a re-extraction of the
+  same episode does not inflate it; sensitivity rises to the evidence's
+  MAX; confidence is recomputed), decided after the contradiction tier so a fold never
+  swallows a conflict. `--list` prints every decision tab-separated for a
+  spot-check. Neither lane's rejects count toward `fact::class_prior`:
+  they are selections, not verdicts on the class, and ~1,900 a sweep would
+  pull every future `llm` fact's prior toward the lane's own rate. The first dry run on the live queue caught the object guard's
+  gap before anything was written: free-text objects compared as "no
+  object" on both sides, which would have folded "uses tool X" into "uses
+  tool Y". On the live queue: 1,922 one-off rejects, 11 folds, of 4,439.
+
 - **A task row carries its parent project's node id beside the name.**
   `kg_task_list`, `kg_entity`'s task block and the two task echoes gain
   `project_id`, absent exactly when `project` is — the create echo now

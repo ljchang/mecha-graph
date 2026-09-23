@@ -144,8 +144,14 @@ facts are rejected with an observation bump, in-queue repeats collapse,
 conversational recaps ("X discussed Y") are dropped as bloat since the
 episode already records them, contradictions on single-valued predicates
 are flagged and always held for a human, and (opt-in) clean novel facts
-on durable predicates auto-accept. What reaches the TUI review screen is
-meant to be only what genuinely needs a decision.
+on durable predicates auto-accept. With `--triage` (opt-in, set from the
+owner's own verdict history), two more lanes run: a restatement of a live
+fact — same subject, predicate and object, no longer, not negated, cosine
+0.90–0.97 — is folded into it as an observation, and a claim about a
+subject the graph knows nothing about and that fewer than three claims
+name is rejected as a one-off (minting and the lane count one pool, so the
+third mention mints the node instead). What reaches the TUI review screen
+is meant to be only what genuinely needs a decision.
 
 ## Retrieval — filter first, rank second
 

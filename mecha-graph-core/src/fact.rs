@@ -724,16 +724,36 @@ pub(crate) fn resolve_predicate(conn: &Connection, predicate: &str) -> Result<St
 
 /// The (proposer, predicate) review-history prior: acceptance rate over
 /// past verdicts, at [`PRIOR_STRENGTH`]. None when history is too thin.
-fn class_prior(conn: &Connection, proposer: &str, predicate: &str) -> Result<Option<(f64, f64)>> {
+///
+/// The precheck triage lanes' rejects are not verdicts on the class and are
+/// excluded: the one-off lane rejects a night's worth of the class's
+/// lowest-accept tail by selection, and a fold rejects a claim BECAUSE it
+/// is true and already held — counting either would drag every future
+/// fact's prior toward the lane's own rate, more with each sweep.
+pub(crate) fn class_prior(
+    conn: &Connection,
+    proposer: &str,
+    predicate: &str,
+) -> Result<Option<(f64, f64)>> {
     let mut stmt = conn.prepare(
         "SELECT COALESCE(json_extract(payload,'$.predicate'), ''),
                 SUM(status='accepted'), SUM(status='rejected')
          FROM fact_candidate
          WHERE proposed_by = ?1 AND status IN ('accepted','rejected')
+           AND NOT (status = 'rejected'
+                    AND (COALESCE(reject_reason, '') LIKE ?2 || '%'
+                         OR COALESCE(reject_reason, '') LIKE ?3 || '%'))
          GROUP BY 1",
     )?;
     let rows: Vec<(String, i64, i64)> = stmt
-        .query_map(params![proposer], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(
+            params![
+                proposer,
+                crate::precheck::ONE_OFF_REASON,
+                crate::precheck::FOLD_REASON
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
         .collect::<std::result::Result<_, _>>()?;
     let (mut acc, mut rej) = (0i64, 0i64);
     for (raw, a, r) in rows {

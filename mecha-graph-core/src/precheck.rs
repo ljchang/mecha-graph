@@ -67,6 +67,74 @@ pub const SEMANTIC_DUP_THRESHOLD: f64 = 0.97;
 /// Band [flag, dup): kept, but annotated with the similar existing fact.
 pub const SEMANTIC_FLAG_THRESHOLD: f64 = 0.83;
 
+// The two triage lanes below were set from the owner's own verdicts, not
+// from a rate inherited from an older embedder. Calibration on 2026-09-23
+// replayed 4,362 human-decided `llm` candidates against the graph as it
+// stood when each was proposed:
+//
+//   subject known to nothing, named by 1-2 candidates   10% accepted (521)
+//   subject a bare pronoun / "the group"-shaped          7% accepted  (41)
+//   subject resolves to a node                          76% accepted
+//   max same-subject cosine >= 0.90                     81% accepted (148)
+//
+// The last row is the surprise, and why redundancy is a FOLD and not a
+// reject: the owner accepts restatements because they are true, and each
+// accept minted a second copy of a fact the graph already held — only ~75
+// of ~2,700 accepts in the sample merged into an existing fact. A verdict of
+// "true" is not a verdict of "new".
+
+/// Same-subject, same-predicate cosine at or above this (and below the dup
+/// threshold) is a restatement: folded into the existing fact as an
+/// observation. Harrier scale, like the two thresholds above.
+pub const RESTATEMENT_THRESHOLD: f64 = 0.90;
+
+/// Subjects that name the owner without resolving to the owner's node. A
+/// claim about the owner is never a one-off subject, however it is spelled.
+const OWNER_WORDS: &[&str] = &["user", "the user", "i", "me", "myself"];
+
+/// What the calibrated triage lanes decided about one candidate — kept on
+/// the report so a dry run can be spot-checked item by item before any
+/// lane is trusted to write.
+#[derive(Debug, Clone, Serialize)]
+pub struct TriageDecision {
+    pub candidate_id: i64,
+    /// `fold` or `one-off-subject`.
+    pub lane: &'static str,
+    pub statement: String,
+    /// The existing fact a fold lands on, or the subject that did not resolve.
+    pub detail: String,
+}
+
+/// The claim restates an existing fact closely enough to count as another
+/// observation of it rather than a new claim. Pure, so the guard is
+/// testable without an embedding server behind it.
+///
+/// Every condition closes a way a high cosine lies:
+/// - same predicate — "served on X's committee" vs "collaborates with X";
+/// - same object, and an object at all — "advised A" vs "advised B" differ
+///   by one name and embed close, and so do "uses tool X" vs "uses tool Y"
+///   when the object is free text (the first dry run on the live queue
+///   would have folded exactly that pair). Objects are compared as keys: the
+///   node id when the object resolves, else its normalized text;
+/// - no more words than the fact — a longer restatement may carry the detail
+///   the fact lacks, and that is the human's call.
+fn is_restatement(
+    sim: f64,
+    cand_predicate: &str,
+    fact_predicate: &str,
+    cand_object: Option<&str>,
+    fact_object: Option<&str>,
+    cand_words: usize,
+    fact_words: usize,
+) -> bool {
+    (RESTATEMENT_THRESHOLD..SEMANTIC_DUP_THRESHOLD).contains(&sim)
+        && cand_predicate == fact_predicate
+        && !NEVER_AUTO.contains(&cand_predicate)
+        && cand_object.is_some()
+        && cand_object == fact_object
+        && cand_words <= fact_words
+}
+
 /// Predicates where two different live objects are a contradiction (§11.5) —
 /// keep in sync with `fact::live_contradictions`.
 pub(crate) const SINGLE_VALUED: &[&str] = &[
@@ -201,6 +269,22 @@ pub struct PrecheckReport {
     /// could not work must SAY so — the nightly logged `semantic-dup 0`
     /// for a week and it read exactly like a clean queue.
     pub semantic_skipped: bool,
+    /// Triage lane: restatements folded into an existing fact.
+    pub restatement_folded: usize,
+    /// Triage lane: claims about a subject nothing else knows.
+    pub one_off_subject_rejected: usize,
+    /// One entry per triage-lane decision, in scan order.
+    pub triage: Vec<TriageDecision>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrecheckOpts {
+    pub auto_accept: bool,
+    /// Count outcomes without writing anything.
+    pub dry_run: bool,
+    /// Run the calibrated triage lanes (fold restatements, reject one-off
+    /// subjects). Off by default until a dry run has been spot-checked.
+    pub triage: bool,
 }
 
 /// How long an unreviewed commitment stays proposable. A commitment is a
@@ -270,6 +354,80 @@ fn resolve_unique(conn: &Connection, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// A fold is a corroboration, so it does everything `fact::propose`'s
+/// re-sighting path does, not a subset of it:
+/// - every sighting is recorded as a `fact_observation` row;
+/// - the counter moves only for a NEW episode from a non-agent source — a
+///   prompt-version bump re-reads the same episode, and the same evidence
+///   read twice is not two observations;
+/// - sensitivity rises to the MAX over contributing evidence — a personal
+///   fact restated in a private transcript becomes private (§10: hops don't
+///   launder, and a fold is a hop that skips the accept path);
+/// - confidence is recomputed from the trail, so the evidence moves the
+///   number retrieval ranks by.
+fn fold_observation(
+    conn: &Connection,
+    fact_id: i64,
+    episode_id: Option<i64>,
+    confidence: Option<f64>,
+) -> Result<()> {
+    fact::record_observation(
+        conn,
+        fact_id,
+        episode_id,
+        "corroborated",
+        "precheck:fold",
+        confidence,
+    )?;
+    let counts = match episode_id {
+        Some(eid) => {
+            let seen_before: bool = conn.query_row(
+                "SELECT COUNT(*) > 1 FROM fact_observation WHERE fact_id = ?1 AND episode_id = ?2",
+                params![fact_id, eid],
+                |r| r.get(0),
+            )?;
+            let agent_sourced: bool = conn
+                .query_row(
+                    "SELECT source LIKE 'probe%' OR source LIKE 'agent:%' FROM episode WHERE id = ?1",
+                    params![eid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            !seen_before && !agent_sourced
+        }
+        None => true,
+    };
+    if counts {
+        bump_observation(conn, fact_id)?;
+    }
+    if let Some(eid) = episode_id {
+        let episode_sens: Option<String> = conn
+            .query_row(
+                "SELECT sensitivity FROM episode WHERE id = ?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let fact_sens: String = conn.query_row(
+            "SELECT sensitivity FROM fact WHERE id = ?1",
+            params![fact_id],
+            |r| r.get(0),
+        )?;
+        if let Some(es) = episode_sens {
+            use crate::episode::sensitivity_rank;
+            if sensitivity_rank(&es) > sensitivity_rank(&fact_sens) {
+                conn.execute(
+                    "UPDATE fact SET sensitivity = ?2 WHERE id = ?1",
+                    params![fact_id, es],
+                )?;
+            }
+        }
+    }
+    fact::recompute_confidence(conn, fact_id)?;
+    Ok(())
+}
+
 fn bump_observation(conn: &Connection, fact_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE fact SET observation_count = observation_count + 1 WHERE id = ?1",
@@ -284,6 +442,136 @@ pub fn precheck_pending(
     auto_accept: bool,
 ) -> Result<PrecheckReport> {
     precheck_pending_opts(conn, embedder, auto_accept, false)
+}
+
+// Recurrence cannot launder a non-referent: "they" said three times is
+// still nobody.
+const MINT_STOP: &[&str] = &[
+    "he",
+    "she",
+    "they",
+    "them",
+    "it",
+    "we",
+    "you",
+    "this",
+    "that",
+    "these",
+    "those",
+    "someone",
+    "somebody",
+    "everyone",
+    "people",
+    "user",
+    "the user",
+    "the team",
+    "the group",
+];
+
+/// Reject reason of the triage one-off lane — a prefix other code matches.
+pub(crate) const ONE_OFF_REASON: &str = "precheck: one-off subject";
+/// Reject reason of the triage fold lane — likewise matched by prefix.
+pub(crate) const FOLD_REASON: &str = "precheck: restatement of fact";
+
+/// The subjects recurrence is counted over — by minting AND by the triage
+/// one-off lane, which must share one denominator to split unknown names
+/// between them. Pending claims, plus the lane's own earlier rejects: the
+/// lane removes a claim from `proposed`, and if minting counted pending
+/// alone, a name arriving once a night would be rejected twice and then
+/// spared on the third night with a pending count of one — never minted,
+/// never resolved, starved by the lane that was meant to hand it over. A
+/// graph that never ran the lane has no such rejects, so minting's own
+/// behaviour is unchanged. Read as TEXT so a subject stored as a JSON
+/// number counts rather than silently lowering a tally that rejects.
+///
+/// Pending rows count as they always have. A lane reject counts only as a
+/// DISTINCT claim (subject, normalized statement) not already in the pool:
+/// those rejects are permanent, and neither the queue-local dup tier nor
+/// rejection memory (human rejects only) collapses a re-queued copy, so a
+/// row count would let one sentence re-extracted across three
+/// prompt-version bumps reach the bar and mint a node. Pending rows are
+/// read first so a reject that repeats a waiting claim adds nothing.
+fn recurrence_pool_subjects(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT CAST(json_extract(payload, '$.subject') AS TEXT),
+                COALESCE(CAST(json_extract(payload, '$.statement') AS TEXT),
+                         CAST(json_extract(payload, '$.what') AS TEXT), ''),
+                status = 'proposed'
+         FROM fact_candidate
+         WHERE (status = 'proposed'
+                OR (status = 'rejected' AND COALESCE(reject_reason, '') LIKE ?1 || '%'))
+           AND COALESCE(json_extract(payload, '$.subject'), '') != ''
+         ORDER BY status = 'proposed' DESC",
+    )?;
+    let rows = stmt.query_map(params![ONE_OFF_REASON], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, bool>(2)?,
+        ))
+    })?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut subjects = Vec::new();
+    for row in rows {
+        let (subject, statement, pending) = row?;
+        let fresh = seen.insert((subject.trim().to_lowercase(), normalize(&statement)));
+        if pending || fresh {
+            subjects.push(subject);
+        }
+    }
+    Ok(subjects)
+}
+
+/// Whether minting could ever make a node for this (lowercased) subject.
+fn mint_eligible(key: &str) -> bool {
+    key.len() >= 3 && key.split_whitespace().count() <= 5 && !MINT_STOP.contains(&key)
+}
+
+/// Negation and change-of-state markers. A candidate carrying one never
+/// folds: "no longer uses the kiln" embeds right beside "uses the kiln
+/// daily", is shorter, and has the same predicate and object — it is the
+/// retraction, and folding it would count it as a confirmation. Checked on
+/// the candidate alone: live facts are positive by construction
+/// (`fact_current`), so a marker in a fact's wording ("the kiln, not the
+/// lathe") is a misread, and matching on it would admit the retraction.
+const NEGATION_MARKERS: &[&str] = &[
+    "not",
+    "no",
+    "never",
+    "none",
+    "nobody",
+    "nothing",
+    "neither",
+    "nor",
+    "without",
+    "stopped",
+    "quit",
+    "former",
+    "formerly",
+    "anymore",
+    "longer",
+    "used to",
+    "no longer",
+    "isn t",
+    "wasn t",
+    "doesn t",
+    "didn t",
+    "don t",
+    "won t",
+    "can t",
+    "cannot",
+    "aren t",
+    "weren t",
+    "hasn t",
+    "haven t",
+];
+
+/// True when a (normalized) statement carries a negation or state-change marker.
+fn negated(norm: &str) -> bool {
+    let padded = format!(" {norm} ");
+    NEGATION_MARKERS
+        .iter()
+        .any(|m| padded.contains(&format!(" {m} ")))
 }
 
 /// A subject named by 3+ distinct pending claims and known to nothing in
@@ -302,42 +590,11 @@ const MINT_RECURRENCE: usize = 3;
 /// and the kNN linker already use. Only subjects that resolve to NOTHING
 /// qualify — an ambiguous name still belongs to the human path.
 fn mint_recurring_subjects(conn: &Connection, dry_run: bool) -> Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT json_extract(payload, '$.subject') FROM fact_candidate
-         WHERE status = 'proposed'
-           AND COALESCE(json_extract(payload, '$.subject'), '') != ''",
-    )?;
-    let subjects: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
-    // Recurrence cannot launder a non-referent: "they" said three times is
-    // still nobody.
-    const MINT_STOP: &[&str] = &[
-        "he",
-        "she",
-        "they",
-        "them",
-        "it",
-        "we",
-        "you",
-        "this",
-        "that",
-        "these",
-        "those",
-        "someone",
-        "somebody",
-        "everyone",
-        "people",
-        "user",
-        "the user",
-        "the team",
-        "the group",
-    ];
+    let subjects = recurrence_pool_subjects(conn)?;
     let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for s in subjects {
         let key = s.trim().to_lowercase();
-        let words = key.split_whitespace().count();
-        if key.len() < 3 || words > 5 || MINT_STOP.contains(&key.as_str()) {
+        if !mint_eligible(&key) {
             continue;
         }
         let e = counts.entry(key).or_insert((s.trim().to_string(), 0));
@@ -370,6 +627,27 @@ pub fn precheck_pending_opts(
     auto_accept: bool,
     dry_run: bool,
 ) -> Result<PrecheckReport> {
+    precheck_pending_with(
+        conn,
+        embedder,
+        PrecheckOpts {
+            auto_accept,
+            dry_run,
+            triage: false,
+        },
+    )
+}
+
+pub fn precheck_pending_with(
+    conn: &Connection,
+    embedder: Option<&Embedder>,
+    opts: PrecheckOpts,
+) -> Result<PrecheckReport> {
+    let PrecheckOpts {
+        auto_accept,
+        dry_run,
+        triage,
+    } = opts;
     let mut report = PrecheckReport::default();
     // Ordered confidence DESC, so the items past the cap — the ones that
     // never get triaged — would be precisely the lowest-confidence tail
@@ -568,6 +846,19 @@ pub fn precheck_pending_opts(
         }
         _ => vec![None; candidates.len()],
     };
+
+    // Triage: how many claims have named each subject.
+    // Keyed in Rust, with the SAME key the lookup uses: SQLite's `lower`
+    // folds ASCII only and its `trim` strips spaces only, so a SQL-side key
+    // lost every count for a name opening on a non-ASCII capital — a
+    // recurring "Émile" read as a one-off.
+    // Counted over minting's own pool (see `recurrence_pool_subjects`).
+    let mut subject_mentions: HashMap<String, usize> = HashMap::new();
+    if triage {
+        for s in recurrence_pool_subjects(conn)? {
+            *subject_mentions.entry(s.trim().to_lowercase()).or_default() += 1;
+        }
+    }
 
     // Queue-local dedup state (first occurrence wins).
     let mut seen_triple: HashSet<(String, String, String)> = HashSet::new();
@@ -775,6 +1066,11 @@ pub fn precheck_pending_opts(
         // and persist the binding — unambiguous detections only; ambiguity
         // still belongs to the human path.
         let mut subject_name = candidate_str(c, "subject").unwrap_or_default();
+        // A subject healed in THIS pass was never counted — not by the
+        // mention tally, not by `mint_recurring_subjects` — so the one-off
+        // lane would read three healed claims about one name as three
+        // one-offs, on the very pass before minting would have caught them.
+        let mut healed_this_pass = false;
         if subject_name.trim().is_empty() && !statement.is_empty() {
             let (detected, _ambiguous) = crate::router::detect_entities(conn, statement)?;
             let identity = detected
@@ -816,9 +1112,14 @@ pub fn precheck_pending_opts(
                     _ => report.subject_implied += 1,
                 }
                 subject_name = name;
+                healed_this_pass = true;
             }
         }
-        let subject_id = resolve_unique(conn, &subject_name)?;
+        // One resolve serves both questions: exactly one match is an
+        // identity; zero (not merely ambiguous) is what the one-off lane asks.
+        let subject_matches = graph::resolve_entity_all(conn, &subject_name)?;
+        let subject_known = !subject_matches.is_empty();
+        let subject_id = (subject_matches.len() == 1).then(|| subject_matches[0].id.clone());
         // Dedup scope: the resolved node id when we have one, else the
         // literal subject string. Identical statements are duplicates
         // whether or not we know who "The Windmill River" is — gating
@@ -887,15 +1188,46 @@ pub fn precheck_pending_opts(
         // resolved subject; candidate-vs-candidate works for everyone via
         // the subject_key grouping.
         let mut flagged_similar: Option<(f64, String)> = None;
+        // The live fact this candidate would fold into, when the triage
+        // lane runs and the match passes `is_restatement`. Decided after the
+        // contradiction tier: a fold must never swallow a conflict.
+        let mut fold_target: Option<usize> = None;
         if let Some(cv) = &cand_vecs[ci] {
-            let mut best: Option<(f64, String, Option<i64>)> = None; // (sim, statement, fact_id)
+            let mut best: Option<(f64, String, Option<usize>)> = None; // (sim, statement, live idx)
             if let Some(sid) = &subject_id {
                 for &i in by_subject.get(sid).map(|v| v.as_slice()).unwrap_or(&[]) {
                     if let Some(fv) = fact_vecs.get(&live[i].id) {
                         let sim = cosine(cv, fv);
                         if best.as_ref().map(|b| sim > b.0).unwrap_or(true) {
-                            best = Some((sim, live[i].statement.clone(), Some(live[i].id)));
+                            best = Some((sim, live[i].statement.clone(), Some(i)));
                         }
+                    }
+                }
+            }
+            if triage && c.proposed_by.as_deref() == Some("llm") {
+                if let Some((sim, _, Some(i))) = &best {
+                    let f = &live[*i];
+                    let cand_object = match candidate_str(c, "object") {
+                        Some(o) if !o.trim().is_empty() => {
+                            Some(resolve_unique(conn, &o)?.unwrap_or_else(|| normalize(&o)))
+                        }
+                        _ => candidate_str(c, "object_value").map(|v| normalize(&v)),
+                    };
+                    let fact_object = f
+                        .object_id
+                        .clone()
+                        .or_else(|| f.object_value.as_deref().map(normalize));
+                    if is_restatement(
+                        *sim,
+                        &predicate,
+                        &f.predicate,
+                        cand_object.as_deref().filter(|o| !o.is_empty()),
+                        fact_object.as_deref().filter(|o| !o.is_empty()),
+                        norm.split_whitespace().count(),
+                        f.norm.split_whitespace().count(),
+                    ) && !negated(&norm)
+                    {
+                        fold_target = Some(*i);
                     }
                 }
             }
@@ -910,10 +1242,10 @@ pub fn precheck_pending_opts(
                 }
             }
             match best {
-                Some((sim, what, fid)) if sim >= SEMANTIC_DUP_THRESHOLD => {
+                Some((sim, what, idx)) if sim >= SEMANTIC_DUP_THRESHOLD => {
                     if !dry_run {
-                        if let Some(fid) = fid {
-                            bump_observation(conn, fid)?;
+                        if let Some(i) = idx {
+                            bump_observation(conn, live[i].id)?;
                         }
                         fact::reject_candidate_opts(
                             conn,
@@ -934,6 +1266,49 @@ pub fn precheck_pending_opts(
 
         // Dedup is done; contradictions and auto-accept need identity.
         let Some(subject_id) = subject_id else {
+            // Triage: a subject the graph knows NOTHING about (not merely
+            // ambiguous — an ambiguous name is a known one) and that almost
+            // no other claim names. The recurrence bar is the minting bar,
+            // so this lane and `mint_recurring_subjects` partition the
+            // unknown names between them: three mentions earns a node, fewer
+            // is a passing mention. Bare pronouns never earn one.
+            if triage && !healed_this_pass && c.proposed_by.as_deref() == Some("llm") {
+                let key = subject_name.trim().to_lowercase();
+                // NEVER_AUTO: a social-standing claim faces a human even
+                // when nobody knows its subject yet.
+                let one_off = !key.is_empty()
+                    && !OWNER_WORDS.contains(&key.as_str())
+                    && !NEVER_AUTO.contains(&predicate.as_str())
+                    && !subject_known
+                    // A name minting can never mint (too short, too long)
+                    // is left for a human rather than counted toward a
+                    // node that will not come.
+                    && (MINT_STOP.contains(&key.as_str())
+                        || (mint_eligible(&key)
+                            && subject_mentions.get(&key).copied().unwrap_or(0)
+                                < MINT_RECURRENCE));
+                if one_off {
+                    if !dry_run {
+                        fact::reject_candidate_opts(
+                            conn,
+                            c.id,
+                            &format!(
+                                "{ONE_OFF_REASON} — known to nothing in the graph and \
+                                 named by too few claims to be a recurring thing"
+                            ),
+                            false,
+                        )?;
+                    }
+                    report.one_off_subject_rejected += 1;
+                    report.triage.push(TriageDecision {
+                        candidate_id: c.id,
+                        lane: "one-off-subject",
+                        statement: statement.clone(),
+                        detail: subject_name.trim().to_string(),
+                    });
+                    continue;
+                }
+            }
             if !dry_run {
                 if let Some((sim, what)) = &flagged_similar {
                     if let serde_json::Value::Object(map) = &mut live_payload {
@@ -976,6 +1351,32 @@ pub fn precheck_pending_opts(
                     break;
                 }
             }
+        }
+
+        // Triage fold: a restatement of a live fact is one more observation
+        // of it. After the contradiction tier on purpose — a conflicting
+        // claim is exactly what a human must see, however close it embeds.
+        if let (Some(i), None) = (fold_target, &contradiction) {
+            if !dry_run {
+                fold_observation(conn, live[i].id, c.episode_id, c.confidence)?;
+                fact::reject_candidate_opts(
+                    conn,
+                    c.id,
+                    &format!(
+                        "{FOLD_REASON} {} folded in (observation recorded)",
+                        live[i].uid
+                    ),
+                    false,
+                )?;
+            }
+            report.restatement_folded += 1;
+            report.triage.push(TriageDecision {
+                candidate_id: c.id,
+                lane: "fold",
+                statement: statement.clone(),
+                detail: live[i].statement.clone(),
+            });
+            continue;
         }
 
         // Annotate the payload so the TUI detail pane shows why it's held.
@@ -1332,6 +1733,694 @@ mod tests {
         assert_eq!(
             rep.auto_accepted, 0,
             "the SAME predicate from an unlisted proposer must still queue"
+        );
+    }
+
+    #[test]
+    fn a_restatement_folds_only_when_nothing_about_it_is_new() {
+        let fold = |sim, cp, fp, co, fo, cw, fw| is_restatement(sim, cp, fp, co, fo, cw, fw);
+        let (a, b) = (Some("node-a"), Some("node-b"));
+        assert!(
+            fold(0.92, "advised", "advised", a, a, 4, 6),
+            "a shorter paraphrase folds"
+        );
+        assert!(
+            fold(0.92, "uses", "uses", Some("tool x"), Some("tool x"), 5, 5),
+            "a text object folds when the text matches"
+        );
+        assert!(
+            !fold(0.95, "uses", "uses", Some("tool x"), Some("tool y"), 5, 5),
+            "a different text object is a different claim"
+        );
+        assert!(
+            !fold(0.95, "is", "is", None, None, 5, 5),
+            "with no object, the cosine alone is all there is — and it lies"
+        );
+        assert!(
+            !fold(0.89, "advised", "advised", a, a, 4, 6),
+            "below the band stays"
+        );
+        assert!(
+            !fold(0.97, "advised", "advised", a, a, 4, 6),
+            "the dup tier owns everything from its threshold up"
+        );
+        assert!(
+            !fold(0.95, "advised", "collaborates_with", a, a, 4, 6),
+            "another predicate is another claim"
+        );
+        assert!(
+            !fold(0.95, "advised", "advised", a, b, 4, 6),
+            "one name apart embeds close and is a different claim"
+        );
+        assert!(
+            !fold(0.95, "advised", "advised", None, a, 4, 6),
+            "an unresolved object is not the fact's object"
+        );
+        assert!(
+            !fold(0.95, "advised", "advised", a, a, 7, 6),
+            "a longer restatement may carry new detail"
+        );
+        assert!(
+            !fold(0.95, "mentors", "mentors", a, a, 4, 6),
+            "social-standing claims always face a human"
+        );
+    }
+
+    fn stage_llm(conn: &Connection, subject: &str, statement: &str) -> i64 {
+        let p = fact::ProposedFact {
+            subject: subject.into(),
+            predicate: "related_to".into(),
+            statement: statement.into(),
+            confidence: Some(0.9),
+            ..Default::default()
+        };
+        fact::propose_fact(conn, &p, "llm", None).unwrap()
+    }
+
+    fn status_of(conn: &Connection, id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM fact_candidate WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_one_off_lane_rejects_only_names_nothing_else_knows() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let known = stage_llm(&conn, "Nadia", "Nadia prefers morning meetings.");
+        let one_off = stage_llm(&conn, "Quillon Varga", "Quillon Varga sells kiosks.");
+        let pronoun = stage_llm(&conn, "the group", "The group met on Tuesday.");
+        let owner = stage_llm(&conn, "user", "The user prefers tea.");
+        // Three pending claims make a recurring name: minting's bar.
+        stage_llm(&conn, "Oriel Fenn", "Oriel Fenn runs a lab.");
+        stage_llm(&conn, "Oriel Fenn", "Oriel Fenn studies bees.");
+        let recurring = stage_llm(&conn, "Oriel Fenn", "Oriel Fenn moved labs.");
+        let unmintable = stage_llm(
+            &conn,
+            "the long winding river by the mill",
+            "The long winding river by the mill floods in spring.",
+        );
+        let social = {
+            let p = fact::ProposedFact {
+                subject: "Tamsin Rook".into(),
+                predicate: "colleague_of".into(),
+                object: Some("Nadia".into()),
+                statement: "Tamsin Rook is a colleague of Nadia.".into(),
+                ..Default::default()
+            };
+            fact::propose_fact(&conn, &p, "llm", None).unwrap()
+        };
+        let from_elsewhere = {
+            let p = fact::ProposedFact {
+                subject: "Quillon Varga".into(),
+                predicate: "related_to".into(),
+                statement: "Quillon Varga repairs kiosks.".into(),
+                ..Default::default()
+            };
+            fact::propose_fact(&conn, &p, "test", None).unwrap()
+        };
+
+        // Off by default: the nightly's behaviour does not change. A dry
+        // run, so this pass cannot shadow-mint anything the triage pass
+        // below is meant to be tested on.
+        let r = precheck_pending_opts(&conn, None, false, true).unwrap();
+        assert_eq!(r.one_off_subject_rejected, 0);
+        assert!(r.triage.is_empty());
+
+        let opts = PrecheckOpts {
+            triage: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let r = precheck_pending_with(&conn, None, opts).unwrap();
+        let hit: HashSet<i64> = r.triage.iter().map(|d| d.candidate_id).collect();
+        assert_eq!(hit, HashSet::from([one_off, pronoun]), "{:?}", r.triage);
+        assert_eq!(
+            status_of(&conn, one_off),
+            "proposed",
+            "a dry run writes nothing"
+        );
+
+        let r = precheck_pending_with(
+            &conn,
+            None,
+            PrecheckOpts {
+                dry_run: false,
+                ..opts
+            },
+        )
+        .unwrap();
+        assert_eq!(r.one_off_subject_rejected, 2);
+        assert_eq!(status_of(&conn, one_off), "rejected");
+        assert_eq!(status_of(&conn, pronoun), "rejected");
+        for (id, why) in [
+            (known, "a resolved subject is never one-off"),
+            (owner, "the owner, however spelled, is never one-off"),
+            (recurring, "a name with three claims is recurring"),
+            (
+                unmintable,
+                "a name minting can never mint is a human's, not a one-off",
+            ),
+            (
+                social,
+                "a social-standing claim faces a human, known subject or not",
+            ),
+            (
+                from_elsewhere,
+                "the lane was calibrated on llm candidates only",
+            ),
+        ] {
+            assert_ne!(status_of(&conn, id), "rejected", "{why}");
+        }
+        let reason: String = conn
+            .query_row(
+                "SELECT reject_reason FROM fact_candidate WHERE id = ?1",
+                params![one_off],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            reason.starts_with("precheck:"),
+            "a machine reject must stay out of rejection memory and the human record"
+        );
+        // Written inline, not via the constant: stored reasons are read back
+        // by prefix (`recurrence_pool_subjects`), so rewording the constant
+        // would silently drop every historical reject from the pool.
+        assert!(
+            reason.starts_with("precheck: one-off subject"),
+            "the stored prefix is persisted state: {reason}"
+        );
+    }
+
+    fn triage_run(conn: &Connection, embedder: Option<&Embedder>) -> PrecheckReport {
+        let opts = PrecheckOpts {
+            triage: true,
+            ..Default::default()
+        };
+        precheck_pending_with(conn, embedder, opts).unwrap()
+    }
+
+    #[test]
+    fn a_recurring_name_keeps_its_count_whatever_its_first_letter() {
+        // The tally was keyed by SQLite's ASCII-only `lower`, the lookup by
+        // Rust's Unicode one: a recurring name opening on "É" never matched
+        // its own count.
+        // A dry run, so minting cannot resolve the name and only the
+        // lane's own tally stands between it and a reject.
+        let conn = open_memory().unwrap();
+        for s in [
+            "Émile Brun keeps bees.",
+            "Émile Brun sells honey.",
+            "Émile Brun moved hives.",
+        ] {
+            stage_llm(&conn, "Émile Brun", s);
+        }
+        let opts = PrecheckOpts {
+            triage: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let r = precheck_pending_with(&conn, None, opts).unwrap();
+        assert_eq!(r.one_off_subject_rejected, 0, "{:?}", r.triage);
+    }
+
+    #[test]
+    fn a_name_arriving_once_a_night_is_minted_on_its_third_night() {
+        // The lane and minting must count one pool. When the lane counted
+        // every status and minting pending only, nights one and two were
+        // rejected, night three was spared by the lane's count of three —
+        // and minting, seeing one pending claim, never made the node.
+        let conn = open_memory().unwrap();
+        let night = |n: usize| -> (i64, PrecheckReport) {
+            let id = stage_llm(&conn, "Oriel Fenn", &format!("Oriel Fenn noted thing {n}."));
+            (id, triage_run(&conn, None))
+        };
+        let (first, _) = night(1);
+        let (second, _) = night(2);
+        assert_eq!(status_of(&conn, first), "rejected");
+        assert_eq!(status_of(&conn, second), "rejected");
+        let (third, r) = night(3);
+        assert_eq!(r.subjects_minted, 1, "the third mention earns a node");
+        assert_ne!(
+            status_of(&conn, third),
+            "rejected",
+            "and the claim that earned it resolves instead of being rejected"
+        );
+    }
+
+    #[test]
+    fn a_subject_healed_this_pass_is_not_judged_on_counts_that_never_saw_it() {
+        // Three claims with no subject, all healed to the same noun phrase
+        // in this pass: neither the tally nor minting ran on that name yet,
+        // so calling each a one-off would reject the recurring thing the
+        // next sweep would have minted.
+        let conn = open_memory().unwrap();
+        for s in [
+            "The Windmill River has trout.",
+            "The Windmill River has bass.",
+            "The Windmill River has pike.",
+        ] {
+            stage_llm(&conn, "", s);
+        }
+        let r = triage_run(&conn, None);
+        assert_eq!(r.subject_phrased, 3, "the premise: all three were healed");
+        assert_eq!(r.one_off_subject_rejected, 0, "{:?}", r.triage);
+    }
+
+    /// The test schema's vector width; the stub's 3-d vectors are zero-padded
+    /// to it, which leaves every cosine unchanged.
+    const TEST_DIMS: usize = 768;
+
+    fn padded(v: &[f32]) -> Vec<f32> {
+        let mut out = v.to_vec();
+        out.resize(TEST_DIMS, 0.0);
+        out
+    }
+
+    /// A stand-in embedding server: each input maps to the fixed 3-d vector
+    /// of the first key it contains, so a test sets cosines by choosing text.
+    fn stub_embedder(vectors: &'static [(&'static str, [f32; 3])]) -> Embedder {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let data: Vec<serde_json::Value> = req["input"]
+                    .as_array()
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let text = t.as_str().unwrap_or("");
+                        let v = vectors
+                            .iter()
+                            .find(|(k, _)| text.contains(k))
+                            .map(|(_, v)| padded(v))
+                            .unwrap_or_else(|| padded(&[0.0, 0.0, 1.0]));
+                        serde_json::json!({ "index": i, "embedding": v })
+                    })
+                    .collect();
+                let out = serde_json::json!({ "data": data }).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    out.len(),
+                    out
+                );
+            }
+        });
+        let mut e = Embedder::default();
+        e.base_url = format!("http://{addr}");
+        e.dims = TEST_DIMS;
+        e
+    }
+
+    fn live_fact_with_vector(conn: &Connection, statement: &str, object: &str, v: [f32; 3]) -> i64 {
+        let p = fact::ProposedFact {
+            subject: "Nadia".into(),
+            predicate: "uses".into(),
+            object_value: Some(object.into()),
+            statement: statement.into(),
+            ..Default::default()
+        };
+        let cid = fact::propose_fact(conn, &p, "test", None).unwrap();
+        fact::accept_candidate(conn, cid).unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM fact WHERE statement = ?1",
+                params![statement],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO vec_fact (fact_id, embedding) VALUES (?1, ?2)",
+            params![id, serde_json::to_string(&padded(&v)).unwrap()],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn the_fold_lane_folds_a_restatement_and_nothing_that_differs() {
+        // Each case sits at cosine 0.95 to the fact and at most ~0.90 to the
+        // others, so the fold band — not the in-queue dedup — decides.
+        static VECS: &[(&str, [f32; 3])] = &[
+            ("the kiln.", [0.95, 0.3122499, 0.0]),
+            ("lathe", [0.95, 0.0, 0.3122499]),
+            ("weekday", [0.95, -0.3122499, 0.0]),
+            ("a kiln.", [0.95, 0.0, -0.3122499]),
+        ];
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let fact_id = live_fact_with_vector(
+            &conn,
+            "Nadia uses the lab's shared kiln daily.",
+            "kiln",
+            [1.0, 0.0, 0.0],
+        );
+        let stage_uses = |statement: &str, object: &str, proposer: &str| {
+            let p = fact::ProposedFact {
+                subject: "Nadia".into(),
+                predicate: "uses".into(),
+                object_value: Some(object.into()),
+                statement: statement.into(),
+                ..Default::default()
+            };
+            fact::propose_fact(&conn, &p, proposer, None).unwrap()
+        };
+        // The folding case names its object as free TEXT that resolves to no
+        // node — the shape the first live dry run got wrong.
+        let fold = {
+            let p = fact::ProposedFact {
+                subject: "Nadia".into(),
+                predicate: "uses".into(),
+                object: Some("Kiln".into()),
+                statement: "NADIA uses the kiln.".into(),
+                ..Default::default()
+            };
+            fact::propose_fact(&conn, &p, "llm", None).unwrap()
+        };
+        let other_object = stage_uses("NADIA uses the lathe.", "lathe", "llm");
+        let longer = stage_uses(
+            "NADIA uses the shared kiln every single weekday morning.",
+            "KILN",
+            "llm",
+        );
+        let other_proposer = stage_uses("NADIA uses a kiln.", "Kiln.", "test");
+        let e = stub_embedder(VECS);
+        let obs = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT observation_count FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Every case differs from the fact's object only after
+        // normalization, so tier 1's exact-triple dedup passes them all
+        // through and the fold lane is what decides.
+        let before = obs(&conn);
+
+        let dry = PrecheckOpts {
+            triage: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let r = precheck_pending_with(&conn, Some(&e), dry).unwrap();
+        assert!(!r.semantic_skipped, "the stub must answer");
+        assert_eq!(r.restatement_folded, 1, "{:?}", r.triage);
+        assert_eq!(obs(&conn), before, "a dry run bumps nothing");
+
+        let r = triage_run(&conn, Some(&e));
+        let folded: Vec<i64> = r.triage.iter().map(|d| d.candidate_id).collect();
+        assert_eq!(
+            folded,
+            vec![fold],
+            "object text normalizes: 'Kiln' is 'kiln'"
+        );
+        assert_eq!(status_of(&conn, fold), "rejected");
+        assert_eq!(
+            obs(&conn),
+            before + 1,
+            "the fold is an observation of the fact"
+        );
+        for (id, why) in [
+            (other_object, "a different text object is a different claim"),
+            (longer, "a longer restatement may carry new detail"),
+            (
+                other_proposer,
+                "the lane was calibrated on llm candidates only",
+            ),
+        ] {
+            assert_ne!(status_of(&conn, id), "rejected", "{why}");
+        }
+    }
+
+    #[test]
+    fn a_fold_never_swallows_a_contradiction() {
+        // The candidate restates one live fact (same text object, cosine
+        // 0.95) AND contradicts another on a single-valued predicate. The
+        // restatement is real; the conflict is what a human must see. Text
+        // objects on purpose: a same-NODE restatement never reaches the fold
+        // lane — tier 1's exact-triple dedup takes it first.
+        static VECS: &[(&str, [f32; 3])] = &[("NADIA", [0.95, 0.3122499, 0.0])];
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        upsert_node(&conn, &Node::new("acme", "org", "Acme")).unwrap();
+        let works_at = |object: Option<&str>, value: Option<&str>, statement: &str, v: [f32; 3]| {
+            let p = fact::ProposedFact {
+                subject: "Nadia".into(),
+                predicate: "works_at".into(),
+                object: object.map(Into::into),
+                object_value: value.map(Into::into),
+                statement: statement.into(),
+                ..Default::default()
+            };
+            let cid = fact::propose_fact(&conn, &p, "test", None).unwrap();
+            fact::accept_candidate(&conn, cid).unwrap();
+            let fid: i64 = conn
+                .query_row(
+                    "SELECT id FROM fact WHERE statement = ?1",
+                    params![statement],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO vec_fact (fact_id, embedding) VALUES (?1, ?2)",
+                params![fid, serde_json::to_string(&padded(&v)).unwrap()],
+            )
+            .unwrap();
+        };
+        works_at(
+            Some("Acme"),
+            None,
+            "Nadia works at Acme in the design group.",
+            [0.0, 1.0, 0.0],
+        );
+        works_at(
+            None,
+            Some("the co-op"),
+            "Nadia works at the co-op on weekends and holidays.",
+            [1.0, 0.0, 0.0],
+        );
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_current WHERE predicate = 'works_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 2, "the premise: both are live");
+        let p = fact::ProposedFact {
+            subject: "Nadia".into(),
+            predicate: "works_at".into(),
+            object: Some("The Co-op".into()),
+            statement: "NADIA works at the co-op.".into(),
+            ..Default::default()
+        };
+        let restating = fact::propose_fact(&conn, &p, "llm", None).unwrap();
+        let r = triage_run(&conn, Some(&stub_embedder(VECS)));
+        assert_eq!(r.restatement_folded, 0, "{:?}", r.triage);
+        assert_eq!(r.contradiction_flagged, 1);
+        assert_eq!(status_of(&conn, restating), "proposed");
+    }
+
+    #[test]
+    fn one_sentence_re_extracted_three_times_is_still_one_claim() {
+        // The lane's rejects are permanent pool rows, and neither tier 2
+        // (queue-local) nor rejection memory (human rejects only) collapses
+        // a re-queued copy — so a row count reached the minting bar on the
+        // third prompt-version bump and made a phantom node.
+        let conn = open_memory().unwrap();
+        for night in 1..=3 {
+            let id = stage_llm(&conn, "Quillon Varga", "Quillon Varga sells kiosks.");
+            let r = triage_run(&conn, None);
+            assert_eq!(
+                r.subjects_minted, 0,
+                "night {night}: three copies are one claim"
+            );
+            assert_eq!(status_of(&conn, id), "rejected", "night {night}");
+        }
+    }
+
+    #[test]
+    fn negation_markers_are_read_on_word_boundaries() {
+        for yes in [
+            "nadia no longer uses the kiln",
+            "nadia doesn t use it",
+            "nadia is not here",
+            "the former chair",
+        ] {
+            assert!(negated(yes), "{yes}");
+        }
+        for no in [
+            "nadia uses the kiln",
+            "nadia notes the knot",
+            "a nonlinear model",
+            "known issues",
+        ] {
+            assert!(!negated(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_denial_never_folds_into_the_fact_it_denies() {
+        // Same subject, predicate and object, shorter, cosine 0.95: every
+        // other guard waves a retraction through.
+        static VECS: &[(&str, [f32; 3])] = &[("no longer", [0.95, 0.3122499, 0.0])];
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let fact_id = live_fact_with_vector(
+            &conn,
+            // A stray "not" in the positive fact's wording: matching the
+            // two sides' markers would read this as agreement and fold.
+            "Nadia uses the lab's shared kiln, not the lathe, for glazing.",
+            "kiln",
+            [1.0, 0.0, 0.0],
+        );
+        let p = fact::ProposedFact {
+            subject: "Nadia".into(),
+            predicate: "uses".into(),
+            object: Some("Kiln".into()),
+            statement: "NADIA no longer uses the kiln.".into(),
+            ..Default::default()
+        };
+        let denial = fact::propose_fact(&conn, &p, "llm", None).unwrap();
+        let r = triage_run(&conn, Some(&stub_embedder(VECS)));
+        assert_eq!(r.restatement_folded, 0, "{:?}", r.triage);
+        assert_ne!(status_of(&conn, denial), "rejected");
+        let obs: i64 = conn
+            .query_row(
+                "SELECT observation_count FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            obs, 1,
+            "a retraction is not an observation of what it retracts"
+        );
+    }
+
+    #[test]
+    fn a_fold_counts_each_episode_once_and_never_an_agent_s() {
+        use crate::episode::{upsert_episode, Episode};
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        let fact_id =
+            live_fact_with_vector(&conn, "Nadia uses the kiln daily.", "kiln", [1.0, 0.0, 0.0]);
+        let ep = |source: &str, id: &str, sensitivity: &str| -> i64 {
+            let e = Episode {
+                id: 0,
+                uid: String::new(),
+                source: source.into(),
+                source_id: id.into(),
+                source_ref: None,
+                body: format!("episode {id}"),
+                occurred_at: "2026-08-01 12:00:00".into(),
+                occurred_end: None,
+                ingested_at: String::new(),
+                lat: None,
+                lon: None,
+                location: None,
+                sensitivity: sensitivity.into(),
+                scope_id: None,
+                meta: None,
+                raw: None,
+            };
+            upsert_episode(&conn, &e).unwrap().0
+        };
+        let (note, agent) = (
+            ep("reflect.note", "n1", "private"),
+            ep("agent:mecha", "a1", "personal"),
+        );
+        let state = || -> (String, f64) {
+            conn.query_row(
+                "SELECT sensitivity, confidence FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (sens0, conf0) = state();
+        assert_eq!(sens0, "personal", "the premise");
+        let obs = || -> (i64, i64) {
+            conn.query_row(
+                "SELECT observation_count, (SELECT COUNT(*) FROM fact_observation WHERE fact_id = ?1)
+                 FROM fact WHERE id = ?1",
+                params![fact_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (count0, rows0) = obs();
+        fold_observation(&conn, fact_id, Some(note), Some(0.9)).unwrap();
+        fold_observation(&conn, fact_id, Some(note), Some(0.9)).unwrap();
+        fold_observation(&conn, fact_id, Some(agent), Some(0.9)).unwrap();
+        let (count, rows) = obs();
+        assert_eq!(rows - rows0, 3, "every sighting is recorded");
+        assert_eq!(
+            count - count0,
+            1,
+            "one new non-agent episode is one observation; a re-read and an agent's are not"
+        );
+        let (sens, conf) = state();
+        assert_eq!(
+            sens, "private",
+            "restated in a private episode, the fact is private: a fold is a hop, and hops don't launder"
+        );
+        assert!(
+            conf > conf0,
+            "the evidence moves the score: {conf0} -> {conf}"
+        );
+    }
+
+    #[test]
+    fn triage_rejects_are_not_verdicts_on_the_class_prior() {
+        // The one-off lane rejects a class's low-accept tail by selection,
+        // and a fold rejects a claim for being true: neither may drag the
+        // Beta prior every future fact of the class is born with.
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("nadia", "person", "Nadia")).unwrap();
+        for i in 0..6 {
+            let id = stage_llm(&conn, "Nadia", &format!("Nadia fact {i}."));
+            if i < 4 {
+                fact::accept_candidate(&conn, id).unwrap();
+            } else {
+                fact::reject_candidate(&conn, id, "not worth keeping").unwrap();
+            }
+        }
+        let before = fact::class_prior(&conn, "llm", "related_to").unwrap();
+        assert!(before.is_some(), "the premise: enough history for a prior");
+        for (i, reason) in [ONE_OFF_REASON, FOLD_REASON].iter().enumerate() {
+            for j in 0..20 {
+                let id = stage_llm(&conn, "Nadia", &format!("Nadia lane {i} {j}."));
+                fact::reject_candidate_opts(&conn, id, &format!("{reason} — test"), false).unwrap();
+            }
+        }
+        assert_eq!(
+            fact::class_prior(&conn, "llm", "related_to").unwrap(),
+            before
         );
     }
 
