@@ -394,6 +394,32 @@ const MINT_STOP: &[&str] = &[
     "the group",
 ];
 
+/// Reject reason of the triage one-off lane — a prefix other code matches.
+const ONE_OFF_REASON: &str = "precheck: one-off subject";
+
+/// The subjects recurrence is counted over — by minting AND by the triage
+/// one-off lane, which must share one denominator to split unknown names
+/// between them. Pending claims, plus the lane's own earlier rejects: the
+/// lane removes a claim from `proposed`, and if minting counted pending
+/// alone, a name arriving once a night would be rejected twice and then
+/// spared on the third night with a pending count of one — never minted,
+/// never resolved, starved by the lane that was meant to hand it over. A
+/// graph that never ran the lane has no such rejects, so minting's own
+/// behaviour is unchanged. Read as TEXT so a subject stored as a JSON
+/// number counts rather than silently lowering a tally that rejects.
+fn recurrence_pool_subjects(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT CAST(json_extract(payload, '$.subject') AS TEXT) FROM fact_candidate
+         WHERE (status = 'proposed'
+                OR (status = 'rejected' AND COALESCE(reject_reason, '') LIKE ?1 || '%'))
+           AND COALESCE(json_extract(payload, '$.subject'), '') != ''",
+    )?;
+    let subjects = stmt
+        .query_map(params![ONE_OFF_REASON], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(subjects)
+}
+
 /// A subject named by 3+ distinct pending claims and known to nothing in
 /// the graph is a real thing in the owner's life — mint it as a topic node
 /// so the claims about it can resolve, dedup, and be reviewed as a class.
@@ -410,14 +436,7 @@ const MINT_RECURRENCE: usize = 3;
 /// and the kNN linker already use. Only subjects that resolve to NOTHING
 /// qualify — an ambiguous name still belongs to the human path.
 fn mint_recurring_subjects(conn: &Connection, dry_run: bool) -> Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT json_extract(payload, '$.subject') FROM fact_candidate
-         WHERE status = 'proposed'
-           AND COALESCE(json_extract(payload, '$.subject'), '') != ''",
-    )?;
-    let subjects: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<std::result::Result<_, _>>()?;
+    let subjects = recurrence_pool_subjects(conn)?;
     let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for s in subjects {
         let key = s.trim().to_lowercase();
@@ -675,22 +694,15 @@ pub fn precheck_pending_with(
         _ => vec![None; candidates.len()],
     };
 
-    // Triage: how many candidates, of ANY status, have named each subject.
-    // Every status, not just pending: a name the owner has already ruled on
-    // several times is a recurring thing in their life even if only one
-    // claim about it is waiting now — counting more can only spare more.
+    // Triage: how many claims have named each subject.
     // Keyed in Rust, with the SAME key the lookup uses: SQLite's `lower`
     // folds ASCII only and its `trim` strips spaces only, so a SQL-side key
     // lost every count for a name opening on a non-ASCII capital — a
     // recurring "Émile" read as a one-off.
+    // Counted over minting's own pool (see `recurrence_pool_subjects`).
     let mut subject_mentions: HashMap<String, usize> = HashMap::new();
     if triage {
-        let mut stmt = conn.prepare(
-            "SELECT json_extract(payload, '$.subject') FROM fact_candidate
-             WHERE COALESCE(json_extract(payload, '$.subject'), '') != ''",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        for s in rows.filter_map(|r| r.ok()) {
+        for s in recurrence_pool_subjects(conn)? {
             *subject_mentions.entry(s.trim().to_lowercase()).or_default() += 1;
         }
     }
@@ -950,7 +962,11 @@ pub fn precheck_pending_with(
                 healed_this_pass = true;
             }
         }
-        let subject_id = resolve_unique(conn, &subject_name)?;
+        // One resolve serves both questions: exactly one match is an
+        // identity; zero (not merely ambiguous) is what the one-off lane asks.
+        let subject_matches = graph::resolve_entity_all(conn, &subject_name)?;
+        let subject_known = !subject_matches.is_empty();
+        let subject_id = (subject_matches.len() == 1).then(|| subject_matches[0].id.clone());
         // Dedup scope: the resolved node id when we have one, else the
         // literal subject string. Identical statements are duplicates
         // whether or not we know who "The Windmill River" is — gating
@@ -1104,9 +1120,12 @@ pub fn precheck_pending_with(
             // is a passing mention. Bare pronouns never earn one.
             if triage && !healed_this_pass && c.proposed_by.as_deref() == Some("llm") {
                 let key = subject_name.trim().to_lowercase();
+                // NEVER_AUTO: a social-standing claim faces a human even
+                // when nobody knows its subject yet.
                 let one_off = !key.is_empty()
                     && !OWNER_WORDS.contains(&key.as_str())
-                    && graph::resolve_entity_all(conn, &subject_name)?.is_empty()
+                    && !NEVER_AUTO.contains(&predicate.as_str())
+                    && !subject_known
                     && (MINT_STOP.contains(&key.as_str())
                         || subject_mentions.get(&key).copied().unwrap_or(0) < MINT_RECURRENCE);
                 if one_off {
@@ -1114,8 +1133,10 @@ pub fn precheck_pending_with(
                         fact::reject_candidate_opts(
                             conn,
                             c.id,
-                            "precheck: one-off subject — known to nothing in the graph and \
-                             named by too few claims to be a recurring thing",
+                            &format!(
+                                "{ONE_OFF_REASON} — known to nothing in the graph and \
+                                 named by too few claims to be a recurring thing"
+                            ),
                             false,
                         )?;
                     }
@@ -1634,12 +1655,20 @@ mod tests {
         let one_off = stage_llm(&conn, "Quillon Varga", "Quillon Varga sells kiosks.");
         let pronoun = stage_llm(&conn, "the group", "The group met on Tuesday.");
         let owner = stage_llm(&conn, "user", "The user prefers tea.");
-        // Two earlier claims, already ruled on, make this a recurring name.
-        for s in ["Oriel Fenn runs a lab.", "Oriel Fenn studies bees."] {
-            let id = stage_llm(&conn, "Oriel Fenn", s);
-            fact::reject_candidate(&conn, id, "not worth keeping").unwrap();
-        }
+        // Three pending claims make a recurring name: minting's bar.
+        stage_llm(&conn, "Oriel Fenn", "Oriel Fenn runs a lab.");
+        stage_llm(&conn, "Oriel Fenn", "Oriel Fenn studies bees.");
         let recurring = stage_llm(&conn, "Oriel Fenn", "Oriel Fenn moved labs.");
+        let social = {
+            let p = fact::ProposedFact {
+                subject: "Tamsin Rook".into(),
+                predicate: "colleague_of".into(),
+                object: Some("Nadia".into()),
+                statement: "Tamsin Rook is a colleague of Nadia.".into(),
+                ..Default::default()
+            };
+            fact::propose_fact(&conn, &p, "llm", None).unwrap()
+        };
         let from_elsewhere = {
             let p = fact::ProposedFact {
                 subject: "Quillon Varga".into(),
@@ -1686,9 +1715,10 @@ mod tests {
         for (id, why) in [
             (known, "a resolved subject is never one-off"),
             (owner, "the owner, however spelled, is never one-off"),
+            (recurring, "a name with three claims is recurring"),
             (
-                recurring,
-                "a name with three claims is recurring, whatever their verdicts",
+                social,
+                "a social-standing claim faces a human, known subject or not",
             ),
             (
                 from_elsewhere,
@@ -1723,15 +1753,47 @@ mod tests {
         // The tally was keyed by SQLite's ASCII-only `lower`, the lookup by
         // Rust's Unicode one: a recurring name opening on "É" never matched
         // its own count.
+        // A dry run, so minting cannot resolve the name and only the
+        // lane's own tally stands between it and a reject.
         let conn = open_memory().unwrap();
-        for s in ["Émile Brun keeps bees.", "Émile Brun sells honey."] {
-            let id = stage_llm(&conn, "Émile Brun", s);
-            fact::reject_candidate(&conn, id, "not worth keeping").unwrap();
+        for s in [
+            "Émile Brun keeps bees.",
+            "Émile Brun sells honey.",
+            "Émile Brun moved hives.",
+        ] {
+            stage_llm(&conn, "Émile Brun", s);
         }
-        let third = stage_llm(&conn, "Émile Brun", "Émile Brun moved hives.");
-        let r = triage_run(&conn, None);
+        let opts = PrecheckOpts {
+            triage: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let r = precheck_pending_with(&conn, None, opts).unwrap();
         assert_eq!(r.one_off_subject_rejected, 0, "{:?}", r.triage);
-        assert_eq!(status_of(&conn, third), "proposed");
+    }
+
+    #[test]
+    fn a_name_arriving_once_a_night_is_minted_on_its_third_night() {
+        // The lane and minting must count one pool. When the lane counted
+        // every status and minting pending only, nights one and two were
+        // rejected, night three was spared by the lane's count of three —
+        // and minting, seeing one pending claim, never made the node.
+        let conn = open_memory().unwrap();
+        let night = |n: usize| -> (i64, PrecheckReport) {
+            let id = stage_llm(&conn, "Oriel Fenn", &format!("Oriel Fenn noted thing {n}."));
+            (id, triage_run(&conn, None))
+        };
+        let (first, _) = night(1);
+        let (second, _) = night(2);
+        assert_eq!(status_of(&conn, first), "rejected");
+        assert_eq!(status_of(&conn, second), "rejected");
+        let (third, r) = night(3);
+        assert_eq!(r.subjects_minted, 1, "the third mention earns a node");
+        assert_ne!(
+            status_of(&conn, third),
+            "rejected",
+            "and the claim that earned it resolves instead of being rejected"
+        );
     }
 
     #[test]
