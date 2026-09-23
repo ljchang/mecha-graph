@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Both nightlies run `precheck --triage`.** `scripts/nightly.sh` and
+  `scripts/nightly-mecha.sh` pass the flag by default; `PRECHECK_TRIAGE=0`
+  turns it off, beside `PRECHECK_AUTO_ACCEPT`. The recurrence pool is read
+  once per sweep and shared by minting and the triage tally — it now holds
+  every one-off reject permanently, and was being scanned twice — and the
+  fold lane's stored reject prefix is pinned by a test, as the one-off
+  lane's already was, since `fact::class_prior` matches it on disk.
+
 ### Added
 
 - **`precheck --triage`: two review-queue lanes set from the owner's own

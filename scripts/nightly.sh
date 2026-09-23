@@ -13,6 +13,8 @@
 #                            # (space-separated; empty string = extract all)
 #   SUMMARIZE_LIMIT=30       # scope summaries refreshed per night (§4.5)
 #   PRECHECK_AUTO_ACCEPT=0   # 0 disables auto-accept (durable predicates only)
+#   PRECHECK_TRIAGE=0        # 0 disables the calibrated triage lanes (fold
+#                            # restatements, reject one-off subjects)
 #   LINK_PROPOSE=1           # re-enable the candidate-staging linker tiers
 #   BEE_PULL_LIMIT=100       # re-enable the Bee suggested-facts pull
 #   GPU_BUSY_THRESHOLD=30    # skip embed/extract above this % utilization
@@ -70,6 +72,7 @@ EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 EXTRACT_EXCLUDE="${EXTRACT_EXCLUDE-calendar.event}"
 SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
 PRECHECK_AUTO_ACCEPT="${PRECHECK_AUTO_ACCEPT:-1}"
+PRECHECK_TRIAGE="${PRECHECK_TRIAGE:-1}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
@@ -193,12 +196,13 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     for src in $EXTRACT_EXCLUDE; do EXTRACT_ARGS+=(--exclude-source "$src"); done
     run "$PKG" extract "${EXTRACT_ARGS[@]}"
     # Auto-triage the fresh candidates: duplicates die, contradictions get
-    # flagged, and (opt-in) clean novel facts accept themselves.
-    if [ "$PRECHECK_AUTO_ACCEPT" = "1" ]; then
-        run "$PKG" precheck --auto-accept
-    else
-        run "$PKG" precheck
-    fi
+    # flagged, and (opt-in) clean novel facts accept themselves. --triage
+    # adds the lanes calibrated on the owner's verdicts (precheck.rs):
+    # restatements fold into their fact, one-off subjects are rejected.
+    PRECHECK_ARGS=()
+    [ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
+    [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+    run "$PKG" precheck "${PRECHECK_ARGS[@]}"
     run "$PKG" summarize --limit "$SUMMARIZE_LIMIT" --model "$EXTRACT_MODEL"
 else
     log "GPU still busy (${GPU_UTIL}%) after ${GPU_WAIT_MINUTES}m: skipping embed/extract tonight"

@@ -131,7 +131,11 @@ done
 # ── 2. bank the verdicts ─────────────────────────────────────────────────────
 # pkg's nightly already ran precheck hours ago, before these verdicts existed.
 # This second pass is what turns them into accepts.
-run_precheck() { "$PKG" precheck --auto-accept >>"$LOG" 2>&1 || log "precheck FAILED"; }
+# Same triage lanes as pkg's nightly, under the same toggle.
+PRECHECK_TRIAGE="${PRECHECK_TRIAGE:-1}"
+PRECHECK_ARGS=(--auto-accept)
+[ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+run_precheck() { "$PKG" precheck "${PRECHECK_ARGS[@]}" >>"$LOG" 2>&1 || log "precheck FAILED"; }
 log "precheck (banking tonight's verdicts)"
 run_precheck
 
