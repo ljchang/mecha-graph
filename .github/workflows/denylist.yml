@@ -122,13 +122,19 @@ jobs:
                 if (prev != "" && l != "") print FILENAME, prev " " l
                 prev = l }' "$@"
           }
-          while IFS= read -r f; do
+          # `-z`: paths verbatim. Without it `git ls-files` C-quotes a path
+          # holding a non-ASCII byte, `[ -f ]` fails on the quoted form, and
+          # the file would be skipped here while the step still said clean.
+          # A join that fails stops the run: a short joined text is a check
+          # that did not happen, not a clean one.
+          while IFS= read -r -d '' f; do
             [ "$f" = LICENSE ] && continue
             [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
-            join_lines "$f" >>"$joined"
-          done < <(git ls-files)
+            join_lines "$f" >>"$joined" || { echo "::error::could not join the lines of a tracked file"; exit 1; }
+          done < <(git ls-files -z)
           for f in "$texts"/additions-* "$texts"/message-*; do
-            [ -f "$f" ] && join_lines "$f" >>"$joined"
+            [ -f "$f" ] || continue
+            join_lines "$f" >>"$joined" || { echo "::error::could not join the lines of a commit's text"; exit 1; }
           done
 
           # A `w` term is literal text bounded by anything that is not a letter or
@@ -231,9 +237,12 @@ jobs:
             if [ "$kind" = p ] && [[ "$term" == *[[:space:]]* ]]; then
               norm=$(printf '%s' "$term" | tr -s '[:space:]' ' ')
               rc=0
-              k=$(grep -ciF -e "$norm" "$joined" 2>/dev/null) || rc=$?
+              # Distinct sources, not matching pairs: each inner line sits in two
+              # pairs, so a pair count would report one place twice.
+              k=$(grep -iF -e "$norm" "$joined" 2>/dev/null | cut -f1 | sort -u | wc -l) || rc=$?
+              [ "$rc" -eq 0 ] && [ "$k" -eq 0 ] && rc=1
               case "$rc" in
-                0) echo "::error::DENYLIST HIT (roster line $line_no) across a line break, $k place(s)"
+                0) echo "::error::DENYLIST HIT (roster line $line_no) across a line break, in $k file(s) or commit(s)"
                    fail=1 ;;
                 1) ;;
                 *) echo "::error::grep failed (exit $rc) across line breaks, roster line $line_no"; exit 1 ;;

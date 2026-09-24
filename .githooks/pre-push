@@ -318,12 +318,17 @@ if [ ${#multi[@]} -gt 0 ]; then
         done < <(find "$1" -type f -not -path '*/.git/*' -print0)
     }
     if [ "$by_hand" -eq 1 ]; then
-        while IFS= read -r f; do
+        # `-z`: paths verbatim — a C-quoted non-ASCII path fails `[ -f ]`.
+        while IFS= read -r -d '' f; do
             [ "$f" = LICENSE ] && continue
             [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
             join_lines "$f" >>"$joined" || refuse_read "$f"
-        done < <(git ls-files -co --exclude-standard)
+        done < <(git ls-files -z -co --exclude-standard)
     else
+        # Each tip is read through `git archive`, not `git grep` as the main
+        # scan reads it: `export-ignore` in a future `.gitattributes`, or a
+        # case-insensitive filesystem collapsing two paths, would narrow this
+        # check alone. Neither applies today; worth knowing before adding one.
         for c in ${tips[@]+"${tips[@]}"}; do
             d="$texts/.tip-${c:0:12}"
             mkdir -p "$d"
@@ -334,7 +339,8 @@ if [ ${#multi[@]} -gt 0 ]; then
     # Additions and messages are wrapped text; path and ref-name lists are one
     # entry per line, and joining two paths would only invent a match.
     for f in "$texts"/additions-* "$texts"/message-*; do
-        [ -f "$f" ] && join_lines "$f" >>"$joined"
+        [ -f "$f" ] || continue
+        join_lines "$f" >>"$joined" || refuse_read "$f"
     done
     for t in "${multi[@]}"; do
         # The term with its own whitespace collapsed, as the joined text is.
