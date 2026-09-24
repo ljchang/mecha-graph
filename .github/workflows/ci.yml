@@ -1,0 +1,58 @@
+name: CI
+
+# Build, lint and test on every pull request and on main.
+#
+# Until 2026-09-24 nothing here built the code: the workflows were review,
+# claude and the denylist, so `cargo clippy -D warnings` had quietly gathered
+# eighteen failures under a newer toolchain before anyone ran it. A lint that
+# only runs when someone remembers to run it is the silently-degrading kind.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second push to a PR should cancel the run it supersedes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on warnings so lint debt cannot accumulate silently.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rusqlite's bundled SQLCipher vendors OpenSSL, so the first build is
+      # slow and later ones hit the cache. No system libraries are needed.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked
+
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
