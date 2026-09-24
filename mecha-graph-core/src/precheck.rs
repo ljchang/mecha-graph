@@ -589,8 +589,7 @@ const MINT_RECURRENCE: usize = 3;
 /// claims about one name is the same evidence bar summarize-eligibility
 /// and the kNN linker already use. Only subjects that resolve to NOTHING
 /// qualify — an ambiguous name still belongs to the human path.
-fn mint_recurring_subjects(conn: &Connection, dry_run: bool) -> Result<usize> {
-    let subjects = recurrence_pool_subjects(conn)?;
+fn mint_recurring_subjects(conn: &Connection, subjects: &[String], dry_run: bool) -> Result<usize> {
     let mut counts: HashMap<String, (String, usize)> = HashMap::new();
     for s in subjects {
         let key = s.trim().to_lowercase();
@@ -665,9 +664,14 @@ pub fn precheck_pending_with(
     if candidates.is_empty() {
         return Ok(report);
     }
+    // The recurrence pool, read once: minting and the triage tally must see
+    // the same list, and the pool — every one-off reject, permanently — is
+    // the one set here that grows without bound. Minting writes nodes, never
+    // candidates, so the list is still exact when the tally reads it.
+    let pool = recurrence_pool_subjects(conn)?;
     // Mint before the loop so this pass's resolve/dedup tiers already see
     // the new nodes.
-    report.subjects_minted = mint_recurring_subjects(conn, dry_run)?;
+    report.subjects_minted = mint_recurring_subjects(conn, &pool, dry_run)?;
 
     // Live facts, keyed for the deterministic tiers.
     let mut stmt = conn.prepare(
@@ -855,7 +859,7 @@ pub fn precheck_pending_with(
     // Counted over minting's own pool (see `recurrence_pool_subjects`).
     let mut subject_mentions: HashMap<String, usize> = HashMap::new();
     if triage {
-        for s in recurrence_pool_subjects(conn)? {
+        for s in &pool {
             *subject_mentions.entry(s.trim().to_lowercase()).or_default() += 1;
         }
     }
@@ -2159,6 +2163,20 @@ mod tests {
             "object text normalizes: 'Kiln' is 'kiln'"
         );
         assert_eq!(status_of(&conn, fold), "rejected");
+        let reason: String = conn
+            .query_row(
+                "SELECT reject_reason FROM fact_candidate WHERE id = ?1",
+                params![fold],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Inline, not via FOLD_REASON: `fact::class_prior` excludes fold
+        // rejects by their STORED prefix, so rewording the constant would
+        // silently return every historical fold to the class prior.
+        assert!(
+            reason.starts_with("precheck: restatement of fact"),
+            "the stored prefix is persisted state: {reason}"
+        );
         assert_eq!(
             obs(&conn),
             before + 1,

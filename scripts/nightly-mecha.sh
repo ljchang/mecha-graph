@@ -3,10 +3,13 @@
 # llama-server, run after pkg's own sweep has finished with ollama.
 #
 #   1. vet    — judge pending candidates in the auto-accept classes
-#   2. precheck --auto-accept — bank the verdicts vet just filed
+#   2. precheck --auto-accept --triage — bank the verdicts vet just filed
 #   3. gossip — probe one or more entities, rotating
 #
 # Install:  crontab -e  →  0 8 * * *  .../scripts/nightly-mecha.sh
+#
+# Precheck toggles are shared with nightly.sh and read from the same file,
+# ~/.mecha-graph/nightly.env: PRECHECK_AUTO_ACCEPT=0, PRECHECK_TRIAGE=0.
 # (was gossip-nightly.sh; renamed 2026-08-16 when vet moved in.)
 #
 # ── Why vet is here and not in nightly.sh ────────────────────────────────────
@@ -131,7 +134,56 @@ done
 # ── 2. bank the verdicts ─────────────────────────────────────────────────────
 # pkg's nightly already ran precheck hours ago, before these verdicts existed.
 # This second pass is what turns them into accepts.
-run_precheck() { "$PKG" precheck --auto-accept >>"$LOG" 2>&1 || log "precheck FAILED"; }
+# Same flags as pkg's nightly, under the same toggles, read from the file
+# nightly.sh sources (same path resolution) — cron exports nothing, so an
+# off-switch written in the documented place must reach both halves or it
+# only half works. Only these two are taken, each in a subshell, so nothing
+# else in nightly.env leaks into this script; the file wins, as it does in
+# nightly.sh.
+#
+# A file that exists but will not source fails closed — both toggles off,
+# loudly — through the helper nightly.sh uses, so one file cannot get two
+# answers from the two halves.
+. "$REPO_DIR/scripts/nightly-env.sh"
+NIGHTLY_ENV="${MECHA_GRAPH_DIR:-$HOME/.mecha-graph}/nightly.env"
+NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — precheck toggles forced OFF" ;;
+esac
+env_toggle() {
+    local name=$1 from_file=""
+    case "$NIGHTLY_ENV_STATUS" in
+        ok) from_file="$(nightly_env_value "$NIGHTLY_ENV" "$name")" ;;
+        absent) ;;
+        *) printf '0'; return ;;
+    esac
+    printf '%s' "${from_file:-${!name:-1}}"
+}
+PRECHECK_AUTO_ACCEPT="$(env_toggle PRECHECK_AUTO_ACCEPT)"
+PRECHECK_TRIAGE="$(env_toggle PRECHECK_TRIAGE)"
+PRECHECK_ARGS=()
+[ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
+[ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+# This pass is the only consumer of tonight's vet verdicts; without
+# --auto-accept they are filed and never banked. Say so, or the night reads
+# exactly like a banking one.
+[ "$PRECHECK_AUTO_ACCEPT" = "1" ] || \
+    log "precheck without --auto-accept: tonight's vet verdicts will not be banked"
+# The blindness alarm nightly.sh has: with --triage on, a precheck that ran
+# without vectors reports "folded 0" beside real one-off rejects, and that
+# zero is blindness, not an absence of restatements.
+# Output streams into the log as it runs (tee), so a hang still leaves a
+# record; pipefail makes the substitution's status precheck's own, so the
+# exit code is kept and FAILED lands after the output that explains it.
+run_precheck() {
+    local out rc=0
+    out="$("$PKG" precheck "${PRECHECK_ARGS[@]}" 2>&1 | tee -a "$LOG")" || rc=$?
+    [ "$rc" -eq 0 ] || log "precheck FAILED (exit $rc)"
+    if printf '%s' "$out" | grep -qE "SEMANTIC TIERS SKIPPED|embedding server unreachable"; then
+        log "ALERT: precheck ran blind — no embeddings; its semantic lanes (fold, dedup) did nothing"
+    fi
+}
 log "precheck (banking tonight's verdicts)"
 run_precheck
 

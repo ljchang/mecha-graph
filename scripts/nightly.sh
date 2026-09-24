@@ -13,6 +13,8 @@
 #                            # (space-separated; empty string = extract all)
 #   SUMMARIZE_LIMIT=30       # scope summaries refreshed per night (§4.5)
 #   PRECHECK_AUTO_ACCEPT=0   # 0 disables auto-accept (durable predicates only)
+#   PRECHECK_TRIAGE=0        # 0 disables the calibrated triage lanes (fold
+#                            # restatements, reject one-off subjects)
 #   LINK_PROPOSE=1           # re-enable the candidate-staging linker tiers
 #   BEE_PULL_LIMIT=100       # re-enable the Bee suggested-facts pull
 #   GPU_BUSY_THRESHOLD=30    # skip embed/extract above this % utilization
@@ -58,7 +60,19 @@ mkdir -p "$LOG_DIR"
 # Keep 30 days of logs.
 find "$LOG_DIR" -name 'nightly-*.log' -mtime +30 -delete 2>/dev/null
 
-[ -f "$MECHA_GRAPH_DIR/nightly.env" ] && . "$MECHA_GRAPH_DIR/nightly.env"
+# A nightly.env that exists but will not source is not an absent one. It is
+# skipped whole (a partial source applies half an intent; an aborting one
+# would kill this run), and the precheck toggles fail CLOSED — the triage
+# lane makes permanent rejects, and its off-switch may be what sits unread.
+# nightly-mecha.sh applies the same rule through the same helper.
+. "$REPO_DIR/scripts/nightly-env.sh"
+NIGHTLY_ENV="$MECHA_GRAPH_DIR/nightly.env"
+NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
+case "$NIGHTLY_ENV_STATUS" in
+    ok) . "$NIGHTLY_ENV" ;;
+    absent) ;;
+    *) PRECHECK_AUTO_ACCEPT=0 PRECHECK_TRIAGE=0 ;;
+esac
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
@@ -70,10 +84,15 @@ EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 EXTRACT_EXCLUDE="${EXTRACT_EXCLUDE-calendar.event}"
 SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
 PRECHECK_AUTO_ACCEPT="${PRECHECK_AUTO_ACCEPT:-1}"
+PRECHECK_TRIAGE="${PRECHECK_TRIAGE:-1}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
 run() { log "\$ $*"; "$@" >>"$LOG" 2>&1 || log "FAILED (exit $?): $*"; }
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — skipped; precheck toggles forced OFF" ;;
+esac
 
 log "=== nightly start ==="
 if [ -n "${BEE_BUS_MISSING:-}" ]; then
@@ -193,12 +212,17 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     for src in $EXTRACT_EXCLUDE; do EXTRACT_ARGS+=(--exclude-source "$src"); done
     run "$PKG" extract "${EXTRACT_ARGS[@]}"
     # Auto-triage the fresh candidates: duplicates die, contradictions get
-    # flagged, and (opt-in) clean novel facts accept themselves.
-    if [ "$PRECHECK_AUTO_ACCEPT" = "1" ]; then
-        run "$PKG" precheck --auto-accept
-    else
-        run "$PKG" precheck
-    fi
+    # flagged, and (opt-in) clean novel facts accept themselves. --triage
+    # adds the lanes calibrated on the owner's verdicts (precheck.rs):
+    # restatements fold into their fact, one-off subjects are rejected.
+    PRECHECK_ARGS=()
+    [ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
+    [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
+    # Where this run's precheck output starts: the blindness alarms read
+    # only from here, so a same-day re-run after the operator restarts the
+    # embedding server is judged on its own output, not the morning's.
+    PRECHECK_LOG_FROM=$(( $(wc -l <"$LOG") + 1 ))
+    run "$PKG" precheck "${PRECHECK_ARGS[@]}"
     run "$PKG" summarize --limit "$SUMMARIZE_LIMIT" --model "$EXTRACT_MODEL"
 else
     log "GPU still busy (${GPU_UTIL}%) after ${GPU_WAIT_MINUTES}m: skipping embed/extract tonight"
@@ -247,9 +271,19 @@ print('; '.join(alerts))
 # A precheck run whose embedding died mid-way prints its blindness marker
 # into this very log; surface it as an alert rather than leaving zeros
 # that read like a clean queue (grep target kept in step with main.rs).
-if grep -q "SEMANTIC TIERS SKIPPED" "$LOG"; then
+# Unset when precheck did not run tonight (GPU busy): nothing to judge.
+PRECHECK_OUT="$([ -n "${PRECHECK_LOG_FROM:-}" ] && tail -n +"$PRECHECK_LOG_FROM" "$LOG")"
+if grep -q "SEMANTIC TIERS SKIPPED" <<<"$PRECHECK_OUT"; then
     STALE="${STALE:+$STALE; }precheck ran blind: embedding failed mid-run"
+elif grep -q "embedding server unreachable" <<<"$PRECHECK_OUT"; then
+    # Down before precheck started, so semantic_skipped was never set —
+    # and with --triage on, "folded 0" is blindness, not a clean queue.
+    STALE="${STALE:+$STALE; }precheck ran blind: embedding server unreachable"
 fi
+case "$NIGHTLY_ENV_STATUS" in
+    ok | absent) ;;
+    *) STALE="${STALE:+$STALE; }nightly.env $NIGHTLY_ENV_STATUS (precheck toggles forced off)" ;;
+esac
 
 if [ -n "$STALE" ]; then
     log "ALERTS: $STALE"
