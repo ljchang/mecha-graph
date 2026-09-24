@@ -1,4 +1,4 @@
-//! `pkg tui` — keystroke-speed surfaces for the jobs a one-shot CLI is bad at
+//! `mecha-graph tui` — keystroke-speed surfaces for the jobs a one-shot CLI is bad at
 //!: review-queue triage, merge review, a search REPL with
 //! provenance drill-down (+ episode tag/note annotation), an entity browser
 //! with fact supersede, and a GTD task board.
@@ -1228,7 +1228,12 @@ fn spawn_editor(initial: &str) -> mecha_graph_core::Result<Option<String>> {
         .or_else(|_| std::env::var("VISUAL"))
         .unwrap_or_else(|_| "vi".into());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let path = std::path::PathBuf::from(home).join("pkg").join(".edit.md");
+    // `~/pkg` was this store's home before the rename; writing there failed
+    // on any install that never had it. The store's own directory is the
+    // one the doc comment above always named.
+    let dir = std::path::PathBuf::from(home).join(".mecha-graph");
+    std::fs::create_dir_all(&dir).map_err(io_err)?;
+    let path = dir.join(".edit.md");
     std::fs::write(&path, initial).map_err(io_err)?;
     #[cfg(unix)]
     {
@@ -2045,7 +2050,7 @@ fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                             app.search.detail = None;
                             app.search.dirty_since = Some(std::time::Instant::now());
                             app.status = format!(
-                                "episode {} deleted — Ctrl-Z (or `pkg undo`) restores",
+                                "episode {} deleted — Ctrl-Z (or `mecha-graph undo`) restores",
                                 &ep.uid[..8]
                             );
                         } else {
@@ -2143,7 +2148,7 @@ fn handle_search(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     "episode" => match episode::get_episode_by_uid(&app.conn, &item.id)? {
                         Some(ep) => {
                             let raw_note = if episode::has_raw(&app.conn, ep.id)? {
-                                format!("\n\n[raw archived — pkg raw {}]", ep.uid)
+                                format!("\n\n[raw archived — mecha-graph raw {}]", ep.uid)
                             } else {
                                 String::new()
                             };
@@ -2602,7 +2607,7 @@ fn handle_entity(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph
                     .cloned();
                 if let Some(ep) = ep {
                     let raw_note = if episode::has_raw(&app.conn, ep.id)? {
-                        format!("\n\n[raw archived — pkg raw {}]", ep.uid)
+                        format!("\n\n[raw archived — mecha-graph raw {}]", ep.uid)
                     } else {
                         String::new()
                     };
@@ -3494,7 +3499,7 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "tip: tags like \"recommendation,software\" make this revisitable via pkg facts --tag",
+                "tip: tags like \"recommendation,software\" make this revisitable via mecha-graph facts --tag",
                 Style::default().fg(Color::DarkGray),
             )));
             Paragraph::new(lines).wrap(Wrap { trim: false }).block(

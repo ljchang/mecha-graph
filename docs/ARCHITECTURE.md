@@ -1,7 +1,7 @@
 # Architecture — the mental model
 
 One sentence: **episodes are evidence, nodes are things, facts are beliefs,
-and the context pack is the product.** Everything in pkg is machinery that
+and the context pack is the product.** Everything in mecha-graph is machinery that
 turns raw records of your life into a token-bounded, provenance-carrying
 slice an agent can trust.
 
@@ -139,7 +139,7 @@ be staged for review:
 
 The staging queue (`fact_candidate`) is the membrane between "a model
 said so" and "the graph believes it": **extraction proposes, promotion
-disposes.** `pkg precheck` auto-triages that queue — duplicates of known
+disposes.** `mecha-graph precheck` auto-triages that queue — duplicates of known
 facts are rejected with an observation bump, in-queue repeats collapse,
 conversational recaps ("X discussed Y") are dropped as bloat since the
 episode already records them, contradictions on single-valued predicates
@@ -181,10 +181,10 @@ trusting the index to forget them.
 The envelope carries two further self-descriptions, both omitted when
 they have nothing to say:
 
-- **`flags`** (≤2) — problems pkg detected in what it is about to
+- **`flags`** (≤2) — problems mecha-graph detected in what it is about to
   return: a contradiction on a single-valued predicate, a denial
   contesting a served belief, a fact past its predicate's half-life.
-  pkg detects with provenance; the consumer judges whether to act. Same
+  mecha-graph detects with provenance; the consumer judges whether to act. Same
   division as ambiguity, generalized.
 - **`scope`** — whether this pack could see facts, evidence, or both.
   A verifier has to know what an answer *could* have drawn on;
@@ -197,7 +197,7 @@ they have nothing to say:
   "last met". Rollups exclude `occurred_at > now`.
 - **At rest**: the DB is SQLCipher-encrypted (`~/.mecha-graph/db.key`, 0600);
   plaintext source files are deleted after verified capture; analytical
-  snapshots come from `pkg decrypt` and are transaction-pinned.
+  snapshots come from `mecha-graph decrypt` and are transaction-pinned.
 - **Nightly** (03:30 cron): source sync → bee-facts two-way sync →
   linker cascade → GPU-gated embed + LLM extract → precheck → scope
   summaries → `MEMORY.md` boot context → health alerts. Everything is
@@ -209,36 +209,36 @@ they have nothing to say:
 
 ## Boundaries — what lives here, what lives in the agent
 
-pkg and mecha (`~/Github/mecha`) are deliberately separate repositories
+mecha-graph and mecha (`~/Github/mecha`) are deliberately separate repositories
 with **no compile-time dependency in either direction**. The entire
-interface is the MCP tool namespace (`pkg__kg_search`, `pkg__kg_upsert`,
-…); mecha's own eval suite tests against a *fixture* pkg server, not
-against pkg itself. Settled 2026-08-12; the reasoning is worth keeping
+interface is the MCP tool namespace (`kg_search`, `kg_upsert`, …, which carry
+their own `kg_` prefix, so a consumer registers them unprefixed); mecha's own eval suite tests against a *fixture* graph server, not
+against mecha-graph itself. Settled 2026-08-12; the reasoning is worth keeping
 because it will be re-litigated.
 
 ### Why separate
 
-**Durability asymmetry — the decisive argument.** pkg holds an
+**Durability asymmetry — the decisive argument.** mecha-graph holds an
 encrypted, migration-versioned store of a life; it is irreplaceable if
 corrupted. mecha holds agent behaviour, which is replaceable and
 *should* be replaced as models and harnesses change. You do not fold a
-durable asset into a disposable tool. Expect pkg to outlive whatever
+durable asset into a disposable tool. Expect mecha-graph to outlive whatever
 harness is currently in front of it.
 
 **The boundary carries the security model.** mecha's taint interlock
-treats a pkg read as arming both taint legs, and mecha's eval has cases
+treats a mecha-graph read as arming both taint legs, and mecha's eval has cases
 asserting exactly that (`web-then-memory`: taint private+untrusted,
-`blocked_sends: 0`). That analysis only works because reading pkg is an
+`blocked_sends: 0`). That analysis only works because reading mecha-graph is an
 *external* act. Merge the two and "reading my own memory" versus
-"reading pkg" blurs precisely where it currently needs to be sharp.
+"reading mecha-graph" blurs precisely where it currently needs to be sharp.
 
-**§2 is only enforceable across a crate boundary.** "pkg-core knows
+**§2 is only enforceable across a crate boundary.** "mecha-graph-core knows
 nothing about any agent" has repeatedly produced better designs by
 pushing orchestration out — the `ask_ada` route, pack flags that
-*describe* rather than decide, pkg not writing into mecha's mailbox. In
+*describe* rather than decide, mecha-graph not writing into mecha's mailbox. In
 one workspace that constraint erodes by convenience.
 
-**Multiple consumers.** Claude Code and Hermes over MCP, the `pkg` CLI,
+**Multiple consumers.** Claude Code and Hermes over MCP, the `mecha-graph` CLI,
 DuckDB for analytics; FlowMail is a future consumer on macOS. Even at
 one real consumer the MCP surface costs nothing already being paid.
 
@@ -247,8 +247,8 @@ one real consumer the MCP surface costs nothing already being paid.
 Both are current practice. Violating either is what would actually
 create redundancy between the repos:
 
-1. **pkg's own interface stays non-conversational** — commands,
-   tables, keystrokes. The moment pkg grows a chat surface there are
+1. **mecha-graph's own interface stays non-conversational** — commands,
+   tables, keystrokes. The moment mecha-graph grows a chat surface there are
    two harnesses.
 2. **mecha never stores facts** — it produces episodes through
    `kg_upsert` and reads context packs. The moment mecha caches graph
@@ -256,7 +256,7 @@ create redundancy between the repos:
 
 ### Two interfaces because there are two modes
 
-The direct interface (`pkg` CLI + TUI) is load-bearing, not a
+The direct interface (`mecha-graph` CLI + TUI) is load-bearing, not a
 convenience:
 
 - it is the **unmediated correction channel** — if the only way to fix
@@ -270,41 +270,41 @@ convenience:
 | Mode | Surface | For |
 |---|---|---|
 | conversational, in-context, reactive | mecha | point-of-use flags, questions, corrections in flow |
-| direct, bulk, deliberate | `pkg` CLI/TUI | cluster review, schema authoring, health, forks |
+| direct, bulk, deliberate | `mecha-graph` CLI/TUI | cluster review, schema authoring, health, forks |
 
 Most apparent duplication between the repos is nominal — the same word
-for different jobs. pkg's review queue holds *world facts*, mecha's
-holds *behaviour rules*. pkg's `sensitivity` is static classification
+for different jobs. mecha-graph's review queue holds *world facts*, mecha's
+holds *behaviour rules*. mecha-graph's `sensitivity` is static classification
 on a row; mecha's `taint` is dynamic flow control on a conversation.
-pkg's eval measures retrieval quality; mecha's grades agent traces.
+mecha-graph's eval measures retrieval quality; mecha's grades agent traces.
 Only two overlaps are real: the class/outcome ledger (same state
 machine, different substrate — share the written mechanism, implement
 twice) and scheduling (mecha's `cron.rs`/`trigger.rs` is the better
 one; `scripts/nightly.sh` stays as the standalone fallback).
 
-### pkg is the agent's declarative memory
+### mecha-graph is the agent's declarative memory
 
 ACT-R — already borrowed for base-level activation (§11.5) — splits
 **declarative** memory (chunks) from **procedural** memory (production
-rules). That split answers "should pkg be mecha's memory system?":
+rules). That split answers "should mecha-graph be mecha's memory system?":
 
 | Memory | Content | Home |
 |---|---|---|
-| **semantic** (declarative) | facts about people, projects, orgs | **pkg** |
-| **episodic** (declarative) | what happened, including the agent's own sessions | **pkg** (`sources/sessions.rs`) |
+| **semantic** (declarative) | facts about people, projects, orgs | **mecha-graph** |
+| **episodic** (declarative) | what happened, including the agent's own sessions | **mecha-graph** (`sources/sessions.rs`) |
 | **procedural** | reflexion rules — "check the graph before searching the web" | mecha `~/.mecha/learning/` |
 | **working** | the live conversation, compaction | mecha runtime (state, not memory) |
 | **operational** | outbox, triggers, messages, liveness | mecha files (infrastructure) |
 
-So pkg already *is* mecha's declarative memory: the session-end
+So mecha-graph already *is* mecha's declarative memory: the session-end
 distiller writes episodes through `kg_upsert`, `sources/sessions.rs`
 ingests sessions, and §8.3's boot digest supplies opening context.
 
 The litmus for anything new is the one that already routes corrections:
-**"would the user ask an assistant about this later?" → pkg. "Should
+**"would the user ask an assistant about this later?" → mecha-graph. "Should
 the agent behave differently next time?" → the harness.**
 
-Procedural memory stays out of pkg even though bi-temporality,
+Procedural memory stays out of mecha-graph even though bi-temporality,
 provenance and supersede would all be useful for rules — it is not
 world knowledge, it is model-specific, and a harness swap should not
 inherit the previous harness's habits. Revisit only if rules reach the
@@ -338,15 +338,15 @@ consistency — covered in the internal research notes) becomes relevant again.
 A Reflect note titled `Iris Calder` with `Type: #person`,
 `Email: iris.calder@example.com`, `Company: Westfield`:
 
-1. `pkg ingest reflect` streams it from the export zip → **episode**
+1. `mecha-graph ingest reflect` streams it from the export zip → **episode**
    (`reflect.note`, keyed by the note's stable id), raw markdown archived,
    zip deleted after verification.
-2. `pkg reflect-process` sees the type tag → resolves the email
+2. `mecha-graph reflect-process` sees the type tag → resolves the email
    **identifier** → attaches to the *existing* Iris node rather than
    creating a duplicate; `Company: Westfield` becomes a **fact**
    (`works_at`, extractor `reflect`, pointing at this episode); the
    episode gets a **mention** of Iris.
-3. `pkg link` scans every episode for known names → more mentions
+3. `mecha-graph link` scans every episode for known names → more mentions
    (its candidate-staging tiers — kNN, structural, rules — run only with
    `--propose`, off in the nightly by default);
    NPMI notices who co-occurs with Iris unusually often → `related_to`

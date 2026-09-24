@@ -271,7 +271,7 @@ pub fn test_source(_name: &str, cfg: &SourceConfig) -> TestResult {
             }
         }
         "slack" => match cfg.get_str("token") {
-            None => fail("no token — pkg source add slack --token xoxp-…".into()),
+            None => fail("no token — mecha-graph source add slack --token xoxp-…".into()),
             Some(token) => match crate::sources::slack::auth_test(token) {
                 Ok((team, user)) => pass(format!("authenticated: {user} @ {team}")),
                 Err(e) => fail(format!("auth.test failed: {e}")),

@@ -611,7 +611,7 @@ pub fn accept_commitment(conn: &Connection, candidate_id: i64) -> Result<String>
     let p: serde_json::Value = serde_json::from_str(&payload)?;
     if p.get("kind").and_then(|k| k.as_str()) != Some("commitment") {
         return Err(Error::Other(
-            "not a commitment candidate — use pkg accept".into(),
+            "not a commitment candidate — use mecha-graph accept".into(),
         ));
     }
 

@@ -53,7 +53,7 @@ pub const GROUP_THRESHOLD: f64 = crate::precheck::SEMANTIC_FLAG_THRESHOLD;
 /// global layer defaulted there would group almost nothing and read as
 /// broken.
 ///
-/// **Measured 2026-08-29** (`pkg calibrate-groups`, 2,423 human verdicts):
+/// **Measured 2026-08-29** (`mecha-graph calibrate-groups`, 2,423 human verdicts):
 /// this floor is a judgement call no longer — and the measurement indicts
 /// the layer, not the value. Cross-class pairs at ≥0.90 carried the SAME
 /// human verdict only **63%** of the time (59–67% across every floor from

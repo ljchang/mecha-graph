@@ -99,7 +99,7 @@ pub struct ContextPack {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<TimeRange>,
     /// Point-of-use problems in what this pack serves (≤2, ranked by
-    /// expected loss). pkg detects; the consumer judges. See [`crate::flags`].
+    /// expected loss). mecha-graph detects; the consumer judges. See [`crate::flags`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<crate::flags::PackFlag>,
 }

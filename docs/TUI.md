@@ -46,7 +46,7 @@ rejects, and in every case the leader is *your* verdict while members
 cascade machine-labeled (one keystroke is one human verdict). Within-class
 only, by measurement: same-class pairs carried the same human verdict ~89%
 of the time; cross-class only ~63%, so crossing stays off this surface
-(`pkg calibrate-groups` reproduces the numbers).
+(`mecha-graph calibrate-groups` reproduces the numbers).
 
 `p` rolls the queue up one level further — by proposing mechanism, with each
 one's **human** accept rate and how much evidence it rests on (unjudged /

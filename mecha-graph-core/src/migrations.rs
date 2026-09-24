@@ -148,7 +148,7 @@ const MIGRATIONS: &[Migration] = &[
 /// attention. This table holds one vector per HUMAN-rejected candidate
 /// (machine rejects are excluded for the same reason they are excluded
 /// everywhere: a lane must not feed the memory that judges its own
-/// input), populated incrementally by `pkg embed`, compared by precheck
+/// input), populated incrementally by `mecha-graph embed`, compared by precheck
 /// at the same 0.97 threshold the live-fact dedup earned.
 ///
 /// Created at the compiled-in default width like its V001 siblings; an
@@ -156,7 +156,7 @@ const MIGRATIONS: &[Migration] = &[
 /// `embed::ensure_vec_dims`, and `embed::ensure_vec_rejected` re-aligns
 /// this one on a store whose vectors were rebuilt before V022 existed.
 /// The index is a derivable cache — dropping it loses nothing that one
-/// `pkg embed` cannot restore.
+/// `mecha-graph embed` cannot restore.
 const V022_VEC_REJECTED: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_rejected USING vec0(candidate_id INTEGER PRIMARY KEY, embedding FLOAT[768]);
 "#;

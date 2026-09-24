@@ -1,4 +1,4 @@
-//! pkg-mcp: the portability layer (§9.1). Eleven tools, stdio transport —
+//! mecha-graph-mcp: the portability layer (§9.1). Thirteen tools, stdio transport —
 //! one server → every harness, zero per-harness code.
 //!
 //! Tools return a versioned envelope ({v, items[], truncated, budget}), not
@@ -138,7 +138,7 @@ fn tool_definitions() -> Value {
         {
             "name": "kg_shadow_queue",
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
-            "description": "The surfaced-verdict queue (review-on-use): live UNREVIEWED (shadow) facts that are about to matter — each with the reasons it surfaced (contradicts a reviewed fact / was served in a context pack N times / spot-check of a sampled class). Shadow facts are already retrievable, rank-discounted and labeled 'unreviewed'; this queue is what a human should look at next. Read-only, and deliberately so: show the owner what surfaced, but the verdict itself (confirm/refute) is a human act on a human surface — `pkg shadow --confirm/--refute` or the TUI.",
+            "description": "The surfaced-verdict queue (review-on-use): live UNREVIEWED (shadow) facts that are about to matter — each with the reasons it surfaced (contradicts a reviewed fact / was served in a context pack N times / spot-check of a sampled class). Shadow facts are already retrievable, rank-discounted and labeled 'unreviewed'; this queue is what a human should look at next. Read-only, and deliberately so: show the owner what surfaced, but the verdict itself (confirm/refute) is a human act on a human surface — `mecha-graph shadow --confirm/--refute` or the TUI.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -370,7 +370,7 @@ fn kg_shadow_queue(conn: &Connection, args: &Value) -> mecha_graph_core::Result<
         })).collect::<Vec<_>>(),
         "shadow_live": live,
         "shadow_served": served,
-        "note": "verdicts are human-gated: pkg shadow --confirm <uid> / --refute <uid> --reason '…'",
+        "note": "verdicts are human-gated: mecha-graph shadow --confirm <uid> / --refute <uid> --reason '…'",
     }))
 }
 
@@ -2084,9 +2084,9 @@ mod tests {
 
 /// The Verifier's deterministic tier, over MCP.
 ///
-/// The role lives in mecha — judging is conversational work and pkg stays
+/// The role lives in mecha — judging is conversational work and mecha-graph stays
 /// non-conversational — but the checkable half is data work and the data is
-/// pkg's. Exposing it is what lets the mecha-side Judge run deterministic
+/// mecha-graph's. Exposing it is what lets the mecha-side Judge run deterministic
 /// checks first and spend a model only on the residue, which is the ordering
 /// PLAN specifies and the 2026-08-13 measurement earned: these checks found
 /// 589 real problems on the day blind model probing found none.

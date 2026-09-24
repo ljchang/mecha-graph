@@ -5,7 +5,7 @@
 //! so the context-switch cost is zero — strictly cheaper than a nightly
 //! batch question about a node the owner has to page back in.
 //!
-//! The division of labour is §1's: **pkg detects with provenance; the
+//! The division of labour is §1's: **mecha-graph detects with provenance; the
 //! model judges** whether to interrupt, ask, or silently note. No flag
 //! ever changes what the pack contains — flags describe it.
 //!

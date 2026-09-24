@@ -117,11 +117,11 @@ already shipped in phase 1.
    `PackItem.tier`, the rendered `[fact · unreviewed]`, the context
    line's `[UNREVIEWED] ` prefix, and `kg_entity`'s `tier` field.
 3. Floor and window — **still deferred on purpose**: `UtilityFloors` are
-   parameters, not constants; the nightly runs `pkg utility` report-only
+   parameters, not constants; the nightly runs `mecha-graph utility` report-only
    until `UTILITY_FLOOR` is set in nightly.env. The precision gate
    (`accept_lb < 0.15` over ≥ 20 human verdicts) IS live — the human
    record has tenure the usage data does not.
-4. Backlog — **bulk-convert** (`pkg shadow-convert`). The backlog
+4. Backlog — **bulk-convert** (`mecha-graph shadow-convert`). The backlog
    disappears as a concept; held classes (commitments, flags,
    unresolvable subjects) stay queued under the same rule as ingest.
 
@@ -150,12 +150,12 @@ already shipped in phase 1.
   recorded verdicts (cosine scales don't transfer across task prefixes).
 - **Extraction gating is structural**: the gated predicate leaves the
   grammar enum (`extraction_predicates`), so the waste never happens;
-  the run prints what it gated, `pkg utility` prints one grep-able line,
+  the run prints what it gated, `mecha-graph utility` prints one grep-able line,
   applied demotions land in `event_log`.
 
 ## §4 — resolved 2026-08-29 (calibrated, and the measurement decided)
 
-`pkg calibrate-groups` measured cascade agreement against 2,423 recorded
+`mecha-graph calibrate-groups` measured cascade agreement against 2,423 recorded
 human verdicts, split by class relationship. The finding replaced the
 question:
 
@@ -176,7 +176,7 @@ deliberately never crosses classes. The global listing survives as a
 but prints the measured numbers at use. `EmbedTask::Dedup` was measured
 alongside and is not better than Document in the range that matters
 (84.8% vs 83.6% at 0.90, worse elsewhere) — it stays wired to nothing.
-The measurement is reproducible: `pkg calibrate-groups`.
+The measurement is reproducible: `mecha-graph calibrate-groups`.
 
 ## Migration sketch
 

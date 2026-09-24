@@ -542,9 +542,9 @@ pub fn enrich_from_native(conn: &rusqlite::Connection, root: &Path) -> Result<us
 // ─── Bee facts write-back (two-way review, #12 partial) ─────────────────────
 //
 // Bee's app extracts its own "suggested facts" from the same conversations
-// pkg ingests. Reviewing them twice (once in Bee's app, once here) is
-// wasted attention — so pull the unconfirmed ones into pkg's review queue,
-// let the pkg tooling (precheck, bulk triage, ghost-text edit) decide, and
+// mecha-graph ingests. Reviewing them twice (once in Bee's app, once here) is
+// wasted attention — so pull the unconfirmed ones into mecha-graph's review queue,
+// let the mecha-graph tooling (precheck, bulk triage, ghost-text edit) decide, and
 // push the verdicts back: accept → `bee facts confirm`, reject →
 // `bee facts delete`. The Bee fact id rides in the candidate payload
 // (`bee_fact_id`); pushed verdicts are marked `bee_pushed` so the sync is

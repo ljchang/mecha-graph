@@ -82,14 +82,14 @@ need zero config.
   (See docs/OPERATIONS.md — gitignored — for this machine's values.)
   The nightly fetches it to `~/.mecha-graph/calendar.ics` and ingests. Manual
   alternative: drop any exported `.ics` at `~/.mecha-graph/calendar.ics`, or run
-  `pkg ingest ics <file> --me <your-email>` directly.
-- Multiple calendars: add more `pkg ingest ics` lines in the nightly, or
+  `mecha-graph ingest ics <file> --me <your-email>` directly.
+- Multiple calendars: add more `mecha-graph ingest ics` lines in the nightly, or
   concatenate ICS files — events are idempotent by UID.
 
 ### Agent sessions (Hermes + Claude Code)
 - **Auth**: none. `~/.hermes/state.db` is opened read-only;
   `~/.claude/projects/*/*.jsonl` are plain files. No writes ever.
-- **Config**: paths overridable via `pkg ingest sessions --hermes/--claude`.
+- **Config**: paths overridable via `mecha-graph ingest sessions --hermes/--claude`.
 
 ## Infrastructure
 
@@ -151,8 +151,8 @@ geometry, KV arithmetic, the measured `-np` table, and the request contract.
 - **SQLCipher-encrypted at rest.** Key resolution on every open:
   `MECHA_GRAPH_DB_KEY` env → `MECHA_GRAPH_DB_KEYFILE` → a local keyfile (0600) →
   plaintext; see docs/OPERATIONS.md (gitignored) for this machine's
-  values. `pkg encrypt` migrated the store in place with count
-  verification; `pkg decrypt --out <path>` writes an ephemeral plaintext
+  values. `mecha-graph encrypt` migrated the store in place with count
+  verification; `mecha-graph decrypt --out <path>` writes an ephemeral plaintext
   snapshot for DuckDB analytics.
 - **Back up the keyfile separately from the DB file** (e.g. a password
   manager) — without it the graph is unrecoverable; with only it, an
@@ -183,7 +183,7 @@ Three retention modes per source (`--retention` on `mecha-graph source add`, or
 
 **Re-processing after deletion is guaranteed**: enrichment, embedding, and
 Tier-7 extraction all read from the DB (`episode_raw` fallback where needed),
-so prompt/schema improvements re-run against the archive — `pkg raw <uid>`
+so prompt/schema improvements re-run against the archive — `mecha-graph raw <uid>`
 shows exactly what's preserved. `mecha-graph redact` deletes the archive row along
 with everything else.
 
@@ -204,46 +204,50 @@ removed before ever being used — see git history if it's ever wanted again):
    this protects against DB-file leaks (stray copies, backups); a thief who
    images the whole disk gets the keyfile too — the mitigation for that
    class is OS-level disk encryption (LUKS), a reinstall-level decision.
-4. **Plaintext remnants can exist outside pkg**: agent session transcripts
+4. **Plaintext remnants can exist outside mecha-graph**: agent session transcripts
    may quote graph content, and the distilled boot-context file (chmod 600)
    holds it by design. See docs/OPERATIONS.md (gitignored) for this
    machine's values.
 
 Backups: copy `graph.db` (it's ciphertext at rest) + keep the keyfile in
-the password manager. `pkg decrypt --out` produces plaintext snapshots for
+the password manager. `mecha-graph decrypt --out` produces plaintext snapshots for
 DuckDB — treat those as ephemeral.
 
 ## Consumers (MCP)
 
-The server is `pkg-mcp` — stdio transport, no network listener, no auth
+The server is `mecha-graph-mcp` — stdio transport, no network listener, no auth
 surface; access = ability to execute the binary as you.
 
-- **Hermes** — wired in `~/.hermes/config.yaml` under `mcp_servers.pkg`
-  (backup kept alongside). Restart Hermes to pick it up.
+- **Hermes** — an entry under `mcp_servers` in `~/.hermes/config.yaml` whose
+  `command` is `mecha-graph-mcp`; the key you give it is the name its tools
+  appear under. Restart Hermes to pick it up.
 - **Claude Code** — wired at user scope:
-  `claude mcp add --scope user pkg -- ~/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp`.
-  Verify with `claude mcp list`; remove with `claude mcp remove pkg`.
+  `claude mcp add --scope user graph -- mecha-graph-mcp`.
+  Verify with `claude mcp list`; remove with `claude mcp remove graph`.
 - Any other MCP client: point it at the same binary, stdio transport.
-- After `cargo build --release`, running servers keep the old binary until
-  their host app restarts.
+- After `cargo install mecha-graph-mcp`, running servers keep the old binary
+  until their host app restarts.
 
 ### Remote access — MCP over SSH (laptop → graph host)
 
 The graph lives on one host; other machines get live access with zero local
-state by running `pkg-mcp` through SSH (Tailscale authenticates). See
+state by running `mecha-graph-mcp` through SSH (Tailscale authenticates). See
 docs/OPERATIONS.md (gitignored) for this machine's values:
 
 ```bash
 # on the laptop — verify the transport first:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | \
   ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
+  '$HOME/.cargo/bin/mecha-graph-mcp'
 # expect a single JSON line back ({"id":1,...serverInfo...})
 
 # then register it:
-claude mcp add --scope user pkg -- ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/Github/personalized_knowledge_graph/target/release/mecha-graph-mcp
+claude mcp add --scope user graph -- ssh -T -o LogLevel=ERROR examplehost \
+  '$HOME/.cargo/bin/mecha-graph-mcp'
 ```
+
+The single quotes matter: they defer `$HOME` to the graph host's shell, so a
+laptop with a different home path still names the host's binary.
 
 Notes: `-T` + `LogLevel=ERROR` keep stdio clean (any motd/banner corrupts
 JSON-RPC); use the absolute binary path (non-login shell, no PATH); writes
@@ -255,9 +259,15 @@ If full offline replicas are ever wanted instead, the uid-based `mecha-graph syn
 design is queued — the schema already carries sync identities.
 
 ### DuckDB
+DuckDB's `sqlite` extension cannot open a SQLCipher file, so an encrypted store
+is read from a plaintext snapshot (a plaintext store can be attached directly):
+
+```bash
+mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
+```
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '~/.mecha-graph/graph.db' AS pkg (TYPE sqlite);
+ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
 ```
 Read-only analytics; never the system of record. (DuckDB wants a literal
 path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
