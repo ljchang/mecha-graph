@@ -68,11 +68,16 @@ find "$LOG_DIR" -name 'nightly-*.log' -mtime +30 -delete 2>/dev/null
 . "$REPO_DIR/scripts/nightly-env.sh"
 NIGHTLY_ENV="$MECHA_GRAPH_DIR/nightly.env"
 NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
-case "$NIGHTLY_ENV_STATUS" in
-    ok) . "$NIGHTLY_ENV" ;;
-    absent) ;;
-    *) PRECHECK_AUTO_ACCEPT=0 PRECHECK_TRIAGE=0 ;;
-esac
+# The precheck toggles come from the shared helper, not from the live
+# source below: sourced here, a line conditional on this shell's own
+# environment could turn triage off at 03:30 and leave it on at 08:00.
+PRECHECK_AUTO_ACCEPT_PROCESS="${PRECHECK_AUTO_ACCEPT:-}"
+PRECHECK_TRIAGE_PROCESS="${PRECHECK_TRIAGE:-}"
+[ "$NIGHTLY_ENV_STATUS" = "ok" ] && . "$NIGHTLY_ENV"
+PRECHECK_AUTO_ACCEPT="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_AUTO_ACCEPT "$PRECHECK_AUTO_ACCEPT_PROCESS")"
+PRECHECK_TRIAGE="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_TRIAGE "$PRECHECK_TRIAGE_PROCESS")"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
@@ -83,8 +88,6 @@ EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # default, making the documented opt-out a no-op.
 EXTRACT_EXCLUDE="${EXTRACT_EXCLUDE-calendar.event}"
 SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
-PRECHECK_AUTO_ACCEPT="${PRECHECK_AUTO_ACCEPT:-1}"
-PRECHECK_TRIAGE="${PRECHECK_TRIAGE:-1}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }

@@ -151,17 +151,10 @@ case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — precheck toggles forced OFF" ;;
 esac
-env_toggle() {
-    local name=$1 from_file=""
-    case "$NIGHTLY_ENV_STATUS" in
-        ok) from_file="$(nightly_env_value "$NIGHTLY_ENV" "$name")" ;;
-        absent) ;;
-        *) printf '0'; return ;;
-    esac
-    printf '%s' "${from_file:-${!name:-1}}"
-}
-PRECHECK_AUTO_ACCEPT="$(env_toggle PRECHECK_AUTO_ACCEPT)"
-PRECHECK_TRIAGE="$(env_toggle PRECHECK_TRIAGE)"
+PRECHECK_AUTO_ACCEPT="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_AUTO_ACCEPT "${PRECHECK_AUTO_ACCEPT:-}")"
+PRECHECK_TRIAGE="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_TRIAGE "${PRECHECK_TRIAGE:-}")"
 PRECHECK_ARGS=()
 [ "$PRECHECK_AUTO_ACCEPT" = "1" ] && PRECHECK_ARGS+=(--auto-accept)
 [ "$PRECHECK_TRIAGE" = "1" ] && PRECHECK_ARGS+=(--triage)
