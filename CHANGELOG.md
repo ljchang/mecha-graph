@@ -23,9 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   someone, or a short name inside `snake_case` (grep's `-w` counts `_` as a
   word character; a `w` term is now bounded by any non-alphanumeric) is
   caught. Whole trees are checked at the pushed tips and each commit for what
-  it adds, so a change that removes an inherited leak can pass. The
-  underscore rule found one such leak already public — a test variable named
-  after a roster term — renamed here. Run by hand (no refs from git, whatever stdin is) it checks
+  it adds, so a change that removes an inherited leak can pass. Run by hand (no refs from git, whatever stdin is) it checks
   the whole working tree from the top, untracked files included. CI keeps grep's exit status under Actions' `bash -e` (a
   missing term no longer ends the step), checks every commit a pull request
   or push brings in — what each adds, its message and its added paths, with

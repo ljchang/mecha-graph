@@ -189,7 +189,11 @@ scan() { # scan <kind> — one pass over the trees; per term only to name a hit
     [ ${#terms[@]} -gt 0 ] || return 0
     out=$(grep_tree "$kind" "${terms[@]}"); rc=$?
     case "$rc" in
-        0)  for t in "${terms[@]}"; do
+        # The batched pass is the one that KNOWS something matched; the
+        # per-term pass only names it. If naming finds nothing (the working
+        # tree changed between the two, by hand), still refuse.
+        0)  fail=1
+            for t in "${terms[@]}"; do
                 out=$(grep_tree "$kind" "$t"); rc=$?
                 case "$rc" in
                     0)  # Local-only output, so naming the term is safe here
@@ -236,10 +240,13 @@ done
 # Against the first parent for a merge; the merged branch's own commits are
 # in the range too, and checked as themselves.
 for c in ${commits[@]+"${commits[@]}"}; do
-    diff=$(git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c") \
+    # `:!LICENSE` here as in the tree scan: it carries the copyright holder's
+    # name by definition, and a year bump would otherwise be a hit no edit
+    # could clear.
+    diff=$(git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE') \
         || refuse_read "the changes of commit $c"
     printf '%s\n' "$diff" | grep '^+' | grep -v '^+++ ' | cut -c2- >"$texts/additions-commit-${c:0:12}"
-    git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" \
+    git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
         >"$texts/paths-commit-${c:0:12}" || refuse_read "the changes of commit $c"
     git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}" || refuse_read "commit $c"
 done
@@ -257,7 +264,8 @@ scan_texts() { # scan_texts <kind> — names and messages, one pass per kind
     for t in "${terms[@]}"; do e+=(-e "$(pattern "$kind" "$t")"); done
     out=$(grep "$(text_flags "$kind")" "${e[@]}" "$texts"/* 2>&1); rc=$?
     case "$rc" in
-        0)  for t in "${terms[@]}"; do
+        0)  fail=1   # as in `scan`: the batched pass knows; naming only names
+            for t in "${terms[@]}"; do
                 out=$(grep "$(text_flags "$kind")" -e "$(pattern "$kind" "$t")" "$texts"/* 2>&1); rc=$?
                 case "$rc" in
                     0)  for f in $out; do

@@ -97,9 +97,10 @@ jobs:
           # the first parent for a merge; the merged commits are checked as
           # themselves.
           for c in "${commits[@]}"; do
-            git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" \
+            # `:!LICENSE` as in the tree scan: a year bump must not be a hit.
+            git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE' \
               | { grep '^+' || true; } | { grep -v '^+++ ' || true; } | cut -c2- >"$texts/additions-commit-${c:0:12}"
-            git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" \
+            git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
               >"$texts/paths-commit-${c:0:12}"
             git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
           done
@@ -169,7 +170,7 @@ jobs:
             # LICENSE carries the copyright holder's name by definition. Nothing
             # else is excluded — not `.githooks`, not this file: a gate this
             # check cannot see is where a name slips out, and neither holds a
-            # term.
+            # term. (`target/` is build output, never committed.)
             # `.git` as a file too: in a worktree it is a pointer holding
             # this machine's path, which is not repository content.
             # `|| rc=$?`, not a bare assignment then `$?`: Actions runs this
