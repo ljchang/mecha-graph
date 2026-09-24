@@ -37,8 +37,10 @@ while IFS= read -r line; do
     kind=${line%% *}; term=${line#* }
     case "$kind" in
         # Word boundary for short terms, substring for phrases. Losing this
-        # distinction is not a near-miss: on the first run it reported
-        # "remedies" and "sugar" as leaks and refused a clean tree.
+        # distinction is not a near-miss: on the first run it flagged two
+        # ordinary words that merely contained a short term, and refused a
+        # clean tree. (Which words is deliberately not written down: naming
+        # them would tell a reader which letters a roster term is made of.)
         w) flags="-Iliw" ;;
         p) flags="-IliF" ;;
         *) echo "roster line $((terms+1)): unknown kind '$kind'" >&2; exit 1 ;;
