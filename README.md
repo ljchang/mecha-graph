@@ -147,11 +147,11 @@ claude mcp add graph -- mecha-graph-mcp
 DuckDB can't read SQLCipher, so analytics use an ephemeral snapshot:
 
 ```bash
-mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
+mecha-graph decrypt --out ~/.mecha-graph/analytics.db   # plaintext snapshot, inside the 0700 store dir
 ```
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
+ATTACH '/home/you/.mecha-graph/analytics.db' AS graph (TYPE sqlite);   -- DuckDB wants the literal path
 SELECT source, COUNT(*) FROM graph.episode GROUP BY source;
 ```
 

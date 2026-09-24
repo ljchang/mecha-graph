@@ -364,8 +364,10 @@ const KNN_TYPES: &str = "('project','org','topic','place')";
 fn parse_embedding(raw: rusqlite::types::ValueRef<'_>) -> Option<Vec<f32>> {
     match raw {
         rusqlite::types::ValueRef::Blob(b) if b.len() % 4 == 0 => Some(
-            b.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         ),
         rusqlite::types::ValueRef::Text(t) => serde_json::from_slice::<Vec<f32>>(t).ok(),

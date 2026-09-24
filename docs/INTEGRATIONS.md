@@ -263,12 +263,15 @@ DuckDB's `sqlite` extension cannot open a SQLCipher file, so an encrypted store
 is read from a plaintext snapshot (a plaintext store can be attached directly):
 
 ```bash
-mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
+mecha-graph decrypt --out ~/.mecha-graph/analytics.db   # plaintext snapshot
 ```
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
+ATTACH '/home/you/.mecha-graph/analytics.db' AS graph (TYPE sqlite);
 ```
+The snapshot goes inside the store's own 0700 directory rather than `/tmp`:
+it is the whole graph in plaintext, and it is only chmod 600 once the copy
+has verified. Delete it when you are done.
 Read-only analytics; never the system of record. (DuckDB wants a literal
 path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
 

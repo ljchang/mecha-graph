@@ -16,13 +16,19 @@ on:
 permissions:
   contents: read
 
-# A second push to a PR should cancel the run it supersedes.
+# A second push to a PR cancels the run it supersedes. Never on main: a
+# cancelled run there leaves a commit with no verdict at all.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned, and moved on purpose: with -D warnings, an unpinned `stable` turns
+  # every open PR red the day a Rust release adds a lint (1.98 added
+  # chunks_exact_to_as_chunks). Bump this in its own PR, fixing what the new
+  # lints find.
+  RUST_TOOLCHAIN: "1.98.1"
   # Fail the build on warnings so lint debt cannot accumulate silently.
   RUSTFLAGS: -D warnings
 
@@ -31,7 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       # rusqlite's bundled SQLCipher vendors OpenSSL, so the first build is
       # slow and later ones hit the cache. No system libraries are needed.
@@ -42,8 +50,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked
@@ -52,7 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all --check

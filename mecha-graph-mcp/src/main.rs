@@ -1665,7 +1665,7 @@ mod tests {
         assert_eq!(v["removed"], true);
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM node_alias WHERE node_id = 'daniel-1' AND alias = 'daniel'",
+                "SELECT COUNT(*) FROM node_alias WHERE node_id = 'rowan-1' AND alias = 'rowan'",
                 [],
                 |r| r.get(0),
             )
