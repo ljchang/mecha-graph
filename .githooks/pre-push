@@ -88,12 +88,18 @@ fi
 # push on stdin, it checks the working tree.
 commits=()
 tags=()
+ref_names=()
+tips=()
 refs_seen=0
 if [ ! -t 0 ]; then
-    while read -r _lref lsha _rref rsha; do
+    while read -r lref lsha rref rsha; do
         [ -n "${lsha:-}" ] || continue
         refs_seen=1
         case "$lsha" in *[!0]*) ;; *) continue ;; esac   # a branch deletion
+        # The ref's own name is published too — the branch list, the PR URL.
+        ref_names+=("$lref" "$rref")
+        # And the tree it points at, whole: what is public once this lands.
+        tips+=("$lsha")
         # A new branch, or a remote tip this clone has never fetched: every
         # commit the push TARGET's tracking refs do not already have. Not
         # `--remotes` whole — with a private remote in the same clone, its
@@ -131,23 +137,60 @@ by_hand=0
 # refuses the push. LICENSE carries the copyright holder's name by definition,
 # and always will — excluded exactly as the original export gate excluded it.
 fail=0
-# By hand, the working tree includes files not yet added (`--untracked`,
-# which still skips ignored ones): a name in a new file is one commit away
-# from a push. Pushing, the commits themselves are the targets.
-if [ "$by_hand" -eq 1 ]; then targets=(--untracked); else targets=(${commits[@]+"${commits[@]}"}); fi
-grep_terms() { # grep_terms <flags> <term>... — over every target at once
-    local flags=$1; shift
-    local e=(); for t in "$@"; do e+=(-e "$t"); done
-    git grep "$flags" ${e[@]+"${e[@]}"} ${targets[@]+"${targets[@]}"} -- ':!LICENSE' 2>&1
+# Whole trees are searched at the TIPS being pushed — what is public once the
+# push lands. Each new commit in between is checked for what it ADDS (below),
+# not its whole tree: every commit's tree carries everything inherited from
+# before it, so a whole-tree check of each one would re-flag an old leak in
+# every commit of the change that removes it, and that change could never
+# pass. By hand, the working tree, including files not yet added
+# (`--untracked`, which still skips ignored ones).
+if [ "$by_hand" -eq 1 ]; then targets=(--untracked); else targets=(${tips[@]+"${tips[@]}"}); fi
+
+# How each kind matches — literal text either way, never a regex a term could
+# break. A `p` term is a fixed substring. A `w` term is the term bounded by
+# anything that is not a letter or digit: grep's own `-w` counts `_` as part
+# of a word, so a short name inside `name_email` or `docs/name_notes.md` was a
+# term that could never match. The term is escaped into an ERE for that, and
+# only that. (camelCase — `getNameProfile` — stays out of reach: with case
+# ignored, a word joined by capitals cannot be told from one word.)
+ere_escape() {
+    local s=$1 out= c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        case "$c" in
+            '\'|'.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'['|']'|'{'|'}'|'|') out+="\\$c" ;;
+            *) out+=$c ;;
+        esac
+    done
+    printf '%s' "$out"
 }
-scan() { # scan <flags> <term>... — one pass; per-term only to name a hit
-    local flags=$1; shift
-    [ "$#" -gt 0 ] || return 0
-    local out rc
-    out=$(grep_terms "$flags" "$@"); rc=$?
+pattern() { # pattern <kind> <term>
+    if [ "$1" = w ]; then
+        printf '(^|[^[:alnum:]])%s($|[^[:alnum:]])' "$(ere_escape "$2")"
+    else
+        printf '%s' "$2"
+    fi
+}
+tree_flags() { [ "$1" = w ] && echo -IliE || echo -IliF; }
+text_flags() { [ "$1" = w ] && echo -liE || echo -liF; }
+kind_terms() { # the roster terms of one kind, one per line
+    if [ "$1" = w ]; then printf '%s\n' ${w_terms[@]+"${w_terms[@]}"}; else printf '%s\n' ${p_terms[@]+"${p_terms[@]}"}; fi
+}
+grep_tree() { # grep_tree <kind> <term>... — over every target at once
+    local kind=$1; shift
+    local e=() t
+    for t in "$@"; do e+=(-e "$(pattern "$kind" "$t")"); done
+    git grep "$(tree_flags "$kind")" "${e[@]}" ${targets[@]+"${targets[@]}"} -- ':!LICENSE' 2>&1
+}
+refuse_grep() { echo "pre-push REFUSED: $1 failed (exit $2):" >&2; printf '%s\n' "$3" | sed 's/^/  /' >&2; exit 1; }
+scan() { # scan <kind> — one pass over the trees; per term only to name a hit
+    local kind=$1 t out rc terms=()
+    while IFS= read -r t; do [ -n "$t" ] && terms+=("$t"); done < <(kind_terms "$kind")
+    [ ${#terms[@]} -gt 0 ] || return 0
+    out=$(grep_tree "$kind" "${terms[@]}"); rc=$?
     case "$rc" in
-        0)  for t in "$@"; do
-                out=$(grep_terms "$flags" "$t"); rc=$?
+        0)  for t in "${terms[@]}"; do
+                out=$(grep_tree "$kind" "$t"); rc=$?
                 case "$rc" in
                     0)  # Local-only output, so naming the term is safe here
                         # and is what makes the finding actionable — the CI
@@ -156,18 +199,16 @@ scan() { # scan <flags> <term>... — one pass; per-term only to name a hit
                         printf '%s\n' "$out" | sed 's/^/  /' >&2
                         fail=1 ;;
                     1)  ;;
-                    *)  echo "pre-push REFUSED: git grep failed (exit $rc):" >&2
-                        printf '%s\n' "$out" | sed 's/^/  /' >&2; exit 1 ;;
+                    *)  refuse_grep "git grep" "$rc" "$out" ;;
                 esac
             done ;;
         1)  ;;
-        *)  echo "pre-push REFUSED: git grep failed (exit $rc):" >&2
-            printf '%s\n' "$out" | sed 's/^/  /' >&2; exit 1 ;;
+        *)  refuse_grep "git grep" "$rc" "$out" ;;
     esac
 }
-if [ "$by_hand" -eq 1 ] || [ ${#commits[@]} -gt 0 ]; then
-    scan -IliwF ${w_terms[@]+"${w_terms[@]}"}
-    scan -IliF ${p_terms[@]+"${p_terms[@]}"}
+if [ "$by_hand" -eq 1 ] || [ ${#tips[@]} -gt 0 ]; then
+    scan w
+    scan p
 fi
 
 # Beyond file contents, two more things are published: the **names** of files
@@ -187,23 +228,37 @@ refuse_read() { echo "pre-push REFUSED: could not read $1" >&2; exit 1; }
 if [ "$by_hand" -eq 1 ]; then
     git ls-files -co --exclude-standard >"$texts/paths-working-tree" || refuse_read "the file list"
 fi
+for c in ${tips[@]+"${tips[@]}"}; do
+    git ls-tree -r --name-only "$c" >"$texts/paths-tip-${c:0:12}" || refuse_read "the tree of $c"
+done
+# Each new commit: the lines it adds, the paths it adds, and its message —
+# a leak added and removed within the push is public by SHA all the same.
+# Against the first parent for a merge; the merged branch's own commits are
+# in the range too, and checked as themselves.
 for c in ${commits[@]+"${commits[@]}"}; do
-    git ls-tree -r --name-only "$c" >"$texts/paths-commit-${c:0:12}" || refuse_read "commit $c"
+    diff=$(git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c") \
+        || refuse_read "the changes of commit $c"
+    printf '%s\n' "$diff" | grep '^+' | grep -v '^+++ ' | cut -c2- >"$texts/additions-commit-${c:0:12}"
+    git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" \
+        >"$texts/paths-commit-${c:0:12}" || refuse_read "the changes of commit $c"
     git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}" || refuse_read "commit $c"
 done
+if [ ${#ref_names[@]} -gt 0 ]; then
+    printf '%s\n' "${ref_names[@]}" >"$texts/names-pushed-refs"
+fi
 for g in ${tags[@]+"${tags[@]}"}; do
     body=$(git cat-file tag "$g") || refuse_read "tag $g"
     printf '%s\n' "$body" | sed '1,/^$/d' >"$texts/message-tag-${g:0:12}"
 done
-scan_texts() { # scan_texts <flags> <term>...
-    local flags=$1; shift
-    [ "$#" -gt 0 ] || return 0
-    local e=() t out rc f
-    for t in "$@"; do e+=(-e "$t"); done
-    out=$(grep -l "$flags" "${e[@]}" "$texts"/* 2>&1); rc=$?
+scan_texts() { # scan_texts <kind> — names and messages, one pass per kind
+    local kind=$1 t out rc f e=() terms=()
+    while IFS= read -r t; do [ -n "$t" ] && terms+=("$t"); done < <(kind_terms "$kind")
+    [ ${#terms[@]} -gt 0 ] || return 0
+    for t in "${terms[@]}"; do e+=(-e "$(pattern "$kind" "$t")"); done
+    out=$(grep "$(text_flags "$kind")" "${e[@]}" "$texts"/* 2>&1); rc=$?
     case "$rc" in
-        0)  for t in "$@"; do
-                out=$(grep -l "$flags" -e "$t" "$texts"/* 2>&1); rc=$?
+        0)  for t in "${terms[@]}"; do
+                out=$(grep "$(text_flags "$kind")" -e "$(pattern "$kind" "$t")" "$texts"/* 2>&1); rc=$?
                 case "$rc" in
                     0)  for f in $out; do
                             f=${f##*/}
@@ -211,16 +266,16 @@ scan_texts() { # scan_texts <flags> <term>...
                         done
                         fail=1 ;;
                     1)  ;;
-                    *)  echo "pre-push REFUSED: grep failed (exit $rc) on names or messages" >&2; exit 1 ;;
+                    *)  refuse_grep "grep on names or messages" "$rc" "$out" ;;
                 esac
             done ;;
         1)  ;;
-        *)  echo "pre-push REFUSED: grep failed (exit $rc) on names or messages" >&2; exit 1 ;;
+        *)  refuse_grep "grep on names or messages" "$rc" "$out" ;;
     esac
 }
 if compgen -G "$texts/*" >/dev/null; then
-    scan_texts -iwF ${w_terms[@]+"${w_terms[@]}"}
-    scan_texts -iF ${p_terms[@]+"${p_terms[@]}"}
+    scan_texts w
+    scan_texts p
 fi
 
 if [ "$fail" -ne 0 ]; then

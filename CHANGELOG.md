@@ -19,12 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being pushed that the push target lacks — its own tracking refs, never a
   second remote's — and those commits' messages, not the checked-out tree, so
   pushing another branch, a leak fixed in a later commit, a name in a commit
-  or annotated-tag message, or a file or directory *named* after someone is
-  caught. Run by hand (no refs from git, whatever stdin is) it checks
+  or annotated-tag message, a file, directory, branch or tag *named* after
+  someone, or a short name inside `snake_case` (grep's `-w` counts `_` as a
+  word character; a `w` term is now bounded by any non-alphanumeric) is
+  caught. Whole trees are checked at the pushed tips and each commit for what
+  it adds, so a change that removes an inherited leak can pass. The
+  underscore rule found one such leak already public — a test variable named
+  after a roster term — renamed here. Run by hand (no refs from git, whatever stdin is) it checks
   the whole working tree from the top, untracked files included. CI keeps grep's exit status under Actions' `bash -e` (a
   missing term no longer ends the step), checks every commit a pull request
-  or push brings in — each tree, each message and every path name, with full
-  history — not only the tip, and refuses (rather than narrowing to the tip)
+  or push brings in — what each adds, its message and its added paths, with
+  full history, plus the branch name — not only the tip, and refuses (rather than narrowing to the tip)
   when it cannot tell what a push brought in; it prints counts and commit ids,
   never a term or a path (a path can carry the name); it excludes nothing but
   LICENSE (not `.githooks`, not itself), writes the

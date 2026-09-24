@@ -37,6 +37,8 @@ jobs:
           ROSTER: ${{ secrets.PUBLIC_DENYLIST }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The branch's own name is published too (the branch list, the PR URL).
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           set -uo pipefail
 
@@ -86,10 +88,38 @@ jobs:
           texts=$(mktemp -d)
           trap 'rm -f "$roster"; rm -rf "$texts"' EXIT
           git ls-files >"$texts/paths-tree"
+          printf '%s\n' "${HEAD_REF:-}" >"$texts/names-branch"
+          # Each commit is checked for what it ADDS — the lines, the paths — and
+          # its message, not its whole tree: every commit's tree carries what it
+          # inherited, so a whole-tree check of each would re-flag an old leak in
+          # every commit of the change that removes it, which could then never
+          # pass. The checked-out tree above is the whole final state. Against
+          # the first parent for a merge; the merged commits are checked as
+          # themselves.
           for c in "${commits[@]}"; do
-            git ls-tree -r --name-only "$c" >"$texts/paths-commit-${c:0:12}"
+            git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" \
+              | { grep '^+' || true; } | { grep -v '^+++ ' || true; } | cut -c2- >"$texts/additions-commit-${c:0:12}"
+            git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" \
+              >"$texts/paths-commit-${c:0:12}"
             git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
           done
+
+          # A `w` term is literal text bounded by anything that is not a letter or
+          # digit — grep's own `-w` counts `_` as a word character, so a short
+          # name inside `name_email` could never match. Escaped into an ERE for
+          # that alone; a `p` term stays a fixed substring. (camelCase stays out
+          # of reach: case ignored, joined words cannot be told apart.)
+          ere_escape() {
+            local s=$1 out= c i
+            for ((i = 0; i < ${#s}; i++)); do
+              c=${s:i:1}
+              case "$c" in
+                '\'|'.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'['|']'|'{'|'}'|'|') out+="\\$c" ;;
+                *) out+=$c ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
 
           fail=0
           n=0
@@ -122,8 +152,9 @@ jobs:
             # would otherwise be a broken regex, and grep's error exit must
             # not read as "no match".
             case "$kind" in
-              w) flags="-rIliwF"; gflags="-IliwF"; tflags="-liwF" ;;
-              p) flags="-rIliF"; gflags="-IliF"; tflags="-liF" ;;
+              w) flags="-rIliE"; tflags="-liE"
+                 pat="(^|[^[:alnum:]])$(ere_escape "$term")(\$|[^[:alnum:]])" ;;
+              p) flags="-rIliF"; tflags="-liF"; pat=$term ;;
               *) echo "::error::roster line $line_no: unknown kind"; exit 1 ;;
             esac
             n=$((n+1))
@@ -146,7 +177,7 @@ jobs:
             # normal case) would otherwise end the step on the first term.
             rc=0
             hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
-                     --exclude=LICENSE -- "$term" . 2>/dev/null) || rc=$?
+                     --exclude=LICENSE -e "$pat" . 2>/dev/null) || rc=$?
             case "$rc" in
               0) echo "::error::DENYLIST HIT (roster line $line_no) in $(printf '%s\n' "$hits" | wc -l) file(s) of the tree"
                  fail=1 ;;
@@ -156,21 +187,10 @@ jobs:
               *) echo "::error::grep failed (exit $rc) on roster line $line_no — refusing to call that clean"
                  exit 1 ;;
             esac
-            if [ ${#commits[@]} -gt 0 ]; then
-              # Every commit's tree; `-l` prints "commit:path", of which only
-              # the commit id is echoed.
-              rc=0
-              hits=$(git grep $gflags -e "$term" "${commits[@]}" -- ':!LICENSE' 2>/dev/null) || rc=$?
-              case "$rc" in
-                0) echo "::error::DENYLIST HIT (roster line $line_no) in the tree of commit(s): $(printf '%s\n' "$hits" | cut -c1-12 | sort -u | tr '\n' ' ')"
-                   fail=1 ;;
-                1) ;;
-                *) echo "::error::git grep failed (exit $rc) on roster line $line_no"; exit 1 ;;
-              esac
-            fi
-            # File and directory names, and commit messages.
+            # Each commit's additions and added paths, file and directory names
+            # in the tree, the branch name, and commit messages.
             rc=0
-            hits=$(grep $tflags -e "$term" "$texts"/* 2>/dev/null) || rc=$?
+            hits=$(grep $tflags -e "$pat" "$texts"/* 2>/dev/null) || rc=$?
             case "$rc" in
               0) for f in $hits; do
                    f=${f##*/}
