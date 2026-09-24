@@ -105,9 +105,12 @@ jobs:
             # the hook.
             # `.git` as a file too: in a worktree it is a pointer holding
             # this machine's path, which is not repository content.
+            # `|| rc=$?`, not a bare assignment then `$?`: Actions runs this
+            # step as `bash -e`, and a grep that finds nothing (exit 1, the
+            # normal case) would otherwise end the step on the first term.
+            rc=0
             hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
-                     --exclude=denylist.yml --exclude=LICENSE -- "$term" . 2>/dev/null)
-            rc=$?
+                     --exclude=denylist.yml --exclude=LICENSE -- "$term" . 2>/dev/null) || rc=$?
             case "$rc" in
               0) echo "::error::DENYLIST HIT (roster line $line_no) in:"
                  printf '%s\n' "$hits" | sed 's/^/  /'
