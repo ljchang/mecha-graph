@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`nightly.sh` resolves its precheck toggles before it sources
+  `nightly.env`, not after.** The live source could reach the helper's
+  "clean" environment in that half only (a `HOME=` line), and could
+  overwrite the resolved values; the helper also fixes `HOME` and its `PATH`
+  when it is loaded. Its comment now says what is true: the fixed `PATH` is
+  the union of what the two nightlies prepend, not what both do.
+
 - **The two nightlies take their precheck toggles from one resolver.**
   `nightly-env.sh` already gave both halves one verdict on `nightly.env`;
   now `nightly_env_toggle` gives them one value too. `nightly.sh` had read

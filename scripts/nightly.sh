@@ -70,14 +70,18 @@ NIGHTLY_ENV="$MECHA_GRAPH_DIR/nightly.env"
 NIGHTLY_ENV_STATUS="$(nightly_env_status "$NIGHTLY_ENV")"
 # The precheck toggles come from the shared helper, not from the live
 # source below: sourced here, a line conditional on this shell's own
-# environment could turn triage off at 03:30 and leave it on at 08:00.
-PRECHECK_AUTO_ACCEPT_PROCESS="${PRECHECK_AUTO_ACCEPT:-}"
-PRECHECK_TRIAGE_PROCESS="${PRECHECK_TRIAGE:-}"
+# environment could turn triage off at 03:30 and leave it on at 08:00. They
+# are resolved BEFORE that source, which could otherwise reach the helper's
+# clean environment (a `HOME=` line) in this half only — nightly-mecha.sh
+# never sources the file — and assigned AFTER it, so the live source cannot
+# overwrite them either.
+PRECHECK_AUTO_ACCEPT_RESOLVED="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_AUTO_ACCEPT "${PRECHECK_AUTO_ACCEPT:-}")"
+PRECHECK_TRIAGE_RESOLVED="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
+    PRECHECK_TRIAGE "${PRECHECK_TRIAGE:-}")"
 [ "$NIGHTLY_ENV_STATUS" = "ok" ] && . "$NIGHTLY_ENV"
-PRECHECK_AUTO_ACCEPT="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
-    PRECHECK_AUTO_ACCEPT "$PRECHECK_AUTO_ACCEPT_PROCESS")"
-PRECHECK_TRIAGE="$(nightly_env_toggle "$NIGHTLY_ENV" "$NIGHTLY_ENV_STATUS" \
-    PRECHECK_TRIAGE "$PRECHECK_TRIAGE_PROCESS")"
+PRECHECK_AUTO_ACCEPT="$PRECHECK_AUTO_ACCEPT_RESOLVED"
+PRECHECK_TRIAGE="$PRECHECK_TRIAGE_RESOLVED"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists

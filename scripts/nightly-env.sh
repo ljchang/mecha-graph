@@ -21,13 +21,17 @@
 # let one file that names a variable only one of them sets get two answers.
 # A shared rule must also be a shared answer, for the verdict AND the values.
 #
-# That PATH leads with the two user bin dirs both nightlies prepend (this
-# project's binaries and the bee CLI live there): a bare system PATH would
-# be shared but unfaithful, and a line like `command -v bee && PRECHECK_TRIAGE=0`
-# would resolve "not found" in both halves — agreement on the OPEN answer.
+# That PATH leads with the user bin dirs the nightlies prepend — the union of
+# the two: `~/.local/bin` (both; the bee CLI and node live there) and
+# `~/.cargo/bin` (nightly-mecha.sh; `mecha` lives there). A bare system PATH
+# would be shared but unfaithful, and a line like
+# `command -v bee && PRECHECK_TRIAGE=0` would resolve "not found" in both
+# halves — agreement on the OPEN answer. HOME and the PATH are fixed when this
+# file is sourced, so nothing a caller sources afterwards can move them.
+NIGHTLY_ENV_HOME="$HOME"
 NIGHTLY_ENV_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 nightly_env_clean() {
-    env -i HOME="$HOME" PATH="$NIGHTLY_ENV_PATH" MECHA_GRAPH_DIR="$(dirname "$1")" \
+    env -i HOME="$NIGHTLY_ENV_HOME" PATH="$NIGHTLY_ENV_PATH" MECHA_GRAPH_DIR="$(dirname "$1")" \
         bash -u -c "$2" _ "$1" "${3:-}"
 }
 nightly_env_status() {
