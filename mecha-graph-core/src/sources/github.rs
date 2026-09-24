@@ -383,7 +383,7 @@ pub fn ingest_github(
                     }
                 }
             }
-            "PushEvent" if p["commits"].as_array().map_or(true, |c| c.is_empty()) => {
+            "PushEvent" if p["commits"].as_array().is_none_or(|c| c.is_empty()) => {
                 let (Some(head), Some(before)) = (p["head"].as_str(), p["before"].as_str()) else {
                     continue;
                 };

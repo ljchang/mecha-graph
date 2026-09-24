@@ -3693,7 +3693,7 @@ pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewC
             samples,
         });
     }
-    clusters.sort_by(|a, b| b.pending.cmp(&a.pending));
+    clusters.sort_by_key(|c| std::cmp::Reverse(c.pending));
     Ok(clusters)
 }
 
@@ -3797,6 +3797,6 @@ pub fn proposer_stats(conn: &Connection) -> Result<Vec<ProposerStat>> {
             s.oldest = ages.get(&s.proposer).cloned();
         }
     }
-    out.sort_by(|a, b| b.pending.cmp(&a.pending));
+    out.sort_by_key(|c| std::cmp::Reverse(c.pending));
     Ok(out)
 }

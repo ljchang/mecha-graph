@@ -680,10 +680,10 @@ fn kg_timeline(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Valu
         .filter(|e| {
             args["from"]
                 .as_str()
-                .map_or(true, |f| e.occurred_at.as_str() >= f)
+                .is_none_or(|f| e.occurred_at.as_str() >= f)
                 && args["to"]
                     .as_str()
-                    .map_or(true, |t| e.occurred_at.as_str() <= t)
+                    .is_none_or(|t| e.occurred_at.as_str() <= t)
         })
         .map(|e| {
             json!({
@@ -917,7 +917,7 @@ fn kg_related(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value
         .filter(|e| {
             type_filter
                 .as_ref()
-                .map_or(true, |tf| tf.contains(&e.node.node_type.as_str()))
+                .is_none_or(|tf| tf.contains(&e.node.node_type.as_str()))
         })
         .map(|e| {
             json!({
@@ -936,6 +936,670 @@ fn kg_related(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value
         "items": items,
         "truncated": false
     }))
+}
+
+/// The Verifier's deterministic tier, over MCP.
+///
+/// The role lives in mecha — judging is conversational work and mecha-graph stays
+/// non-conversational — but the checkable half is data work and the data is
+/// mecha-graph's. Exposing it is what lets the mecha-side Judge run deterministic
+/// checks first and spend a model only on the residue, which is the ordering
+/// PLAN specifies and the 2026-08-13 measurement earned: these checks found
+/// 589 real problems on the day blind model probing found none.
+/// Pending candidates in one review class, with the evidence they came from.
+/// File an agent's opinion beside a candidate. Never decides it.
+fn kg_verdict(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let (Some(cid), Some(mech), Some(verdict)) = (
+        args["candidate_id"].as_i64(),
+        args["mechanism"].as_str(),
+        args["verdict"].as_str(),
+    ) else {
+        return Ok(json!({
+            "v": 1,
+            "error": "candidate_id, mechanism and verdict are all required"
+        }));
+    };
+    let id = mecha_graph_core::fact::record_verdict(
+        conn,
+        cid,
+        mech,
+        verdict,
+        args["basis"].as_str().unwrap_or_default(),
+        args["model"].as_str(),
+    )?;
+    Ok(json!({
+        "v": 1, "recorded": id, "candidate_id": cid,
+        "note": "opinion filed; the candidate is still pending and still needs a human"
+    }))
+}
+
+/// A candidate's subject, resolved against the graph as it is now.
+///
+/// Falls back to live entity detection when the staged subject is empty.
+/// Staging-time resolution is a snapshot; aliases, merges and name fixes
+/// all land afterwards, and nothing re-runs over the queue.
+fn subject_now(conn: &Connection, payload: &Value) -> Value {
+    if let Some(s) = payload["subject"].as_str() {
+        if !s.trim().is_empty() {
+            return json!(s);
+        }
+    }
+    let Some(text) = payload["statement"].as_str() else {
+        return Value::Null;
+    };
+    match mecha_graph_core::router::detect_entities(conn, text) {
+        Ok((detected, ambiguous)) => {
+            if let Some(d) = detected
+                .iter()
+                .find(|d| d.node_type == "person")
+                .or_else(|| detected.first())
+            {
+                return json!(d.name);
+            }
+            // Ambiguity is a feature (§8.1) and staging treats it as
+            // silence: bee.rs drops the ambiguous arm, so every claim
+            // naming a person the graph holds twice loses its subject —
+            // when the owner's own name resolves to two nodes that are
+            // one person, nearly every suggested candidate arrives
+            // subjectless. Report the dominant candidate so downstream
+            // work is not blocked, and say that it was a guess. See
+            // `subject_ambiguous`.
+            ambiguous
+                .first()
+                .and_then(|a| {
+                    a.candidates
+                        .iter()
+                        .max_by_key(|c| c.interaction_count)
+                        .map(|c| json!(c.name))
+                })
+                .unwrap_or(Value::Null)
+        }
+        Err(_) => Value::Null,
+    }
+}
+
+/// Whether the subject above had to be guessed from an ambiguous match.
+fn subject_is_guessed(conn: &Connection, payload: &Value) -> bool {
+    if payload["subject"]
+        .as_str()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(text) = payload["statement"].as_str() else {
+        return false;
+    };
+    matches!(
+        mecha_graph_core::router::detect_entities(conn, text),
+        Ok((detected, ambiguous)) if detected.is_empty() && !ambiguous.is_empty()
+    )
+}
+
+fn kg_pending(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let proposer = args["proposed_by"].as_str().unwrap_or_default();
+    let predicate = args["predicate"].as_str().unwrap_or_default();
+    // `entity` is the OTHER axis, not an extra filter on the class one. A
+    // reader that has just studied one person should spend that context on
+    // every pending claim about them, whatever class it sits in.
+    let entity = args["entity"].as_str().unwrap_or_default();
+    if entity.is_empty() && (proposer.is_empty() || predicate.is_empty()) {
+        return Ok(json!({
+            "v": 1,
+            "error": "give either `entity`, or both `proposed_by` and `predicate` — \
+                      the queue is worked one class at a time, or one entity at a time"
+        }));
+    }
+    let limit = args["limit"].as_i64().unwrap_or(20).clamp(1, 200);
+    // A mechanism that names itself gets candidates it has not yet judged,
+    // instead of the same oldest N on every run.
+    let unjudged_by = args["unjudged_by"].as_str().filter(|s| !s.is_empty());
+    // Verification reads the claim against the evidence it was extracted
+    // FROM — hand the origin episode over rather than making a reader
+    // search for what the row already cites.
+    let include_evidence = args["include_evidence"].as_bool().unwrap_or(false);
+    let items = if entity.is_empty() {
+        mecha_graph_core::fact::pending_in_class(conn, proposer, predicate, limit, unjudged_by)?
+    } else {
+        // Resolve to the node so the alias set does the matching — a
+        // candidate staged before an alias was learned names the surface
+        // form, not the canonical one.
+        let node = graph::resolve_entity(conn, entity)?
+            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no entity '{entity}'")))?;
+        let mut surfaces = vec![node.name.clone()];
+        surfaces.extend(node.aliases.iter().cloned());
+        mecha_graph_core::fact::pending_about_entity(conn, &surfaces, limit, unjudged_by)?
+    };
+    let items: Vec<Value> = items
+        .iter()
+        .map(|c| {
+            json!({
+                "candidate_id": c.id,
+                "origin_source": c.episode_id.and_then(|_| {
+                    mecha_graph_core::fact::candidate_origin_source(conn, c.id).ok().flatten()
+                }),
+                "statement": c.payload["statement"],
+                // Resolved NOW, not trusted from staging. A candidate's
+                // subject is a snapshot of what the graph could resolve on
+                // the day it was staged, and the graph improves underneath
+                // it: 189 of 200 bee:suggested candidates carry an empty
+                // subject while their statements name someone the graph
+                // resolves cleanly today, because the aliases arrived after
+                // the candidates did. Staged state that nothing revisits
+                // goes stale silently.
+                "subject": subject_now(conn, &c.payload),
+                "subject_ambiguous": subject_is_guessed(conn, &c.payload),
+                "object": c.payload["object"],
+                "predicate": c.payload["predicate"],
+                "confidence": c.confidence,
+                "episode_id": c.episode_id,
+                "created_at": c.created_at,
+                "evidence": include_evidence
+                    .then(|| {
+                        c.episode_id.and_then(|eid| {
+                            mecha_graph_core::episode::get_episode(conn, eid).ok().flatten().map(|e| {
+                                json!({
+                                    "source": e.source,
+                                    "occurred_at": e.occurred_at,
+                                    "body": e.body.chars().take(4000).collect::<String>(),
+                                })
+                            })
+                        })
+                    })
+                    .flatten(),
+            })
+        })
+        .collect();
+    Ok(
+        json!({ "v": 1, "proposed_by": proposer, "predicate": predicate, "count": items.len(), "items": items }),
+    )
+}
+
+fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let checks = match (args["node"].as_str(), args["fact"].as_str()) {
+        (_, Some(uid)) => vec![mecha_graph_core::verify::verify_fact(conn, uid)?],
+        (Some(name), None) => {
+            let mut matches = graph::resolve_entity_all(conn, name)?;
+            if matches.is_empty() {
+                if let Some(n) = graph::get_node(conn, name)? {
+                    matches.push(n);
+                }
+            }
+            match matches.len() {
+                0 => return Ok(json!({ "v": 1, "found": false, "query": name })),
+                // Ambiguity is a feature (§8.1): say so rather than verifying
+                // the wrong person's beliefs.
+                n if n > 1 => {
+                    return Ok(json!({
+                        "v": 1, "found": true,
+                        "ambiguous": matches.iter().map(|m| json!({
+                            "id": m.id, "name": m.name, "type": m.node_type
+                        })).collect::<Vec<_>>()
+                    }))
+                }
+                _ => mecha_graph_core::verify::verify_node(
+                    conn,
+                    &matches[0].id,
+                    args["limit"].as_u64().unwrap_or(20) as usize,
+                )?,
+            }
+        }
+        (None, None) => {
+            return Err(mecha_graph_core::Error::Other(
+                "kg_verify needs `node` or `fact`".into(),
+            ))
+        }
+    };
+
+    // Findings first — verify_node already sorts by severity, and a caller
+    // that reads only the head should read the problems.
+    let items: Vec<Value> = checks
+        .iter()
+        .map(|c| {
+            json!({
+                "fact_uid": c.fact_uid,
+                "statement": c.statement,
+                "predicate": c.predicate,
+                "verdict": format!("{:?}", c.verdict).to_lowercase(),
+                "detail": c.detail,
+                "cited_episodes": c.cited,
+                "supported_by": c.supported_by,
+                "observations": c.observations,
+                "conflicts_with": c.conflicts_with,
+            })
+        })
+        .collect();
+    let findings = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i["verdict"].as_str(),
+                Some("missing" | "refuted" | "contradicted" | "denied" | "stale")
+            )
+        })
+        .count();
+    Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
+}
+
+/// A list-of-names argument, refused rather than coerced.
+///
+/// Absent is an empty list; an array of strings is itself; **anything else is
+/// an error**, including the bare string that an array was specified for.
+/// `as_array()` returning `None` for `"about": "Nadia"` made the commonest
+/// shape mistake here answer `created`/`updated` having written nothing —
+/// once on each of the two tools, because the guard was written at one call
+/// site instead of in one function.
+fn name_array(args: &Value, key: &str) -> mecha_graph_core::Result<Vec<String>> {
+    match &args[key] {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(a) => a
+            .iter()
+            .map(|n| {
+                n.as_str().map(str::to_string).ok_or_else(|| {
+                    mecha_graph_core::Error::Other(format!(
+                        "`{key}` takes an array of names, got {n} inside it"
+                    ))
+                })
+            })
+            .collect(),
+        other => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` takes an array of names, got {other} — nothing was changed"
+        ))),
+    }
+}
+
+/// One task as the board renders it. Shared by `kg_task_list` and the
+/// `tasks` block on `kg_entity`, so the two surfaces cannot disagree about
+/// what a task looks like or when one is overdue.
+fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
+    let overdue = t
+        .due_at
+        .as_deref()
+        .is_some_and(|d| d < today && t.completed_at.is_none());
+    json!({
+        "id": t.node_id, "name": t.name, "status": t.status,
+        "due_at": t.due_at, "defer_until": t.defer_until,
+        "context": t.context_tag, "project": t.project,
+        // The parent's node id beside its name — the pointer a consumer
+        // cites (`project:<id>`), where the name is prose.
+        "project_id": t.project_id,
+        "waiting_on": t.waiting_on, "about": t.about,
+        // Why a task with no live association is on this entity's card.
+        "previously_waiting_on": t.previously_waiting_on,
+        // Present only when the extractor's date could not be read, which is
+        // why this task has no due date.
+        "unreadable_when": t.unreadable_when,
+        "session": t.session, "completed_at": t.completed_at,
+        "captured_from": t.captured_from,
+        "overdue": overdue
+    })
+}
+
+fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let include_closed = args["include_closed"].as_bool().unwrap_or(false);
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    // An unresolvable entity is an ERROR, never an empty board. "No tasks
+    // for Nadia" and "there is nobody here called Nadia" are opposite
+    // findings, and a caller that cannot tell them apart will report the
+    // first when the truth is the second.
+    let entity = match args["entity"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // `gtd::resolve_about`, not `resolve_entity`: the sentinel writes but
+        // did not read, so `entity: "@owner"` failed with "no node matches"
+        // on a graph that has one.
+        Some(name) => Some(gtd::resolve_about(conn, name)?.ok_or_else(|| {
+            mecha_graph_core::Error::Other(format!(
+                "no node matches '{name}' — kg_entity resolves names, and \
+                 an unknown one is not an empty task list"
+            ))
+        })?),
+        None => None,
+    };
+    let tasks = match &entity {
+        Some(node) => gtd::tasks_for_entity(conn, &node.id, include_closed)?,
+        None => gtd::list_tasks(conn, include_closed)?,
+    };
+    let items: Vec<Value> = tasks.iter().map(|t| task_json(t, &today)).collect();
+    let mut out = json!({ "v": 1, "items": items, "today": today, "truncated": false });
+    if let Some(node) = entity {
+        out["entity"] = json!({ "id": node.id, "name": node.name });
+    }
+    Ok(out)
+}
+
+fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    // The required scalar, checked like its neighbours: a list where the
+    // name belongs used to refuse as "task needs a name" — true, and the
+    // wrong problem to name to a caller whose payload carries one (found
+    // on review).
+    let name = scalar_arg(args, "name")
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+        .unwrap_or_default();
+    if name.trim().is_empty() {
+        // The commonest malformed call, with the clause every other
+        // refusal here carries (found on review).
+        return Err(mecha_graph_core::Error::Other(
+            "task needs a name — no task was created".into(),
+        ));
+    }
+    // Shape-checked like every scalar the update reads: a list where a
+    // string belongs used to create an undated, untagged task that answered
+    // `created` — the surface where the loss is least detectable, since
+    // there is no prior row to diff against (found on review).
+    let created_suffix = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — no task was created"))
+    };
+    let due = match scalar_arg(args, "due").map_err(created_suffix)? {
+        Some(raw) => gtd::parse_due(raw).map_err(created_suffix)?,
+        None => None,
+    };
+    let context = scalar_arg(args, "context").map_err(created_suffix)?;
+    // **Resolve every `about` name before creating anything.** The same rule
+    // `set_task_waiting_on` states as "resolve before retiring anything",
+    // for the same reason one step earlier: resolving afterwards makes a
+    // near-miss name — the common failure, since the caller is guessing at
+    // spellings — return an error carrying no task id, for a task that now
+    // exists. The caller corrects the name, retries, and there are two.
+    // Checking first makes the call all-or-nothing.
+    // Shape and names both checked before anything is written — see
+    // `name_array`, which is shared with `kg_task_update` so the two tools
+    // cannot disagree about what a list of names is.
+    let about_names = name_array(args, "about")?;
+    for name in &about_names {
+        // The FULL rule the writer applies, not a subset of it — see
+        // `validate_about_target`. A guard weaker than the thing it guards
+        // lets the create run and then refuses, which is the half-write this
+        // pre-check exists to prevent.
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
+    }
+    // The provenance pointer is checked before the insert for the same
+    // reason `about` is: refused after it, the task existed while the
+    // error said nothing was created, and a caller retrying without the
+    // pointer staged a duplicate (found on review).
+    if !args["captured_from"].is_null() {
+        gtd::validate_captured_from(&args["captured_from"])
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
+    }
+    // The parent, resolved here so its refusal says what the others say —
+    // an ambiguous name is the refusal a consumer most likely retries
+    // blind (found on review). `create_task` resolves the id again, which
+    // is a lookup by id and cannot disagree.
+    let parent = match project_arg(args)
+        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
+    {
+        Some(p) => gtd::resolve_project_arg(conn, p)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
+        None => None,
+    };
+    let task_id = gtd::create_task(conn, name, due.as_deref(), parent.as_deref(), context)?;
+    // A second write rather than a sixth positional argument, on the
+    // `set_task_session` shape: the property has its own validating setter,
+    // and `create_task` has a TUI caller that has nothing to say about
+    // provenance. A refused pointer fails the *call*, so the caller learns
+    // its pointer was junk rather than getting a task with the provenance
+    // quietly missing — which is the absence this whole field exists to fix.
+    if !args["captured_from"].is_null() {
+        gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
+    }
+    // Every name here already resolved above, so these cannot fail on a
+    // lookup and the task cannot be left half-associated.
+    for name in &about_names {
+        gtd::add_task_about(conn, &task_id, name)?;
+    }
+    // Echoed in the SAME shape every other surface uses — `{name, unreviewed}`,
+    // read back from the store rather than from the names that went in. Bare
+    // strings here made this the one response where a caller could not tell a
+    // vetted association from a guess, contradicting the tool descriptions
+    // this PR wrote; and reading it back means the echo reflects what was
+    // actually recorded, including a pre-existing shadow row upgraded to
+    // reviewed by this very call.
+    let created = gtd::get_task(conn, &task_id)?;
+    let about = created
+        .as_ref()
+        .map(|t| t.about.clone())
+        .unwrap_or_default();
+    // And the whole row under `task`, through `task_json` like the update
+    // echo — the moment a task is created under a project is the moment a
+    // citing consumer has the project's id to record, and a hand-written
+    // literal here was the one surface that did not carry it (found on
+    // review). The top-level keys stay: callers read `id` and `due_at` off
+    // them.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let task = created.map(|t| task_json(&t, &today));
+    Ok(json!({
+        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about,
+        "task": task
+    }))
+}
+
+/// `project` as a string, or refused. A number or an object is not
+/// silently dropped: `project_id` is a JSON field the caller just read off
+/// a row, and re-sending the object it came in rather than the string is
+/// the obvious slip — dropping it would create an unfiled task and answer
+/// `created` (found on review; `name_array`'s rule for the same class of
+/// input).
+fn project_arg(args: &Value) -> mecha_graph_core::Result<Option<&str>> {
+    match args.get("project") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`project` must be a string — a name or a node id — not {other}"
+        ))),
+    }
+}
+
+/// A scalar field as a string, or refused: a number or a list where a
+/// string belongs is not silently the same as an absent field — `status:
+/// ["done"]` answered `updated` with nothing written (found on review;
+/// `project_arg`'s rule, for every scalar the update reads).
+fn scalar_arg<'a>(args: &'a Value, key: &str) -> mecha_graph_core::Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        // The shape problem alone; the outcome clause is the caller's, as
+        // `project_arg` leaves it — baked in here, create's re-wrap read
+        // "— nothing was changed — no task was created" (found on review).
+        Some(other) => Err(mecha_graph_core::Error::Other(format!(
+            "`{key}` must be a string, not {other}"
+        ))),
+    }
+}
+
+fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
+    let task = args["task"]
+        .as_str()
+        .ok_or_else(|| mecha_graph_core::Error::Other("kg_task_update needs `task`".into()))?;
+
+    // **Validate the `about` names before the first write, not beside their
+    // own.** This function applies its fields in sequence, so a name checked
+    // where it is used would refuse the association *after* the status change
+    // and the reschedule had already landed — and the error would say nothing
+    // about which of them stuck. Checked here, "nothing was changed" is true.
+    //
+    // A non-string entry is refused rather than skipped: dropping it silently
+    // reports success for a name nobody applied.
+    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> { name_array(args, key) };
+    let to_add = names("about_add")?;
+    let to_remove = names("about_remove")?;
+    for name in to_add.iter().chain(to_remove.iter()) {
+        gtd::validate_about_target(conn, name)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+    // That the target is a task at all, ahead of every other pre-check:
+    // `resolve_project_for` reads the task's row first and would answer
+    // "no rows" for a non-task where this says what it is (found on
+    // review).
+    if !gtd::is_task(conn, task)? {
+        return Err(mecha_graph_core::Error::Other(format!(
+            "{task} is not a task on the board — nothing was changed"
+        )));
+    }
+    // `project` resolved here too, before the first write, for the same
+    // reason: a refused parent — ambiguous, unknown, a person, a non-string
+    // — used to return an error on a call whose status change had already
+    // landed and retired the live `waiting_on` claim, which reopening does
+    // not restore (found on review). Pure reads; the write is last.
+    let parent =
+        match project_arg(args)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?
+        {
+            Some(p) => Some(gtd::resolve_project_for(conn, task, p).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?),
+            None => None,
+        };
+    // And the dates, through `parse_due` so 'tomorrow' and '+3d' work,
+    // parsed here rather than beside their write: parsed after the status
+    // landed, a date that did not parse returned an error on a call that
+    // had already closed the task and retired its `waiting_on` claim — the
+    // half-write the `project` pre-check closes, one field over (found on
+    // review).
+    let changed_nothing = |e: mecha_graph_core::Error| {
+        mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+    };
+    let sched = |key: &str| -> mecha_graph_core::Result<Option<Option<String>>> {
+        match scalar_arg(args, key).map_err(changed_nothing)? {
+            None => Ok(None),
+            Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?)),
+        }
+    };
+    let due = sched("due")?;
+    let defer = sched("defer")?;
+    // Every scalar the writes below read, checked for shape here so a list
+    // where a string belongs refuses the call rather than skipping the
+    // field and answering `updated`.
+    let status_arg = scalar_arg(args, "status").map_err(changed_nothing)?;
+    // And for value, not only shape: the status write is first, so a
+    // refused one wrote nothing, but its refusal came back without the
+    // clause every other pre-flight refusal carries (found on review).
+    if let Some(s) = status_arg {
+        gtd::validate_status(s).map_err(changed_nothing)?;
+    }
+    let context_arg = scalar_arg(args, "context").map_err(changed_nothing)?;
+    let waiting_on_arg = scalar_arg(args, "waiting_on").map_err(changed_nothing)?;
+    let session_arg = scalar_arg(args, "session").map_err(changed_nothing)?;
+    // And who the task waits on — resolved after the status landed, a typo
+    // returned an error on a call that had already closed the task and
+    // retired the live claim (found on review, the one writer the block's
+    // claim had missed).
+    if let Some(who) = waiting_on_arg {
+        gtd::resolve_waiting_on(conn, who)
+            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
+    }
+    // And the provenance pointer. After these, no writer below can refuse.
+    match args.get("captured_from") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(s)) if s.trim().is_empty() => {}
+        Some(v) => {
+            gtd::validate_captured_from(v).map_err(|e| {
+                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
+            })?;
+        }
+    }
+
+    // **Status goes FIRST, so every field after it sees the status the
+    // caller is actually setting.**
+    //
+    // It briefly went last, to stop `{status: "done", waiting_on: "Nadia"}`
+    // asserting a live obligation onto a finished task. That was the right
+    // bug and the wrong layer: the guard now lives on `set_task_waiting_on`,
+    // which closes the claim itself when the task is done, so no call shape
+    // can route around it — and the reorder became not merely redundant but
+    // harmful. `set_task_waiting_on` reads the status from the row, so with
+    // status applied last it read the PRE-call value: `{status: "waiting",
+    // waiting_on: "Nadia"}` on a done task asserted the claim, immediately
+    // closed it because the row still said done, and only then reopened the
+    // task — an open `waiting` task that nobody owes. Two ordering fixes for
+    // the same field cancelled each other; the invariant on the writer is
+    // what actually holds, and this order is what lets it see the truth.
+    if let Some(status) = status_arg {
+        gtd::set_task_status(conn, task, status)?;
+    }
+
+    // Absent field → untouched; "" → cleared — the same tri-state
+    // update_task_schedule speaks; the dates were parsed in the pre-flight
+    // block above, before the first write.
+    let context = context_arg.map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
+    if due.is_some() || defer.is_some() || context.is_some() {
+        gtd::update_task_schedule(
+            conn,
+            task,
+            due.as_ref().map(|o| o.as_deref()),
+            defer.as_ref().map(|o| o.as_deref()),
+            context.as_ref().map(|o| o.as_deref()),
+        )?;
+    }
+
+    // After the schedule, because both can arrive in one call and a caller
+    // moving a task to `waiting` almost always names who in the same breath.
+    if let Some(who) = waiting_on_arg {
+        gtd::set_task_waiting_on(conn, task, who)?;
+    }
+    if let Some(session) = session_arg {
+        gtd::set_task_session(conn, task, session)?;
+    }
+    // Add and remove rather than set, because `about` is multi-valued: a
+    // `set` would make "also file this under Nadia" silently drop whoever
+    // was already there.
+    //
+    // Both lists were resolved at the top of this function, so neither loop
+    // can fail on a lookup and leave the edit half applied.
+    for name in &to_add {
+        gtd::add_task_about(conn, task, name)?;
+    }
+    for name in &to_remove {
+        gtd::remove_task_about(conn, task, name)?;
+    }
+    // An object sets it; `""` clears it, which is the tri-state every other
+    // field here speaks. `null` cannot mean "clear" — an absent key
+    // deserialises to exactly that, so the two would be the same call and
+    // omitting the field would wipe the pointer.
+    match &args["captured_from"] {
+        Value::Null => {}
+        Value::String(s) if s.trim().is_empty() => {
+            gtd::set_task_captured_from(conn, task, None)?;
+        }
+        value => gtd::set_task_captured_from(conn, task, Some(value))?,
+    }
+    // Re-file, with the parent resolved above (`""` cleared it to `None`) —
+    // and written **last**, after `captured_from`, the one writer left
+    // whose argument is validated inside its setter: a durable pointer a
+    // consumer cites must not be re-filed by a call that then fails and
+    // reports nothing landed (found on review).
+    if let Some(parent) = parent {
+        if parent.is_none() {
+            // `project: ""` on a task already under nothing is the "no
+            // project is right" acknowledgement, over this surface too.
+            gtd::mark_detachment_reviewed(conn, task)?;
+        }
+        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
+    }
+
+    // `task_json`, not a second literal. The reason this response echoes
+    // `waiting_on` at all — a caller cannot otherwise tell a successful set
+    // from a silently ignored one, because the field is a fact rather than a
+    // column — is exactly as true of `about`, and the hand-written copy
+    // omitted it. `about_remove` on a task that was never filed there updates
+    // nothing and reports `updated`, so the echo is the only way a caller
+    // learns the unfiling did not happen. One renderer means the two
+    // responses cannot drift again.
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let updated = gtd::get_task(conn, task)?.map(|t| task_json(&t, &today));
+    Ok(json!({ "v": 1, "status": "updated", "task": updated }))
 }
 
 #[cfg(test)]
@@ -2080,668 +2744,4 @@ mod tests {
         let full = kg_task_list(&conn, &json!({ "entity": "Wren" })).unwrap();
         assert_eq!(full["items"].as_array().unwrap().len(), 20);
     }
-}
-
-/// The Verifier's deterministic tier, over MCP.
-///
-/// The role lives in mecha — judging is conversational work and mecha-graph stays
-/// non-conversational — but the checkable half is data work and the data is
-/// mecha-graph's. Exposing it is what lets the mecha-side Judge run deterministic
-/// checks first and spend a model only on the residue, which is the ordering
-/// PLAN specifies and the 2026-08-13 measurement earned: these checks found
-/// 589 real problems on the day blind model probing found none.
-/// Pending candidates in one review class, with the evidence they came from.
-/// File an agent's opinion beside a candidate. Never decides it.
-fn kg_verdict(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let (Some(cid), Some(mech), Some(verdict)) = (
-        args["candidate_id"].as_i64(),
-        args["mechanism"].as_str(),
-        args["verdict"].as_str(),
-    ) else {
-        return Ok(json!({
-            "v": 1,
-            "error": "candidate_id, mechanism and verdict are all required"
-        }));
-    };
-    let id = mecha_graph_core::fact::record_verdict(
-        conn,
-        cid,
-        mech,
-        verdict,
-        args["basis"].as_str().unwrap_or_default(),
-        args["model"].as_str(),
-    )?;
-    Ok(json!({
-        "v": 1, "recorded": id, "candidate_id": cid,
-        "note": "opinion filed; the candidate is still pending and still needs a human"
-    }))
-}
-
-/// A candidate's subject, resolved against the graph as it is now.
-///
-/// Falls back to live entity detection when the staged subject is empty.
-/// Staging-time resolution is a snapshot; aliases, merges and name fixes
-/// all land afterwards, and nothing re-runs over the queue.
-fn subject_now(conn: &Connection, payload: &Value) -> Value {
-    if let Some(s) = payload["subject"].as_str() {
-        if !s.trim().is_empty() {
-            return json!(s);
-        }
-    }
-    let Some(text) = payload["statement"].as_str() else {
-        return Value::Null;
-    };
-    match mecha_graph_core::router::detect_entities(conn, text) {
-        Ok((detected, ambiguous)) => {
-            if let Some(d) = detected
-                .iter()
-                .find(|d| d.node_type == "person")
-                .or_else(|| detected.first())
-            {
-                return json!(d.name);
-            }
-            // Ambiguity is a feature (§8.1) and staging treats it as
-            // silence: bee.rs drops the ambiguous arm, so every claim
-            // naming a person the graph holds twice loses its subject —
-            // when the owner's own name resolves to two nodes that are
-            // one person, nearly every suggested candidate arrives
-            // subjectless. Report the dominant candidate so downstream
-            // work is not blocked, and say that it was a guess. See
-            // `subject_ambiguous`.
-            ambiguous
-                .first()
-                .and_then(|a| {
-                    a.candidates
-                        .iter()
-                        .max_by_key(|c| c.interaction_count)
-                        .map(|c| json!(c.name))
-                })
-                .unwrap_or(Value::Null)
-        }
-        Err(_) => Value::Null,
-    }
-}
-
-/// Whether the subject above had to be guessed from an ambiguous match.
-fn subject_is_guessed(conn: &Connection, payload: &Value) -> bool {
-    if payload["subject"]
-        .as_str()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
-        return false;
-    }
-    let Some(text) = payload["statement"].as_str() else {
-        return false;
-    };
-    matches!(
-        mecha_graph_core::router::detect_entities(conn, text),
-        Ok((detected, ambiguous)) if detected.is_empty() && !ambiguous.is_empty()
-    )
-}
-
-fn kg_pending(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let proposer = args["proposed_by"].as_str().unwrap_or_default();
-    let predicate = args["predicate"].as_str().unwrap_or_default();
-    // `entity` is the OTHER axis, not an extra filter on the class one. A
-    // reader that has just studied one person should spend that context on
-    // every pending claim about them, whatever class it sits in.
-    let entity = args["entity"].as_str().unwrap_or_default();
-    if entity.is_empty() && (proposer.is_empty() || predicate.is_empty()) {
-        return Ok(json!({
-            "v": 1,
-            "error": "give either `entity`, or both `proposed_by` and `predicate` — \
-                      the queue is worked one class at a time, or one entity at a time"
-        }));
-    }
-    let limit = args["limit"].as_i64().unwrap_or(20).clamp(1, 200);
-    // A mechanism that names itself gets candidates it has not yet judged,
-    // instead of the same oldest N on every run.
-    let unjudged_by = args["unjudged_by"].as_str().filter(|s| !s.is_empty());
-    // Verification reads the claim against the evidence it was extracted
-    // FROM — hand the origin episode over rather than making a reader
-    // search for what the row already cites.
-    let include_evidence = args["include_evidence"].as_bool().unwrap_or(false);
-    let items = if entity.is_empty() {
-        mecha_graph_core::fact::pending_in_class(conn, proposer, predicate, limit, unjudged_by)?
-    } else {
-        // Resolve to the node so the alias set does the matching — a
-        // candidate staged before an alias was learned names the surface
-        // form, not the canonical one.
-        let node = graph::resolve_entity(conn, entity)?
-            .ok_or_else(|| mecha_graph_core::Error::Other(format!("no entity '{entity}'")))?;
-        let mut surfaces = vec![node.name.clone()];
-        surfaces.extend(node.aliases.iter().cloned());
-        mecha_graph_core::fact::pending_about_entity(conn, &surfaces, limit, unjudged_by)?
-    };
-    let items: Vec<Value> = items
-        .iter()
-        .map(|c| {
-            json!({
-                "candidate_id": c.id,
-                "origin_source": c.episode_id.and_then(|_| {
-                    mecha_graph_core::fact::candidate_origin_source(conn, c.id).ok().flatten()
-                }),
-                "statement": c.payload["statement"],
-                // Resolved NOW, not trusted from staging. A candidate's
-                // subject is a snapshot of what the graph could resolve on
-                // the day it was staged, and the graph improves underneath
-                // it: 189 of 200 bee:suggested candidates carry an empty
-                // subject while their statements name someone the graph
-                // resolves cleanly today, because the aliases arrived after
-                // the candidates did. Staged state that nothing revisits
-                // goes stale silently.
-                "subject": subject_now(conn, &c.payload),
-                "subject_ambiguous": subject_is_guessed(conn, &c.payload),
-                "object": c.payload["object"],
-                "predicate": c.payload["predicate"],
-                "confidence": c.confidence,
-                "episode_id": c.episode_id,
-                "created_at": c.created_at,
-                "evidence": include_evidence
-                    .then(|| {
-                        c.episode_id.and_then(|eid| {
-                            mecha_graph_core::episode::get_episode(conn, eid).ok().flatten().map(|e| {
-                                json!({
-                                    "source": e.source,
-                                    "occurred_at": e.occurred_at,
-                                    "body": e.body.chars().take(4000).collect::<String>(),
-                                })
-                            })
-                        })
-                    })
-                    .flatten(),
-            })
-        })
-        .collect();
-    Ok(
-        json!({ "v": 1, "proposed_by": proposer, "predicate": predicate, "count": items.len(), "items": items }),
-    )
-}
-
-fn kg_verify(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let checks = match (args["node"].as_str(), args["fact"].as_str()) {
-        (_, Some(uid)) => vec![mecha_graph_core::verify::verify_fact(conn, uid)?],
-        (Some(name), None) => {
-            let mut matches = graph::resolve_entity_all(conn, name)?;
-            if matches.is_empty() {
-                if let Some(n) = graph::get_node(conn, name)? {
-                    matches.push(n);
-                }
-            }
-            match matches.len() {
-                0 => return Ok(json!({ "v": 1, "found": false, "query": name })),
-                // Ambiguity is a feature (§8.1): say so rather than verifying
-                // the wrong person's beliefs.
-                n if n > 1 => {
-                    return Ok(json!({
-                        "v": 1, "found": true,
-                        "ambiguous": matches.iter().map(|m| json!({
-                            "id": m.id, "name": m.name, "type": m.node_type
-                        })).collect::<Vec<_>>()
-                    }))
-                }
-                _ => mecha_graph_core::verify::verify_node(
-                    conn,
-                    &matches[0].id,
-                    args["limit"].as_u64().unwrap_or(20) as usize,
-                )?,
-            }
-        }
-        (None, None) => {
-            return Err(mecha_graph_core::Error::Other(
-                "kg_verify needs `node` or `fact`".into(),
-            ))
-        }
-    };
-
-    // Findings first — verify_node already sorts by severity, and a caller
-    // that reads only the head should read the problems.
-    let items: Vec<Value> = checks
-        .iter()
-        .map(|c| {
-            json!({
-                "fact_uid": c.fact_uid,
-                "statement": c.statement,
-                "predicate": c.predicate,
-                "verdict": format!("{:?}", c.verdict).to_lowercase(),
-                "detail": c.detail,
-                "cited_episodes": c.cited,
-                "supported_by": c.supported_by,
-                "observations": c.observations,
-                "conflicts_with": c.conflicts_with,
-            })
-        })
-        .collect();
-    let findings = items
-        .iter()
-        .filter(|i| {
-            matches!(
-                i["verdict"].as_str(),
-                Some("missing" | "refuted" | "contradicted" | "denied" | "stale")
-            )
-        })
-        .count();
-    Ok(json!({ "v": 1, "items": items, "findings": findings, "truncated": false }))
-}
-
-/// A list-of-names argument, refused rather than coerced.
-///
-/// Absent is an empty list; an array of strings is itself; **anything else is
-/// an error**, including the bare string that an array was specified for.
-/// `as_array()` returning `None` for `"about": "Nadia"` made the commonest
-/// shape mistake here answer `created`/`updated` having written nothing —
-/// once on each of the two tools, because the guard was written at one call
-/// site instead of in one function.
-fn name_array(args: &Value, key: &str) -> mecha_graph_core::Result<Vec<String>> {
-    match &args[key] {
-        Value::Null => Ok(Vec::new()),
-        Value::Array(a) => a
-            .iter()
-            .map(|n| {
-                n.as_str().map(str::to_string).ok_or_else(|| {
-                    mecha_graph_core::Error::Other(format!(
-                        "`{key}` takes an array of names, got {n} inside it"
-                    ))
-                })
-            })
-            .collect(),
-        other => Err(mecha_graph_core::Error::Other(format!(
-            "`{key}` takes an array of names, got {other} — nothing was changed"
-        ))),
-    }
-}
-
-/// One task as the board renders it. Shared by `kg_task_list` and the
-/// `tasks` block on `kg_entity`, so the two surfaces cannot disagree about
-/// what a task looks like or when one is overdue.
-fn task_json(t: &gtd::TaskItem, today: &str) -> Value {
-    let overdue = t
-        .due_at
-        .as_deref()
-        .is_some_and(|d| d < today && t.completed_at.is_none());
-    json!({
-        "id": t.node_id, "name": t.name, "status": t.status,
-        "due_at": t.due_at, "defer_until": t.defer_until,
-        "context": t.context_tag, "project": t.project,
-        // The parent's node id beside its name — the pointer a consumer
-        // cites (`project:<id>`), where the name is prose.
-        "project_id": t.project_id,
-        "waiting_on": t.waiting_on, "about": t.about,
-        // Why a task with no live association is on this entity's card.
-        "previously_waiting_on": t.previously_waiting_on,
-        // Present only when the extractor's date could not be read, which is
-        // why this task has no due date.
-        "unreadable_when": t.unreadable_when,
-        "session": t.session, "completed_at": t.completed_at,
-        "captured_from": t.captured_from,
-        "overdue": overdue
-    })
-}
-
-fn kg_task_list(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let include_closed = args["include_closed"].as_bool().unwrap_or(false);
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    // An unresolvable entity is an ERROR, never an empty board. "No tasks
-    // for Nadia" and "there is nobody here called Nadia" are opposite
-    // findings, and a caller that cannot tell them apart will report the
-    // first when the truth is the second.
-    let entity = match args["entity"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // `gtd::resolve_about`, not `resolve_entity`: the sentinel writes but
-        // did not read, so `entity: "@owner"` failed with "no node matches"
-        // on a graph that has one.
-        Some(name) => Some(gtd::resolve_about(conn, name)?.ok_or_else(|| {
-            mecha_graph_core::Error::Other(format!(
-                "no node matches '{name}' — kg_entity resolves names, and \
-                 an unknown one is not an empty task list"
-            ))
-        })?),
-        None => None,
-    };
-    let tasks = match &entity {
-        Some(node) => gtd::tasks_for_entity(conn, &node.id, include_closed)?,
-        None => gtd::list_tasks(conn, include_closed)?,
-    };
-    let items: Vec<Value> = tasks.iter().map(|t| task_json(t, &today)).collect();
-    let mut out = json!({ "v": 1, "items": items, "today": today, "truncated": false });
-    if let Some(node) = entity {
-        out["entity"] = json!({ "id": node.id, "name": node.name });
-    }
-    Ok(out)
-}
-
-fn kg_task_create(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    // The required scalar, checked like its neighbours: a list where the
-    // name belongs used to refuse as "task needs a name" — true, and the
-    // wrong problem to name to a caller whose payload carries one (found
-    // on review).
-    let name = scalar_arg(args, "name")
-        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
-        .unwrap_or_default();
-    if name.trim().is_empty() {
-        // The commonest malformed call, with the clause every other
-        // refusal here carries (found on review).
-        return Err(mecha_graph_core::Error::Other(
-            "task needs a name — no task was created".into(),
-        ));
-    }
-    // Shape-checked like every scalar the update reads: a list where a
-    // string belongs used to create an undated, untagged task that answered
-    // `created` — the surface where the loss is least detectable, since
-    // there is no prior row to diff against (found on review).
-    let created_suffix = |e: mecha_graph_core::Error| {
-        mecha_graph_core::Error::Other(format!("{e} — no task was created"))
-    };
-    let due = match scalar_arg(args, "due").map_err(created_suffix)? {
-        Some(raw) => gtd::parse_due(raw).map_err(created_suffix)?,
-        None => None,
-    };
-    let context = scalar_arg(args, "context").map_err(created_suffix)?;
-    // **Resolve every `about` name before creating anything.** The same rule
-    // `set_task_waiting_on` states as "resolve before retiring anything",
-    // for the same reason one step earlier: resolving afterwards makes a
-    // near-miss name — the common failure, since the caller is guessing at
-    // spellings — return an error carrying no task id, for a task that now
-    // exists. The caller corrects the name, retries, and there are two.
-    // Checking first makes the call all-or-nothing.
-    // Shape and names both checked before anything is written — see
-    // `name_array`, which is shared with `kg_task_update` so the two tools
-    // cannot disagree about what a list of names is.
-    let about_names = name_array(args, "about")?;
-    for name in &about_names {
-        // The FULL rule the writer applies, not a subset of it — see
-        // `validate_about_target`. A guard weaker than the thing it guards
-        // lets the create run and then refuses, which is the half-write this
-        // pre-check exists to prevent.
-        gtd::validate_about_target(conn, name)
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
-    }
-    // The provenance pointer is checked before the insert for the same
-    // reason `about` is: refused after it, the task existed while the
-    // error said nothing was created, and a caller retrying without the
-    // pointer staged a duplicate (found on review).
-    if !args["captured_from"].is_null() {
-        gtd::validate_captured_from(&args["captured_from"])
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?;
-    }
-    // The parent, resolved here so its refusal says what the others say —
-    // an ambiguous name is the refusal a consumer most likely retries
-    // blind (found on review). `create_task` resolves the id again, which
-    // is a lookup by id and cannot disagree.
-    let parent = match project_arg(args)
-        .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?
-    {
-        Some(p) => gtd::resolve_project_arg(conn, p)
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — no task was created")))?,
-        None => None,
-    };
-    let task_id = gtd::create_task(conn, name, due.as_deref(), parent.as_deref(), context)?;
-    // A second write rather than a sixth positional argument, on the
-    // `set_task_session` shape: the property has its own validating setter,
-    // and `create_task` has a TUI caller that has nothing to say about
-    // provenance. A refused pointer fails the *call*, so the caller learns
-    // its pointer was junk rather than getting a task with the provenance
-    // quietly missing — which is the absence this whole field exists to fix.
-    if !args["captured_from"].is_null() {
-        gtd::set_task_captured_from(conn, &task_id, Some(&args["captured_from"]))?;
-    }
-    // Every name here already resolved above, so these cannot fail on a
-    // lookup and the task cannot be left half-associated.
-    for name in &about_names {
-        gtd::add_task_about(conn, &task_id, name)?;
-    }
-    // Echoed in the SAME shape every other surface uses — `{name, unreviewed}`,
-    // read back from the store rather than from the names that went in. Bare
-    // strings here made this the one response where a caller could not tell a
-    // vetted association from a guess, contradicting the tool descriptions
-    // this PR wrote; and reading it back means the echo reflects what was
-    // actually recorded, including a pre-existing shadow row upgraded to
-    // reviewed by this very call.
-    let created = gtd::get_task(conn, &task_id)?;
-    let about = created
-        .as_ref()
-        .map(|t| t.about.clone())
-        .unwrap_or_default();
-    // And the whole row under `task`, through `task_json` like the update
-    // echo — the moment a task is created under a project is the moment a
-    // citing consumer has the project's id to record, and a hand-written
-    // literal here was the one surface that did not carry it (found on
-    // review). The top-level keys stay: callers read `id` and `due_at` off
-    // them.
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let task = created.map(|t| task_json(&t, &today));
-    Ok(json!({
-        "v": 1, "status": "created", "id": task_id, "due_at": due, "about": about,
-        "task": task
-    }))
-}
-
-/// `project` as a string, or refused. A number or an object is not
-/// silently dropped: `project_id` is a JSON field the caller just read off
-/// a row, and re-sending the object it came in rather than the string is
-/// the obvious slip — dropping it would create an unfiled task and answer
-/// `created` (found on review; `name_array`'s rule for the same class of
-/// input).
-fn project_arg(args: &Value) -> mecha_graph_core::Result<Option<&str>> {
-    match args.get("project") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.as_str())),
-        Some(other) => Err(mecha_graph_core::Error::Other(format!(
-            "`project` must be a string — a name or a node id — not {other}"
-        ))),
-    }
-}
-
-/// A scalar field as a string, or refused: a number or a list where a
-/// string belongs is not silently the same as an absent field — `status:
-/// ["done"]` answered `updated` with nothing written (found on review;
-/// `project_arg`'s rule, for every scalar the update reads).
-fn scalar_arg<'a>(args: &'a Value, key: &str) -> mecha_graph_core::Result<Option<&'a str>> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.as_str())),
-        // The shape problem alone; the outcome clause is the caller's, as
-        // `project_arg` leaves it — baked in here, create's re-wrap read
-        // "— nothing was changed — no task was created" (found on review).
-        Some(other) => Err(mecha_graph_core::Error::Other(format!(
-            "`{key}` must be a string, not {other}"
-        ))),
-    }
-}
-
-fn kg_task_update(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> {
-    let task = args["task"]
-        .as_str()
-        .ok_or_else(|| mecha_graph_core::Error::Other("kg_task_update needs `task`".into()))?;
-
-    // **Validate the `about` names before the first write, not beside their
-    // own.** This function applies its fields in sequence, so a name checked
-    // where it is used would refuse the association *after* the status change
-    // and the reschedule had already landed — and the error would say nothing
-    // about which of them stuck. Checked here, "nothing was changed" is true.
-    //
-    // A non-string entry is refused rather than skipped: dropping it silently
-    // reports success for a name nobody applied.
-    let names = |key: &str| -> mecha_graph_core::Result<Vec<String>> { name_array(args, key) };
-    let to_add = names("about_add")?;
-    let to_remove = names("about_remove")?;
-    for name in to_add.iter().chain(to_remove.iter()) {
-        gtd::validate_about_target(conn, name)
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
-    }
-    // That the target is a task at all, ahead of every other pre-check:
-    // `resolve_project_for` reads the task's row first and would answer
-    // "no rows" for a non-task where this says what it is (found on
-    // review).
-    if !gtd::is_task(conn, task)? {
-        return Err(mecha_graph_core::Error::Other(format!(
-            "{task} is not a task on the board — nothing was changed"
-        )));
-    }
-    // `project` resolved here too, before the first write, for the same
-    // reason: a refused parent — ambiguous, unknown, a person, a non-string
-    // — used to return an error on a call whose status change had already
-    // landed and retired the live `waiting_on` claim, which reopening does
-    // not restore (found on review). Pure reads; the write is last.
-    let parent =
-        match project_arg(args)
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?
-        {
-            Some(p) => Some(gtd::resolve_project_for(conn, task, p).map_err(|e| {
-                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
-            })?),
-            None => None,
-        };
-    // And the dates, through `parse_due` so 'tomorrow' and '+3d' work,
-    // parsed here rather than beside their write: parsed after the status
-    // landed, a date that did not parse returned an error on a call that
-    // had already closed the task and retired its `waiting_on` claim — the
-    // half-write the `project` pre-check closes, one field over (found on
-    // review).
-    let changed_nothing = |e: mecha_graph_core::Error| {
-        mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
-    };
-    let sched = |key: &str| -> mecha_graph_core::Result<Option<Option<String>>> {
-        match scalar_arg(args, key).map_err(changed_nothing)? {
-            None => Ok(None),
-            Some(raw) => Ok(Some(gtd::parse_due(raw).map_err(|e| {
-                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
-            })?)),
-        }
-    };
-    let due = sched("due")?;
-    let defer = sched("defer")?;
-    // Every scalar the writes below read, checked for shape here so a list
-    // where a string belongs refuses the call rather than skipping the
-    // field and answering `updated`.
-    let status_arg = scalar_arg(args, "status").map_err(changed_nothing)?;
-    // And for value, not only shape: the status write is first, so a
-    // refused one wrote nothing, but its refusal came back without the
-    // clause every other pre-flight refusal carries (found on review).
-    if let Some(s) = status_arg {
-        gtd::validate_status(s).map_err(changed_nothing)?;
-    }
-    let context_arg = scalar_arg(args, "context").map_err(changed_nothing)?;
-    let waiting_on_arg = scalar_arg(args, "waiting_on").map_err(changed_nothing)?;
-    let session_arg = scalar_arg(args, "session").map_err(changed_nothing)?;
-    // And who the task waits on — resolved after the status landed, a typo
-    // returned an error on a call that had already closed the task and
-    // retired the live claim (found on review, the one writer the block's
-    // claim had missed).
-    if let Some(who) = waiting_on_arg {
-        gtd::resolve_waiting_on(conn, who)
-            .map_err(|e| mecha_graph_core::Error::Other(format!("{e} — nothing was changed")))?;
-    }
-    // And the provenance pointer. After these, no writer below can refuse.
-    match args.get("captured_from") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(s)) if s.trim().is_empty() => {}
-        Some(v) => {
-            gtd::validate_captured_from(v).map_err(|e| {
-                mecha_graph_core::Error::Other(format!("{e} — nothing was changed"))
-            })?;
-        }
-    }
-
-    // **Status goes FIRST, so every field after it sees the status the
-    // caller is actually setting.**
-    //
-    // It briefly went last, to stop `{status: "done", waiting_on: "Nadia"}`
-    // asserting a live obligation onto a finished task. That was the right
-    // bug and the wrong layer: the guard now lives on `set_task_waiting_on`,
-    // which closes the claim itself when the task is done, so no call shape
-    // can route around it — and the reorder became not merely redundant but
-    // harmful. `set_task_waiting_on` reads the status from the row, so with
-    // status applied last it read the PRE-call value: `{status: "waiting",
-    // waiting_on: "Nadia"}` on a done task asserted the claim, immediately
-    // closed it because the row still said done, and only then reopened the
-    // task — an open `waiting` task that nobody owes. Two ordering fixes for
-    // the same field cancelled each other; the invariant on the writer is
-    // what actually holds, and this order is what lets it see the truth.
-    if let Some(status) = status_arg {
-        gtd::set_task_status(conn, task, status)?;
-    }
-
-    // Absent field → untouched; "" → cleared — the same tri-state
-    // update_task_schedule speaks; the dates were parsed in the pre-flight
-    // block above, before the first write.
-    let context = context_arg.map(|c| Some(c.to_string()).filter(|s| !s.trim().is_empty()));
-    if due.is_some() || defer.is_some() || context.is_some() {
-        gtd::update_task_schedule(
-            conn,
-            task,
-            due.as_ref().map(|o| o.as_deref()),
-            defer.as_ref().map(|o| o.as_deref()),
-            context.as_ref().map(|o| o.as_deref()),
-        )?;
-    }
-
-    // After the schedule, because both can arrive in one call and a caller
-    // moving a task to `waiting` almost always names who in the same breath.
-    if let Some(who) = waiting_on_arg {
-        gtd::set_task_waiting_on(conn, task, who)?;
-    }
-    if let Some(session) = session_arg {
-        gtd::set_task_session(conn, task, session)?;
-    }
-    // Add and remove rather than set, because `about` is multi-valued: a
-    // `set` would make "also file this under Nadia" silently drop whoever
-    // was already there.
-    //
-    // Both lists were resolved at the top of this function, so neither loop
-    // can fail on a lookup and leave the edit half applied.
-    for name in &to_add {
-        gtd::add_task_about(conn, task, name)?;
-    }
-    for name in &to_remove {
-        gtd::remove_task_about(conn, task, name)?;
-    }
-    // An object sets it; `""` clears it, which is the tri-state every other
-    // field here speaks. `null` cannot mean "clear" — an absent key
-    // deserialises to exactly that, so the two would be the same call and
-    // omitting the field would wipe the pointer.
-    match &args["captured_from"] {
-        Value::Null => {}
-        Value::String(s) if s.trim().is_empty() => {
-            gtd::set_task_captured_from(conn, task, None)?;
-        }
-        value => gtd::set_task_captured_from(conn, task, Some(value))?,
-    }
-    // Re-file, with the parent resolved above (`""` cleared it to `None`) —
-    // and written **last**, after `captured_from`, the one writer left
-    // whose argument is validated inside its setter: a durable pointer a
-    // consumer cites must not be re-filed by a call that then fails and
-    // reports nothing landed (found on review).
-    if let Some(parent) = parent {
-        if parent.is_none() {
-            // `project: ""` on a task already under nothing is the "no
-            // project is right" acknowledgement, over this surface too.
-            gtd::mark_detachment_reviewed(conn, task)?;
-        }
-        gtd::set_task_parent_id(conn, task, parent.as_deref())?;
-    }
-
-    // `task_json`, not a second literal. The reason this response echoes
-    // `waiting_on` at all — a caller cannot otherwise tell a successful set
-    // from a silently ignored one, because the field is a fact rather than a
-    // column — is exactly as true of `about`, and the hand-written copy
-    // omitted it. `about_remove` on a task that was never filed there updates
-    // nothing and reports `updated`, so the echo is the only way a caller
-    // learns the unfiling did not happen. One renderer means the two
-    // responses cannot drift again.
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let updated = gtd::get_task(conn, task)?.map(|t| task_json(&t, &today));
-    Ok(json!({ "v": 1, "status": "updated", "task": updated }))
 }

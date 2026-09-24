@@ -240,10 +240,7 @@ pub fn ingest_with(
                     let project = match graph::get_node_by_identifier(conn, "path", &root)? {
                         Some(n) => n,
                         None => {
-                            let id = format!(
-                                "project-{}",
-                                crate::ids::content_hash(&root)[..12].to_string()
-                            );
+                            let id = format!("project-{}", &crate::ids::content_hash(&root)[..12]);
                             let mut node = graph::Node::new(&id, "project", &name);
                             node.source = source.id().to_string();
                             node.source_ref = Some(root.clone());
@@ -286,7 +283,7 @@ pub fn ingest_with(
 
         if max_occurred
             .as_deref()
-            .map_or(true, |m| ep.occurred_at.as_str() > m)
+            .is_none_or(|m| ep.occurred_at.as_str() > m)
         {
             max_occurred = Some(ep.occurred_at.clone());
         }

@@ -1126,7 +1126,7 @@ impl App {
             .flatten();
         let eps = episode::episodes_for_node(&self.conn, id, 4).unwrap_or_default();
         let mut out = format!("{}\n{}\n", node.name, id);
-        out.push_str(&format!("identifiers:\n"));
+        out.push_str("identifiers:\n");
         for i in &idents {
             out.push_str(&format!("  {i}\n"));
         }
