@@ -286,6 +286,70 @@ if compgen -G "$texts/*" >/dev/null; then
     scan_texts p
 fi
 
+# ── Terms across a line break ─────────────────────────────────────────────
+#
+# grep is line-oriented, so a `p` term of several words is the one kind that
+# wrapped text can split — and prose here is hard-wrapped at ~75 columns, in
+# docs, comments and commit messages alike: "Jane" at the end of one line and
+# "Doe" at the start of the next passed as clean. Each line is joined to the
+# next (indentation and a leading comment marker stripped, whitespace
+# collapsed) and the multiword terms are looked for across the join.
+multi=()
+for t in ${p_terms[@]+"${p_terms[@]}"}; do
+    case "$t" in *[[:space:]]*) multi+=("$t") ;; esac
+done
+join_lines() { # join_lines <file>... → "<file>\t<line> <next line>" for each adjacent pair
+    awk -v OFS='\t' 'FNR == 1 { prev = "" }
+        { l = $0
+          sub(/^[ \t]*(\/\/+!?|#+|\*+|--|;+|>+)?[ \t]*/, "", l)
+          gsub(/[ \t\r]+/, " ", l); sub(/ $/, "", l)
+          if (prev != "" && l != "") print FILENAME, prev " " l
+          prev = l }' "$@"
+}
+if [ ${#multi[@]} -gt 0 ]; then
+    joined="$texts/.joined"
+    : >"$joined"
+    add_tree() { # add_tree <dir> <label-prefix-to-strip>: its text files, LICENSE aside
+        local f
+        while IFS= read -r -d '' f; do
+            [ "${f#"$1"/}" = LICENSE ] && continue
+            grep -Iq . "$f" 2>/dev/null || continue
+            join_lines "$f" >>"$joined" || refuse_read "$f"
+        done < <(find "$1" -type f -not -path '*/.git/*' -print0)
+    }
+    if [ "$by_hand" -eq 1 ]; then
+        while IFS= read -r f; do
+            [ "$f" = LICENSE ] && continue
+            [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
+            join_lines "$f" >>"$joined" || refuse_read "$f"
+        done < <(git ls-files -co --exclude-standard)
+    else
+        for c in ${tips[@]+"${tips[@]}"}; do
+            d="$texts/.tip-${c:0:12}"
+            mkdir -p "$d"
+            git archive "$c" | tar -x -C "$d" || refuse_read "the tree of $c"
+            add_tree "$d"
+        done
+    fi
+    # Additions and messages are wrapped text; path and ref-name lists are one
+    # entry per line, and joining two paths would only invent a match.
+    for f in "$texts"/additions-* "$texts"/message-*; do
+        [ -f "$f" ] && join_lines "$f" >>"$joined"
+    done
+    for t in "${multi[@]}"; do
+        # The term with its own whitespace collapsed, as the joined text is.
+        norm=$(printf '%s' "$t" | tr -s '[:space:]' ' ')
+        out=$(grep -iF -e "$norm" "$joined" 2>&1); rc=$?
+        case "$rc" in
+            0)  echo "DENYLIST HIT [$t] across a line break in:" >&2
+                printf '%s\n' "$out" | cut -f1 | sed "s#^$texts/\.tip-[^/]*/##; s#^$texts/##" | sort -u | sed 's/^/  /' >&2
+                fail=1 ;;
+            1)  ;;
+            *)  refuse_grep "grep across line breaks" "$rc" "$out" ;;
+        esac
+    done
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "pre-push REFUSED: $terms term(s) checked, see hits above." >&2

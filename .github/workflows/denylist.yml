@@ -105,6 +105,32 @@ jobs:
             git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
           done
 
+          # grep is line-oriented, so a `p` term of several words is the one kind
+          # wrapped text can split — and prose here is hard-wrapped at ~75
+          # columns in docs, comments and commit messages alike. Each line is
+          # joined to the next (indentation and a leading comment marker
+          # stripped, whitespace collapsed); multiword terms are looked for
+          # across the join. Path and ref-name lists are not joined: they are
+          # one entry per line, and joining two would only invent a match.
+          joined=$(mktemp)
+          trap 'rm -f "$roster" "$joined"; rm -rf "$texts"' EXIT
+          join_lines() {
+            awk -v OFS='\t' 'FNR == 1 { prev = "" }
+              { l = $0
+                sub(/^[ \t]*(\/\/+!?|#+|\*+|--|;+|>+)?[ \t]*/, "", l)
+                gsub(/[ \t\r]+/, " ", l); sub(/ $/, "", l)
+                if (prev != "" && l != "") print FILENAME, prev " " l
+                prev = l }' "$@"
+          }
+          while IFS= read -r f; do
+            [ "$f" = LICENSE ] && continue
+            [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
+            join_lines "$f" >>"$joined"
+          done < <(git ls-files)
+          for f in "$texts"/additions-* "$texts"/message-*; do
+            [ -f "$f" ] && join_lines "$f" >>"$joined"
+          done
+
           # A `w` term is literal text bounded by anything that is not a letter or
           # digit — grep's own `-w` counts `_` as a word character, so a short
           # name inside `name_email` could never match. Escaped into an ERE for
@@ -201,6 +227,18 @@ jobs:
               1) ;;
               *) echo "::error::grep failed (exit $rc) on names or messages, roster line $line_no"; exit 1 ;;
             esac
+            # A multiword term across a line break — a count only, never where.
+            if [ "$kind" = p ] && [[ "$term" == *[[:space:]]* ]]; then
+              norm=$(printf '%s' "$term" | tr -s '[:space:]' ' ')
+              rc=0
+              k=$(grep -ciF -e "$norm" "$joined" 2>/dev/null) || rc=$?
+              case "$rc" in
+                0) echo "::error::DENYLIST HIT (roster line $line_no) across a line break, $k place(s)"
+                   fail=1 ;;
+                1) ;;
+                *) echo "::error::grep failed (exit $rc) across line breaks, roster line $line_no"; exit 1 ;;
+              esac
+            fi
           done < "$roster"
 
           if [ "$n" -eq 0 ]; then

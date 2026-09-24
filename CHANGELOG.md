@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A multiword denylist term split across a line break is caught.** grep
+  reads one line at a time, and prose here is hard-wrapped at ~75 columns in
+  docs, comments and commit messages, so a two-word term with its words on
+  either side of a wrap passed both gates as clean. Each line is now also
+  joined to the next — indentation and a leading comment marker stripped,
+  whitespace collapsed — and multiword terms are looked for across the join,
+  in the tree, in what each commit adds, and in commit messages. A paragraph
+  break is not joined; path and ref-name lists are not joined either.
+
 - **The denylist gates can no longer pass a term they did not check.** Both
   the pre-push hook and CI read a roster line with no trailing newline, strip
   CRLF, trim stray spaces, and refuse a line with a kind but no term — each of
