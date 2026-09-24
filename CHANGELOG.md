@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the toggles from its live source, so a line conditional on the caller's
   environment (`[ "$USER" = lab ] && PRECHECK_TRIAGE=0`) could switch triage
   off at 03:30 and leave it on at 08:00. Both halves now read the file in the
-  same clean environment — including a fixed system `PATH` rather than each
-  caller's own — falling back to the process value, then to 1.
+  same clean environment — including one fixed `PATH` that still leads with the
+  `~/.local/bin` and `~/.cargo/bin` both nightlies prepend, and the syntax
+  check runs there too, so it and the source probe are one interpreter — falling back to the process value, then to 1.
 
 - **Both nightlies run `precheck --triage`.** `scripts/nightly.sh` and
   `scripts/nightly-mecha.sh` pass the flag by default; `PRECHECK_TRIAGE=0`

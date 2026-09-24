@@ -14,13 +14,18 @@
 # status, so the source's exit code cannot be the test. A sentinel printed
 # after the source in the same shell can — only a real abort skips it.
 #
-# The probe runs in a CLEAN environment (HOME, a fixed system PATH, and
+# The probe runs in a CLEAN environment (HOME, one fixed PATH, and
 # MECHA_GRAPH_DIR as the file's own directory, under `set -u`), never the
 # caller's: the two nightlies define different variables — and build
 # different PATHs — before they ask, so probing in their live state would
 # let one file that names a variable only one of them sets get two answers.
 # A shared rule must also be a shared answer, for the verdict AND the values.
-NIGHTLY_ENV_PATH="/usr/local/bin:/usr/bin:/bin"
+#
+# That PATH leads with the two user bin dirs both nightlies prepend (this
+# project's binaries and the bee CLI live there): a bare system PATH would
+# be shared but unfaithful, and a line like `command -v bee && PRECHECK_TRIAGE=0`
+# would resolve "not found" in both halves — agreement on the OPEN answer.
+NIGHTLY_ENV_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 nightly_env_clean() {
     env -i HOME="$HOME" PATH="$NIGHTLY_ENV_PATH" MECHA_GRAPH_DIR="$(dirname "$1")" \
         bash -u -c "$2" _ "$1" "${3:-}"
@@ -32,7 +37,11 @@ nightly_env_status() {
     # runs the lane that makes permanent rejects.
     [ -e "$f" ] || [ -L "$f" ] || { echo absent; return; }
     { [ -f "$f" ] && [ -r "$f" ]; } || { echo unreadable; return; }
-    bash -n "$f" 2>/dev/null || { echo unparseable; return; }
+    # Same clean environment as the source probe below, so the syntax check
+    # and the abort check are one interpreter — a newer bash on the caller's
+    # PATH parsing what the probe's bash cannot would read as `aborts` and
+    # drop the whole file.
+    nightly_env_clean "$f" 'bash -n "$1"' 2>/dev/null || { echo unparseable; return; }
     [ "$(nightly_env_clean "$f" '. "$1" >/dev/null 2>&1; echo __sourced__')" = "__sourced__" ] \
         || { echo aborts; return; }
     echo ok
