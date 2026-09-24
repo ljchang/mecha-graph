@@ -26,13 +26,19 @@ jobs:
     name: denylist
     runs-on: ubuntu-latest
     steps:
+      # Full history: every commit a push or pull request carries is public by
+      # SHA once it lands, so each one is checked, not only the tip.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Check the tree against the roster
         env:
           ROSTER: ${{ secrets.PUBLIC_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The branch's own name is published too (the branch list, the PR URL).
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           set -uo pipefail
 
@@ -49,49 +55,161 @@ jobs:
             exit 1
           fi
 
-          printf '%s\n' "$ROSTER" > /tmp/roster.txt
+          # The most sensitive file in the set, for the length of one step:
+          # private to this user, at a path nobody else chose, and removed on
+          # every exit, the early ones included.
+          umask 077
+          roster=$(mktemp)
+          trap 'rm -f "$roster"' EXIT
+          printf '%s\n' "$ROSTER" > "$roster"
+          # The commits this run brings in: a pull request's base..head, a
+          # push's before..after. A leak added in one commit and removed in a
+          # later one is still public by SHA, and so is a commit message — the
+          # checked-out tree shows neither. **An unknown base stops the run**
+          # rather than narrowing to the tip: a force-push to main leaves
+          # `before` unreachable, and "checked the tip, called it clean" is the
+          # silent skip this gate exists to refuse. Check such a push with the
+          # hook locally, which knows what it pushed.
+          if [[ "${BASE_SHA:-}" == *[!0]* ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            range=("$BASE_SHA..$HEAD_SHA")
+          else
+            echo "::error::cannot tell which commits this run brings in (base '${BASE_SHA:-none}' unknown — a force-push or a new ref); refusing to check only the tip"
+            exit 1
+          fi
+          commits=()
+          list=$(git rev-list "${range[@]}") || { echo "::error::could not list the commits under check"; exit 1; }
+          [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
+          echo "checking the tree and ${#commits[@]} commit(s)"
+
+          # Names and messages are published too: file and directory names (in
+          # the tree listing, the PR file list, `git log --stat`), and commit
+          # messages. Each written once to its own file; each term is then one
+          # grep over them all. Author fields are the owner's own and public.
+          texts=$(mktemp -d)
+          trap 'rm -f "$roster"; rm -rf "$texts"' EXIT
+          git ls-files >"$texts/paths-tree"
+          printf '%s\n' "${HEAD_REF:-}" >"$texts/names-branch"
+          # Each commit is checked for what it ADDS — the lines, the paths — and
+          # its message, not its whole tree: every commit's tree carries what it
+          # inherited, so a whole-tree check of each would re-flag an old leak in
+          # every commit of the change that removes it, which could then never
+          # pass. The checked-out tree above is the whole final state. Against
+          # the first parent for a merge; the merged commits are checked as
+          # themselves.
+          for c in "${commits[@]}"; do
+            # `:!LICENSE` as in the tree scan: a year bump must not be a hit.
+            git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE' \
+              | { grep '^+' || true; } | { grep -v '^+++ ' || true; } | cut -c2- >"$texts/additions-commit-${c:0:12}"
+            git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
+              >"$texts/paths-commit-${c:0:12}"
+            git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
+          done
+
+          # A `w` term is literal text bounded by anything that is not a letter or
+          # digit — grep's own `-w` counts `_` as a word character, so a short
+          # name inside `name_email` could never match. Escaped into an ERE for
+          # that alone; a `p` term stays a fixed substring. (camelCase stays out
+          # of reach: case ignored, joined words cannot be told apart.)
+          ere_escape() {
+            local s=$1 out= c i
+            for ((i = 0; i < ${#s}; i++)); do
+              c=${s:i:1}
+              case "$c" in
+                '\'|'.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'['|']'|'{'|'}'|'|') out+="\\$c" ;;
+                *) out+=$c ;;
+              esac
+            done
+            printf '%s' "$out"
+          }
+
           fail=0
           n=0
-          while IFS= read -r line; do
+          line_no=0
+          # `|| [ -n "$line" ]`: a last line with no newline is still a line.
+          while IFS= read -r line || [ -n "$line" ]; do
+            line_no=$((line_no+1))
+            # CRLF would leave a `\r` on every term, and a term that cannot
+            # match is a term that was never checked.
+            line=${line%$'\r'}
             # Blank lines and `#` comments so the roster can carry its own
             # notes about why a term is on it.
             case "$line" in ''|'#'*) continue ;; esac
-            kind=${line%% *}; term=${line#* }
+            kind=${line%% *}
+            term=${line#"$kind"}
+            term="${term#"${term%%[![:space:]]*}"}"
+            term="${term%"${term##*[![:space:]]}"}"
+            if [ -z "$term" ]; then
+              echo "::error::roster line $line_no has a kind but no term"
+              exit 1
+            fi
             # Two kinds, and the distinction is load-bearing. A `w` term is
             # short enough to live inside an ordinary English word, so it
             # matches at word boundaries; a `p` term is multiword or
             # address-shaped and matches as a substring. A first draft
             # flattened them and refused a clean tree over two common words
             # that happened to contain a roster term.
+            #
+            # Both kinds are fixed strings (`-F`): a term holding `[` or `(`
+            # would otherwise be a broken regex, and grep's error exit must
+            # not read as "no match".
             case "$kind" in
-              w) flags="-rIliw" ;;
-              p) flags="-rIliF" ;;
-              *) echo "::error::roster line $((n+1)): unknown kind"; exit 1 ;;
+              w) flags="-rIliE"; tflags="-liE"
+                 pat="(^|[^[:alnum:]])$(ere_escape "$term")(\$|[^[:alnum:]])" ;;
+              p) flags="-rIliF"; tflags="-liF"; pat=$term ;;
+              *) echo "::error::roster line $line_no: unknown kind"; exit 1 ;;
             esac
             n=$((n+1))
-            # **Never print the term.** GitHub masks a secret's whole value
-            # in logs, not its individual lines, so echoing a matched term
-            # would publish the roster one finding at a time, in a public
-            # repository's build log. The file and a stable line index are
-            # enough to find it locally; the term stays in the secret.
+            # **Never print the term — or a path.** GitHub masks a secret's
+            # whole value in logs, not its individual lines, so echoing a
+            # matched term would publish the roster one finding at a time, in
+            # a public repository's build log. A matching file's path can
+            # carry the term too (a file named after the person it names), so
+            # only counts, commit ids and a stable roster line index are
+            # printed; the local hook names term and files.
             #
-            # LICENSE carries the copyright holder's name by definition.
-            if hits=$(grep $flags --exclude-dir=.git --exclude-dir=target \
-                        --exclude-dir=.githooks --exclude=denylist.yml \
-                        --exclude=LICENSE -- "$term" . 2>/dev/null); then
-              echo "::error::DENYLIST HIT (roster line $n) in:"
-              printf '%s\n' "$hits" | sed 's/^/  /'
-              fail=1
-            fi
-          done < /tmp/roster.txt
-          rm -f /tmp/roster.txt
+            # LICENSE carries the copyright holder's name by definition. Nothing
+            # else is excluded — not `.githooks`, not this file: a gate this
+            # check cannot see is where a name slips out, and neither holds a
+            # term. (`target/` is build output, never committed.)
+            # `.git` as a file too: in a worktree it is a pointer holding
+            # this machine's path, which is not repository content.
+            # `|| rc=$?`, not a bare assignment then `$?`: Actions runs this
+            # step as `bash -e`, and a grep that finds nothing (exit 1, the
+            # normal case) would otherwise end the step on the first term.
+            rc=0
+            hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
+                     --exclude=LICENSE -e "$pat" . 2>/dev/null) || rc=$?
+            case "$rc" in
+              0) echo "::error::DENYLIST HIT (roster line $line_no) in $(printf '%s\n' "$hits" | wc -l) file(s) of the tree"
+                 fail=1 ;;
+              1) ;;
+              # An error is not a clean result. Never print the term here
+              # either — only that the line could not be checked.
+              *) echo "::error::grep failed (exit $rc) on roster line $line_no — refusing to call that clean"
+                 exit 1 ;;
+            esac
+            # Each commit's additions and added paths, file and directory names
+            # in the tree, the branch name, and commit messages.
+            rc=0
+            hits=$(grep $tflags -e "$pat" "$texts"/* 2>/dev/null) || rc=$?
+            case "$rc" in
+              0) for f in $hits; do
+                   f=${f##*/}
+                   echo "::error::DENYLIST HIT (roster line $line_no) in the ${f%%-*} of ${f#*-}"
+                 done
+                 fail=1 ;;
+              1) ;;
+              *) echo "::error::grep failed (exit $rc) on names or messages, roster line $line_no"; exit 1 ;;
+            esac
+          done < "$roster"
 
           if [ "$n" -eq 0 ]; then
             echo "::error::the roster parsed to zero terms — refusing to call that clean"
             exit 1
           fi
           if [ "$fail" -ne 0 ]; then
-            echo "Run scripts/check-public-denylist.sh locally to see which term hit."
+            echo "To see which term hit, run .githooks/pre-push locally with the roster in place"
+            echo "(owner-only: the roster is deliberately not in this repository or this log)."
             exit 1
           fi
           echo "clean: $n roster term(s), no hits"

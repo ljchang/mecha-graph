@@ -8,6 +8,14 @@
 #
 # Install: git config core.hooksPath .githooks
 set -uo pipefail
+# Paths and pathspecs from the top, however the hook is invoked: run by hand
+# from a subdirectory, `git grep` would search only that subtree and report
+# the whole repository clean — and `:!LICENSE` would exclude nothing.
+top=$(git rev-parse --show-toplevel) || exit 1
+cd "$top" || exit 1
+# git passes the remote's name (or URL) as $1: the only remote whose refs say
+# what is already public here.
+remote=${1:-}
 
 # The roster lives outside this repository on purpose — it is a list of what
 # must never appear here, which makes it the most sensitive file in the set.
@@ -30,40 +38,261 @@ MSG
     exit 1
 fi
 
-fail=0
-terms=0
-while IFS= read -r line; do
+# ── The roster ────────────────────────────────────────────────────────────
+#
+# Every way of writing the file that could silently shrink what gets checked
+# is either tolerated or refused, never passed over: a last line with no
+# trailing newline (`read` would drop it — and it is the line just added), CRLF
+# endings (every term would carry a `\r` and match nothing), stray spaces, and
+# a line with a kind but no term.
+w_terms=()
+p_terms=()
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n+1))
+    line=${line%$'\r'}
     case "$line" in ''|'#'*) continue ;; esac
-    kind=${line%% *}; term=${line#* }
+    kind=${line%% *}
+    term=${line#"$kind"}
+    term="${term#"${term%%[![:space:]]*}"}"
+    term="${term%"${term##*[![:space:]]}"}"
+    if [ -z "$term" ]; then
+        echo "pre-push REFUSED: roster line $n has a kind but no term" >&2
+        exit 1
+    fi
     case "$kind" in
         # Word boundary for short terms, substring for phrases. Losing this
         # distinction is not a near-miss: on the first run it flagged two
         # ordinary words that merely contained a short term, and refused a
         # clean tree. (Which words is deliberately not written down: naming
         # them would tell a reader which letters a roster term is made of.)
-        w) flags="-Iliw" ;;
-        p) flags="-IliF" ;;
-        *) echo "roster line $((terms+1)): unknown kind '$kind'" >&2; exit 1 ;;
+        w) w_terms+=("$term") ;;
+        p) p_terms+=("$term") ;;
+        *) echo "pre-push REFUSED: roster line $n: unknown kind '$kind'" >&2; exit 1 ;;
     esac
-    terms=$((terms+1))
-    # LICENSE carries the copyright holder's name by definition, and always
-    # will. Excluded here exactly as the original export gate excluded it.
-    if hits=$(git grep $flags -- "$term" -- ':!LICENSE' 2>/dev/null); then
-        # Local-only output, so naming the term is safe here and is what
-        # makes the finding actionable — the CI job deliberately cannot.
-        echo "DENYLIST HIT [$term]:" >&2
-        printf '%s\n' "$hits" | sed 's/^/  /' >&2
-        fail=1
-    fi
 done < "$ROSTER"
-
+terms=$(( ${#w_terms[@]} + ${#p_terms[@]} ))
 if [ "$terms" -eq 0 ]; then
     echo "pre-push REFUSED: roster at $ROSTER parsed to zero terms" >&2
     exit 1
 fi
+
+# ── What is being pushed ──────────────────────────────────────────────────
+#
+# git hands a pre-push hook one line per ref: <local ref> <local sha>
+# <remote ref> <remote sha>. The check is on the COMMITS those refs carry that
+# the remote does not have yet — every one of them, not only the tip, since an
+# intermediate commit is public by SHA once pushed even if a later one removed
+# the leak — and not on whatever happens to be checked out (`git push origin
+# other-branch` would otherwise check the wrong tree). Run by hand, with no
+# push on stdin, it checks the working tree.
+commits=()
+tags=()
+ref_names=()
+tips=()
+refs_seen=0
+if [ ! -t 0 ]; then
+    while read -r lref lsha rref rsha; do
+        [ -n "${lsha:-}" ] || continue
+        refs_seen=1
+        case "$lsha" in *[!0]*) ;; *) continue ;; esac   # a branch deletion
+        # The ref's own name is published too — the branch list, the PR URL.
+        ref_names+=("$lref" "$rref")
+        # And the tree it points at, whole: what is public once this lands.
+        tips+=("$lsha")
+        # A new branch, or a remote tip this clone has never fetched: every
+        # commit the push TARGET's tracking refs do not already have. Not
+        # `--remotes` whole — with a private remote in the same clone, its
+        # commits are exactly the ones that must not be skipped. A URL, or a
+        # remote with no tracking refs, matches none: every commit reachable
+        # from the tip is checked, which is slow and right.
+        if [[ "$rsha" == *[!0]* ]] && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+            range=("$rsha..$lsha")
+        else
+            range=("$lsha" --not --remotes="${remote:-no-remote-given}")
+        fi
+        # Unknown is never clean: commits that cannot be listed are commits
+        # that cannot be checked.
+        if ! list=$(git rev-list "${range[@]}"); then
+            echo "pre-push REFUSED: could not list the commits being pushed" >&2
+            exit 1
+        fi
+        [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
+        # An annotated tag carries a message of its own, pushed and public;
+        # `rev-list` resolves through it to commits and never sees it.
+        [ "$(git cat-file -t "$lsha" 2>/dev/null)" = tag ] && tags+=("$lsha")
+    done
+fi
+# By hand means git passed no ref lines — not "stdin is a terminal": run from
+# a script, a Makefile or `</dev/null`, a tty test would read as "nothing to
+# push" and print clean having checked nothing.
+by_hand=0
+[ "$refs_seen" -eq 0 ] && by_hand=1
+
+# ── The check ─────────────────────────────────────────────────────────────
+#
+# Terms are fixed strings, never regular expressions (`-F`, for `w` terms too):
+# a term containing `(` or `[` is a broken regex, and git grep's error exit
+# must not read as "no match". Any exit other than 0 (found) or 1 (not found)
+# refuses the push. LICENSE carries the copyright holder's name by definition,
+# and always will — excluded exactly as the original export gate excluded it.
+fail=0
+# Whole trees are searched at the TIPS being pushed — what is public once the
+# push lands. Each new commit in between is checked for what it ADDS (below),
+# not its whole tree: every commit's tree carries everything inherited from
+# before it, so a whole-tree check of each one would re-flag an old leak in
+# every commit of the change that removes it, and that change could never
+# pass. By hand, the working tree, including files not yet added
+# (`--untracked`, which still skips ignored ones).
+if [ "$by_hand" -eq 1 ]; then targets=(--untracked); else targets=(${tips[@]+"${tips[@]}"}); fi
+
+# How each kind matches — literal text either way, never a regex a term could
+# break. A `p` term is a fixed substring. A `w` term is the term bounded by
+# anything that is not a letter or digit: grep's own `-w` counts `_` as part
+# of a word, so a short name inside `name_email` or `docs/name_notes.md` was a
+# term that could never match. The term is escaped into an ERE for that, and
+# only that. (camelCase — `getNameProfile` — stays out of reach: with case
+# ignored, a word joined by capitals cannot be told from one word.)
+ere_escape() {
+    local s=$1 out= c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        case "$c" in
+            '\'|'.'|'*'|'^'|'$'|'+'|'?'|'('|')'|'['|']'|'{'|'}'|'|') out+="\\$c" ;;
+            *) out+=$c ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+pattern() { # pattern <kind> <term>
+    if [ "$1" = w ]; then
+        printf '(^|[^[:alnum:]])%s($|[^[:alnum:]])' "$(ere_escape "$2")"
+    else
+        printf '%s' "$2"
+    fi
+}
+tree_flags() { [ "$1" = w ] && echo -IliE || echo -IliF; }
+text_flags() { [ "$1" = w ] && echo -liE || echo -liF; }
+kind_terms() { # the roster terms of one kind, one per line
+    if [ "$1" = w ]; then printf '%s\n' ${w_terms[@]+"${w_terms[@]}"}; else printf '%s\n' ${p_terms[@]+"${p_terms[@]}"}; fi
+}
+grep_tree() { # grep_tree <kind> <term>... — over every target at once
+    local kind=$1; shift
+    local e=() t
+    for t in "$@"; do e+=(-e "$(pattern "$kind" "$t")"); done
+    git grep "$(tree_flags "$kind")" "${e[@]}" ${targets[@]+"${targets[@]}"} -- ':!LICENSE' 2>&1
+}
+refuse_grep() { echo "pre-push REFUSED: $1 failed (exit $2):" >&2; printf '%s\n' "$3" | sed 's/^/  /' >&2; exit 1; }
+scan() { # scan <kind> — one pass over the trees; per term only to name a hit
+    local kind=$1 t out rc terms=()
+    while IFS= read -r t; do [ -n "$t" ] && terms+=("$t"); done < <(kind_terms "$kind")
+    [ ${#terms[@]} -gt 0 ] || return 0
+    out=$(grep_tree "$kind" "${terms[@]}"); rc=$?
+    case "$rc" in
+        # The batched pass is the one that KNOWS something matched; the
+        # per-term pass only names it. If naming finds nothing (the working
+        # tree changed between the two, by hand), still refuse.
+        0)  fail=1
+            for t in "${terms[@]}"; do
+                out=$(grep_tree "$kind" "$t"); rc=$?
+                case "$rc" in
+                    0)  # Local-only output, so naming the term is safe here
+                        # and is what makes the finding actionable — the CI
+                        # job deliberately cannot.
+                        echo "DENYLIST HIT [$t]:" >&2
+                        printf '%s\n' "$out" | sed 's/^/  /' >&2
+                        fail=1 ;;
+                    1)  ;;
+                    *)  refuse_grep "git grep" "$rc" "$out" ;;
+                esac
+            done ;;
+        1)  ;;
+        *)  refuse_grep "git grep" "$rc" "$out" ;;
+    esac
+}
+if [ "$by_hand" -eq 1 ] || [ ${#tips[@]} -gt 0 ]; then
+    scan w
+    scan p
+fi
+
+# Beyond file contents, two more things are published: the **names** of files
+# and directories (a doc named after a person is a name in the tree listing,
+# the PR file list and every `git log --stat`, whatever it holds), and the
+# **messages** of commits and annotated tags — the likeliest place a first
+# name lands casually ("per <name>'s note"). Author and committer fields are
+# not checked: they are the owner's own name and address, public by
+# definition like LICENSE.
+#
+# Each text is written once to its own file (one git call per object, its
+# exit status checked — an unreadable message is not a clean one), then each
+# kind is one grep over all of them, per term only to name a hit.
+texts=$(umask 077; mktemp -d) || exit 1
+trap 'rm -rf "$texts"' EXIT
+refuse_read() { echo "pre-push REFUSED: could not read $1" >&2; exit 1; }
+if [ "$by_hand" -eq 1 ]; then
+    git ls-files -co --exclude-standard >"$texts/paths-working-tree" || refuse_read "the file list"
+fi
+for c in ${tips[@]+"${tips[@]}"}; do
+    git ls-tree -r --name-only "$c" >"$texts/paths-tip-${c:0:12}" || refuse_read "the tree of $c"
+done
+# Each new commit: the lines it adds, the paths it adds, and its message —
+# a leak added and removed within the push is public by SHA all the same.
+# Against the first parent for a merge; the merged branch's own commits are
+# in the range too, and checked as themselves.
+for c in ${commits[@]+"${commits[@]}"}; do
+    # `:!LICENSE` here as in the tree scan: it carries the copyright holder's
+    # name by definition, and a year bump would otherwise be a hit no edit
+    # could clear.
+    diff=$(git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE') \
+        || refuse_read "the changes of commit $c"
+    printf '%s\n' "$diff" | grep '^+' | grep -v '^+++ ' | cut -c2- >"$texts/additions-commit-${c:0:12}"
+    git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
+        >"$texts/paths-commit-${c:0:12}" || refuse_read "the changes of commit $c"
+    git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}" || refuse_read "commit $c"
+done
+if [ ${#ref_names[@]} -gt 0 ]; then
+    printf '%s\n' "${ref_names[@]}" >"$texts/names-pushed-refs"
+fi
+for g in ${tags[@]+"${tags[@]}"}; do
+    body=$(git cat-file tag "$g") || refuse_read "tag $g"
+    printf '%s\n' "$body" | sed '1,/^$/d' >"$texts/message-tag-${g:0:12}"
+done
+scan_texts() { # scan_texts <kind> — names and messages, one pass per kind
+    local kind=$1 t out rc f e=() terms=()
+    while IFS= read -r t; do [ -n "$t" ] && terms+=("$t"); done < <(kind_terms "$kind")
+    [ ${#terms[@]} -gt 0 ] || return 0
+    for t in "${terms[@]}"; do e+=(-e "$(pattern "$kind" "$t")"); done
+    out=$(grep "$(text_flags "$kind")" "${e[@]}" "$texts"/* 2>&1); rc=$?
+    case "$rc" in
+        0)  fail=1   # as in `scan`: the batched pass knows; naming only names
+            for t in "${terms[@]}"; do
+                out=$(grep "$(text_flags "$kind")" -e "$(pattern "$kind" "$t")" "$texts"/* 2>&1); rc=$?
+                case "$rc" in
+                    0)  for f in $out; do
+                            f=${f##*/}
+                            echo "DENYLIST HIT [$t] in the ${f%%-*} of ${f#*-}" >&2
+                        done
+                        fail=1 ;;
+                    1)  ;;
+                    *)  refuse_grep "grep on names or messages" "$rc" "$out" ;;
+                esac
+            done ;;
+        1)  ;;
+        *)  refuse_grep "grep on names or messages" "$rc" "$out" ;;
+    esac
+}
+if compgen -G "$texts/*" >/dev/null; then
+    scan_texts w
+    scan_texts p
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "pre-push REFUSED: $terms term(s) checked, see hits above." >&2
     exit 1
 fi
-echo "denylist: clean ($terms terms)"
+if [ "$by_hand" -eq 1 ]; then
+    echo "denylist: clean ($terms terms, working tree)"
+else
+    echo "denylist: clean ($terms terms, ${#commits[@]} new commit(s))"
+fi

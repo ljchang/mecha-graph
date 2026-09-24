@@ -2102,14 +2102,14 @@ mod tests {
         // A pre-existing self-loop on the destination is none of this
         // function's business, and cleaning up after the re-point would have
         // eaten it.
-        let on_edie: i64 = conn
+        let on_wren: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM fact WHERE subject_id=?1 OR object_id=?1",
                 params![wren.id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(on_edie, 3);
+        assert_eq!(on_wren, 3);
     }
 
     /// The narrowing is the whole point: a contaminated node is usually not
