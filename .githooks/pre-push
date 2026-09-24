@@ -11,7 +11,8 @@ set -uo pipefail
 # Paths and pathspecs from the top, however the hook is invoked: run by hand
 # from a subdirectory, `git grep` would search only that subtree and report
 # the whole repository clean — and `:!LICENSE` would exclude nothing.
-cd "$(git rev-parse --show-toplevel)" || exit 1
+top=$(git rev-parse --show-toplevel) || exit 1
+cd "$top" || exit 1
 # git passes the remote's name (or URL) as $1: the only remote whose refs say
 # what is already public here.
 remote=${1:-}
@@ -169,36 +170,57 @@ if [ "$by_hand" -eq 1 ] || [ ${#commits[@]} -gt 0 ]; then
     scan -IliF ${p_terms[@]+"${p_terms[@]}"}
 fi
 
-# Commit and tag messages are pushed too, and rendered as publicly as any
-# file — the likeliest place a first name lands casually ("per <name>'s
-# note"). Messages only: the author and committer fields are the owner's own
-# name and address, public by definition like LICENSE. Each message is read
-# into a variable and grepped from there: `git log | grep -q` under pipefail
-# reports a match as a failure when grep exits early and git takes SIGPIPE.
-scan_messages() { # scan_messages <flags> <term>...
+# Beyond file contents, two more things are published: the **names** of files
+# and directories (a doc named after a person is a name in the tree listing,
+# the PR file list and every `git log --stat`, whatever it holds), and the
+# **messages** of commits and annotated tags — the likeliest place a first
+# name lands casually ("per <name>'s note"). Author and committer fields are
+# not checked: they are the owner's own name and address, public by
+# definition like LICENSE.
+#
+# Each text is written once to its own file (one git call per object, its
+# exit status checked — an unreadable message is not a clean one), then each
+# kind is one grep over all of them, per term only to name a hit.
+texts=$(umask 077; mktemp -d) || exit 1
+trap 'rm -rf "$texts"' EXIT
+refuse_read() { echo "pre-push REFUSED: could not read $1" >&2; exit 1; }
+if [ "$by_hand" -eq 1 ]; then
+    git ls-files -co --exclude-standard >"$texts/paths-working-tree" || refuse_read "the file list"
+fi
+for c in ${commits[@]+"${commits[@]}"}; do
+    git ls-tree -r --name-only "$c" >"$texts/paths-commit-${c:0:12}" || refuse_read "commit $c"
+    git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}" || refuse_read "commit $c"
+done
+for g in ${tags[@]+"${tags[@]}"}; do
+    body=$(git cat-file tag "$g") || refuse_read "tag $g"
+    printf '%s\n' "$body" | sed '1,/^$/d' >"$texts/message-tag-${g:0:12}"
+done
+scan_texts() { # scan_texts <flags> <term>...
     local flags=$1; shift
-    local t o msg rc
-    for t in "$@"; do
-        for o in ${commits[@]+"${commits[@]}"} ${tags[@]+"${tags[@]}"}; do
-            if [ "$(git cat-file -t "$o")" = tag ]; then
-                msg=$(git cat-file tag "$o" | sed '1,/^$/d')
-            else
-                msg=$(git log -1 --format=%B "$o")
-            fi
-            rc=0
-            grep -q "$flags" -e "$t" <<<"$msg" || rc=$?
-            case "$rc" in
-                0)  echo "DENYLIST HIT [$t] in the message of $(git cat-file -t "$o") ${o:0:12}" >&2
-                    fail=1 ;;
-                1)  ;;
-                *)  echo "pre-push REFUSED: grep failed (exit $rc) on a message" >&2; exit 1 ;;
-            esac
-        done
-    done
+    [ "$#" -gt 0 ] || return 0
+    local e=() t out rc f
+    for t in "$@"; do e+=(-e "$t"); done
+    out=$(grep -l "$flags" "${e[@]}" "$texts"/* 2>&1); rc=$?
+    case "$rc" in
+        0)  for t in "$@"; do
+                out=$(grep -l "$flags" -e "$t" "$texts"/* 2>&1); rc=$?
+                case "$rc" in
+                    0)  for f in $out; do
+                            f=${f##*/}
+                            echo "DENYLIST HIT [$t] in the ${f%%-*} of ${f#*-}" >&2
+                        done
+                        fail=1 ;;
+                    1)  ;;
+                    *)  echo "pre-push REFUSED: grep failed (exit $rc) on names or messages" >&2; exit 1 ;;
+                esac
+            done ;;
+        1)  ;;
+        *)  echo "pre-push REFUSED: grep failed (exit $rc) on names or messages" >&2; exit 1 ;;
+    esac
 }
-if [ $(( ${#commits[@]} + ${#tags[@]} )) -gt 0 ]; then
-    scan_messages -iwF ${w_terms[@]+"${w_terms[@]}"}
-    scan_messages -iF ${p_terms[@]+"${p_terms[@]}"}
+if compgen -G "$texts/*" >/dev/null; then
+    scan_texts -iwF ${w_terms[@]+"${w_terms[@]}"}
+    scan_texts -iF ${p_terms[@]+"${p_terms[@]}"}
 fi
 
 if [ "$fail" -ne 0 ]; then

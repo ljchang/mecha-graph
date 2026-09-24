@@ -63,18 +63,33 @@ jobs:
           # The commits this run brings in: a pull request's base..head, a
           # push's before..after. A leak added in one commit and removed in a
           # later one is still public by SHA, and so is a commit message — the
-          # checked-out tree shows neither. An unknown base (a new ref, a
-          # rewritten one) falls back to the head commit alone. Unknown is
-          # never clean: commits that cannot be listed stop the run.
+          # checked-out tree shows neither. **An unknown base stops the run**
+          # rather than narrowing to the tip: a force-push to main leaves
+          # `before` unreachable, and "checked the tip, called it clean" is the
+          # silent skip this gate exists to refuse. Check such a push with the
+          # hook locally, which knows what it pushed.
           if [[ "${BASE_SHA:-}" == *[!0]* ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
             range=("$BASE_SHA..$HEAD_SHA")
           else
-            range=(-1 "$HEAD_SHA")
+            echo "::error::cannot tell which commits this run brings in (base '${BASE_SHA:-none}' unknown — a force-push or a new ref); refusing to check only the tip"
+            exit 1
           fi
           commits=()
           list=$(git rev-list "${range[@]}") || { echo "::error::could not list the commits under check"; exit 1; }
           [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
           echo "checking the tree and ${#commits[@]} commit(s)"
+
+          # Names and messages are published too: file and directory names (in
+          # the tree listing, the PR file list, `git log --stat`), and commit
+          # messages. Each written once to its own file; each term is then one
+          # grep over them all. Author fields are the owner's own and public.
+          texts=$(mktemp -d)
+          trap 'rm -f "$roster"; rm -rf "$texts"' EXIT
+          git ls-files >"$texts/paths-tree"
+          for c in "${commits[@]}"; do
+            git ls-tree -r --name-only "$c" >"$texts/paths-commit-${c:0:12}"
+            git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
+          done
 
           fail=0
           n=0
@@ -107,16 +122,18 @@ jobs:
             # would otherwise be a broken regex, and grep's error exit must
             # not read as "no match".
             case "$kind" in
-              w) flags="-rIliwF"; gflags="-IliwF"; mflags="-iwF" ;;
-              p) flags="-rIliF"; gflags="-IliF"; mflags="-iF" ;;
+              w) flags="-rIliwF"; gflags="-IliwF"; tflags="-liwF" ;;
+              p) flags="-rIliF"; gflags="-IliF"; tflags="-liF" ;;
               *) echo "::error::roster line $line_no: unknown kind"; exit 1 ;;
             esac
             n=$((n+1))
-            # **Never print the term.** GitHub masks a secret's whole value
-            # in logs, not its individual lines, so echoing a matched term
-            # would publish the roster one finding at a time, in a public
-            # repository's build log. The file and a stable line index are
-            # enough to find it locally; the term stays in the secret.
+            # **Never print the term — or a path.** GitHub masks a secret's
+            # whole value in logs, not its individual lines, so echoing a
+            # matched term would publish the roster one finding at a time, in
+            # a public repository's build log. A matching file's path can
+            # carry the term too (a file named after the person it names), so
+            # only counts, commit ids and a stable roster line index are
+            # printed; the local hook names term and files.
             #
             # LICENSE carries the copyright holder's name by definition. Nothing
             # else is excluded — not `.githooks`, not this file: a gate this
@@ -131,8 +148,7 @@ jobs:
             hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
                      --exclude=LICENSE -- "$term" . 2>/dev/null) || rc=$?
             case "$rc" in
-              0) echo "::error::DENYLIST HIT (roster line $line_no) in:"
-                 printf '%s\n' "$hits" | sed 's/^/  /'
+              0) echo "::error::DENYLIST HIT (roster line $line_no) in $(printf '%s\n' "$hits" | wc -l) file(s) of the tree"
                  fail=1 ;;
               1) ;;
               # An error is not a clean result. Never print the term here
@@ -141,31 +157,29 @@ jobs:
                  exit 1 ;;
             esac
             if [ ${#commits[@]} -gt 0 ]; then
-              # Every commit's tree (paths only, `-l`: never content).
+              # Every commit's tree; `-l` prints "commit:path", of which only
+              # the commit id is echoed.
               rc=0
               hits=$(git grep $gflags -e "$term" "${commits[@]}" -- ':!LICENSE' 2>/dev/null) || rc=$?
               case "$rc" in
-                0) echo "::error::DENYLIST HIT (roster line $line_no) in a commit's tree:"
-                   printf '%s\n' "$hits" | sed 's/^/  /'
+                0) echo "::error::DENYLIST HIT (roster line $line_no) in the tree of commit(s): $(printf '%s\n' "$hits" | cut -c1-12 | sort -u | tr '\n' ' ')"
                    fail=1 ;;
                 1) ;;
                 *) echo "::error::git grep failed (exit $rc) on roster line $line_no"; exit 1 ;;
               esac
-              # Every commit's message, read into a variable first: piping
-              # `git log` into `grep -q` under pipefail can turn a match into a
-              # failure when grep exits early and git takes SIGPIPE.
-              for c in "${commits[@]}"; do
-                msg=$(git log -1 --format=%B "$c")
-                rc=0
-                grep -q $mflags -e "$term" <<<"$msg" || rc=$?
-                case "$rc" in
-                  0) echo "::error::DENYLIST HIT (roster line $line_no) in the message of commit ${c:0:12}"
-                     fail=1 ;;
-                  1) ;;
-                  *) echo "::error::grep failed (exit $rc) on a commit message"; exit 1 ;;
-                esac
-              done
             fi
+            # File and directory names, and commit messages.
+            rc=0
+            hits=$(grep $tflags -e "$term" "$texts"/* 2>/dev/null) || rc=$?
+            case "$rc" in
+              0) for f in $hits; do
+                   f=${f##*/}
+                   echo "::error::DENYLIST HIT (roster line $line_no) in the ${f%%-*} of ${f#*-}"
+                 done
+                 fail=1 ;;
+              1) ;;
+              *) echo "::error::grep failed (exit $rc) on names or messages, roster line $line_no"; exit 1 ;;
+            esac
           done < "$roster"
 
           if [ "$n" -eq 0 ]; then
