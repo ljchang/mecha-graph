@@ -19,9 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being pushed that the push target lacks — its own tracking refs, never a
   second remote's — and those commits' messages, not the checked-out tree, so
   pushing another branch, a leak fixed in a later commit, or a name in a commit
-  message is caught. Run by hand (no refs from git, whatever stdin is) it checks
+  or annotated-tag message is caught. Run by hand (no refs from git, whatever stdin is) it checks
   the whole working tree from the top, untracked files included. CI keeps grep's exit status under Actions' `bash -e` (a
-  missing term no longer ends the step), no longer excludes `.githooks`, writes the
+  missing term no longer ends the step), checks every commit a pull request
+  or push brings in — each tree and each message, with full history — not
+  only the tip, excludes nothing but LICENSE (not `.githooks`, not itself), writes the
   roster to a private temp file removed on every exit, and its failure line
   says the naming tool is owner-only.
 

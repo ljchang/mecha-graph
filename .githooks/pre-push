@@ -86,6 +86,7 @@ fi
 # other-branch` would otherwise check the wrong tree). Run by hand, with no
 # push on stdin, it checks the working tree.
 commits=()
+tags=()
 refs_seen=0
 if [ ! -t 0 ]; then
     while read -r _lref lsha _rref rsha; do
@@ -110,6 +111,9 @@ if [ ! -t 0 ]; then
             exit 1
         fi
         [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
+        # An annotated tag carries a message of its own, pushed and public;
+        # `rev-list` resolves through it to commits and never sees it.
+        [ "$(git cat-file -t "$lsha" 2>/dev/null)" = tag ] && tags+=("$lsha")
     done
 fi
 # By hand means git passed no ref lines — not "stdin is a terminal": run from
@@ -129,11 +133,11 @@ fail=0
 # By hand, the working tree includes files not yet added (`--untracked`,
 # which still skips ignored ones): a name in a new file is one commit away
 # from a push. Pushing, the commits themselves are the targets.
-if [ "$by_hand" -eq 1 ]; then targets=(--untracked); else targets=("${commits[@]}"); fi
+if [ "$by_hand" -eq 1 ]; then targets=(--untracked); else targets=(${commits[@]+"${commits[@]}"}); fi
 grep_terms() { # grep_terms <flags> <term>... — over every target at once
     local flags=$1; shift
     local e=(); for t in "$@"; do e+=(-e "$t"); done
-    git grep "$flags" "${e[@]}" "${targets[@]}" -- ':!LICENSE' 2>&1
+    git grep "$flags" ${e[@]+"${e[@]}"} ${targets[@]+"${targets[@]}"} -- ':!LICENSE' 2>&1
 }
 scan() { # scan <flags> <term>... — one pass; per-term only to name a hit
     local flags=$1; shift
@@ -161,37 +165,40 @@ scan() { # scan <flags> <term>... — one pass; per-term only to name a hit
     esac
 }
 if [ "$by_hand" -eq 1 ] || [ ${#commits[@]} -gt 0 ]; then
-    scan -IliwF "${w_terms[@]}"
-    scan -IliF "${p_terms[@]}"
+    scan -IliwF ${w_terms[@]+"${w_terms[@]}"}
+    scan -IliF ${p_terms[@]+"${p_terms[@]}"}
 fi
 
-# Commit messages are pushed too, and rendered as publicly as any file — the
-# likeliest place a first name lands casually ("per <name>'s note"). Messages
-# only: the author and committer fields are the owner's own name and address,
-# public by definition like LICENSE.
-if [ ${#commits[@]} -gt 0 ]; then
-    msgs=$(umask 077; mktemp) || exit 1
-    trap 'rm -f "$msgs"' EXIT
-    for c in "${commits[@]}"; do
-        printf 'commit %s\n' "${c:0:12}"
-        git log -1 --format=%B "$c" | sed 's/^/    /'
-    done >"$msgs"
-    scan_messages() { # scan_messages <flags> <term>...
-        local flags=$1; shift
-        local t out rc
-        for t in "$@"; do
-            out=$(grep "$flags" -e "$t" "$msgs" 2>&1); rc=$?
+# Commit and tag messages are pushed too, and rendered as publicly as any
+# file — the likeliest place a first name lands casually ("per <name>'s
+# note"). Messages only: the author and committer fields are the owner's own
+# name and address, public by definition like LICENSE. Each message is read
+# into a variable and grepped from there: `git log | grep -q` under pipefail
+# reports a match as a failure when grep exits early and git takes SIGPIPE.
+scan_messages() { # scan_messages <flags> <term>...
+    local flags=$1; shift
+    local t o msg rc
+    for t in "$@"; do
+        for o in ${commits[@]+"${commits[@]}"} ${tags[@]+"${tags[@]}"}; do
+            if [ "$(git cat-file -t "$o")" = tag ]; then
+                msg=$(git cat-file tag "$o" | sed '1,/^$/d')
+            else
+                msg=$(git log -1 --format=%B "$o")
+            fi
+            rc=0
+            grep -q "$flags" -e "$t" <<<"$msg" || rc=$?
             case "$rc" in
-                0)  echo "DENYLIST HIT [$t] in a commit message:" >&2
-                    grep -B200 "$flags" -e "$t" "$msgs" | grep -E '^commit ' | tail -1 | sed 's/^/  /' >&2
+                0)  echo "DENYLIST HIT [$t] in the message of $(git cat-file -t "$o") ${o:0:12}" >&2
                     fail=1 ;;
                 1)  ;;
-                *)  echo "pre-push REFUSED: grep failed (exit $rc) on commit messages" >&2; exit 1 ;;
+                *)  echo "pre-push REFUSED: grep failed (exit $rc) on a message" >&2; exit 1 ;;
             esac
         done
-    }
-    scan_messages -iwF "${w_terms[@]}"
-    scan_messages -iF "${p_terms[@]}"
+    done
+}
+if [ $(( ${#commits[@]} + ${#tags[@]} )) -gt 0 ]; then
+    scan_messages -iwF ${w_terms[@]+"${w_terms[@]}"}
+    scan_messages -iF ${p_terms[@]+"${p_terms[@]}"}
 fi
 
 if [ "$fail" -ne 0 ]; then

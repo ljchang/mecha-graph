@@ -26,13 +26,17 @@ jobs:
     name: denylist
     runs-on: ubuntu-latest
     steps:
+      # Full history: every commit a push or pull request carries is public by
+      # SHA once it lands, so each one is checked, not only the tip.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Check the tree against the roster
         env:
           ROSTER: ${{ secrets.PUBLIC_DENYLIST }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -uo pipefail
 
@@ -56,6 +60,22 @@ jobs:
           roster=$(mktemp)
           trap 'rm -f "$roster"' EXIT
           printf '%s\n' "$ROSTER" > "$roster"
+          # The commits this run brings in: a pull request's base..head, a
+          # push's before..after. A leak added in one commit and removed in a
+          # later one is still public by SHA, and so is a commit message — the
+          # checked-out tree shows neither. An unknown base (a new ref, a
+          # rewritten one) falls back to the head commit alone. Unknown is
+          # never clean: commits that cannot be listed stop the run.
+          if [[ "${BASE_SHA:-}" == *[!0]* ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            range=("$BASE_SHA..$HEAD_SHA")
+          else
+            range=(-1 "$HEAD_SHA")
+          fi
+          commits=()
+          list=$(git rev-list "${range[@]}") || { echo "::error::could not list the commits under check"; exit 1; }
+          [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
+          echo "checking the tree and ${#commits[@]} commit(s)"
+
           fail=0
           n=0
           line_no=0
@@ -87,8 +107,8 @@ jobs:
             # would otherwise be a broken regex, and grep's error exit must
             # not read as "no match".
             case "$kind" in
-              w) flags="-rIliwF" ;;
-              p) flags="-rIliF" ;;
+              w) flags="-rIliwF"; gflags="-IliwF"; mflags="-iwF" ;;
+              p) flags="-rIliF"; gflags="-IliF"; mflags="-iF" ;;
               *) echo "::error::roster line $line_no: unknown kind"; exit 1 ;;
             esac
             n=$((n+1))
@@ -98,11 +118,10 @@ jobs:
             # repository's build log. The file and a stable line index are
             # enough to find it locally; the term stays in the secret.
             #
-            # LICENSE carries the copyright holder's name by definition, and
-            # this file is the gate itself. `.githooks` is deliberately NOT
-            # excluded: it is the local gate, and a gate this check cannot
-            # see is where a name slips out for anyone who never installed
-            # the hook.
+            # LICENSE carries the copyright holder's name by definition. Nothing
+            # else is excluded — not `.githooks`, not this file: a gate this
+            # check cannot see is where a name slips out, and neither holds a
+            # term.
             # `.git` as a file too: in a worktree it is a pointer holding
             # this machine's path, which is not repository content.
             # `|| rc=$?`, not a bare assignment then `$?`: Actions runs this
@@ -110,7 +129,7 @@ jobs:
             # normal case) would otherwise end the step on the first term.
             rc=0
             hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
-                     --exclude=denylist.yml --exclude=LICENSE -- "$term" . 2>/dev/null) || rc=$?
+                     --exclude=LICENSE -- "$term" . 2>/dev/null) || rc=$?
             case "$rc" in
               0) echo "::error::DENYLIST HIT (roster line $line_no) in:"
                  printf '%s\n' "$hits" | sed 's/^/  /'
@@ -121,6 +140,32 @@ jobs:
               *) echo "::error::grep failed (exit $rc) on roster line $line_no — refusing to call that clean"
                  exit 1 ;;
             esac
+            if [ ${#commits[@]} -gt 0 ]; then
+              # Every commit's tree (paths only, `-l`: never content).
+              rc=0
+              hits=$(git grep $gflags -e "$term" "${commits[@]}" -- ':!LICENSE' 2>/dev/null) || rc=$?
+              case "$rc" in
+                0) echo "::error::DENYLIST HIT (roster line $line_no) in a commit's tree:"
+                   printf '%s\n' "$hits" | sed 's/^/  /'
+                   fail=1 ;;
+                1) ;;
+                *) echo "::error::git grep failed (exit $rc) on roster line $line_no"; exit 1 ;;
+              esac
+              # Every commit's message, read into a variable first: piping
+              # `git log` into `grep -q` under pipefail can turn a match into a
+              # failure when grep exits early and git takes SIGPIPE.
+              for c in "${commits[@]}"; do
+                msg=$(git log -1 --format=%B "$c")
+                rc=0
+                grep -q $mflags -e "$term" <<<"$msg" || rc=$?
+                case "$rc" in
+                  0) echo "::error::DENYLIST HIT (roster line $line_no) in the message of commit ${c:0:12}"
+                     fail=1 ;;
+                  1) ;;
+                  *) echo "::error::grep failed (exit $rc) on a commit message"; exit 1 ;;
+                esac
+              done
+            fi
           done < "$roster"
 
           if [ "$n" -eq 0 ]; then
