@@ -49,24 +49,47 @@ jobs:
             exit 1
           fi
 
-          printf '%s\n' "$ROSTER" > /tmp/roster.txt
+          # The most sensitive file in the set, for the length of one step:
+          # private to this user, at a path nobody else chose, and removed on
+          # every exit, the early ones included.
+          umask 077
+          roster=$(mktemp)
+          trap 'rm -f "$roster"' EXIT
+          printf '%s\n' "$ROSTER" > "$roster"
           fail=0
           n=0
-          while IFS= read -r line; do
+          line_no=0
+          # `|| [ -n "$line" ]`: a last line with no newline is still a line.
+          while IFS= read -r line || [ -n "$line" ]; do
+            line_no=$((line_no+1))
+            # CRLF would leave a `\r` on every term, and a term that cannot
+            # match is a term that was never checked.
+            line=${line%$'\r'}
             # Blank lines and `#` comments so the roster can carry its own
             # notes about why a term is on it.
             case "$line" in ''|'#'*) continue ;; esac
-            kind=${line%% *}; term=${line#* }
+            kind=${line%% *}
+            term=${line#"$kind"}
+            term="${term#"${term%%[![:space:]]*}"}"
+            term="${term%"${term##*[![:space:]]}"}"
+            if [ -z "$term" ]; then
+              echo "::error::roster line $line_no has a kind but no term"
+              exit 1
+            fi
             # Two kinds, and the distinction is load-bearing. A `w` term is
             # short enough to live inside an ordinary English word, so it
             # matches at word boundaries; a `p` term is multiword or
             # address-shaped and matches as a substring. A first draft
             # flattened them and refused a clean tree over two common words
             # that happened to contain a roster term.
+            #
+            # Both kinds are fixed strings (`-F`): a term holding `[` or `(`
+            # would otherwise be a broken regex, and grep's error exit must
+            # not read as "no match".
             case "$kind" in
-              w) flags="-rIliw" ;;
+              w) flags="-rIliwF" ;;
               p) flags="-rIliF" ;;
-              *) echo "::error::roster line $((n+1)): unknown kind"; exit 1 ;;
+              *) echo "::error::roster line $line_no: unknown kind"; exit 1 ;;
             esac
             n=$((n+1))
             # **Never print the term.** GitHub masks a secret's whole value
@@ -75,23 +98,35 @@ jobs:
             # repository's build log. The file and a stable line index are
             # enough to find it locally; the term stays in the secret.
             #
-            # LICENSE carries the copyright holder's name by definition.
-            if hits=$(grep $flags --exclude-dir=.git --exclude-dir=target \
-                        --exclude-dir=.githooks --exclude=denylist.yml \
-                        --exclude=LICENSE -- "$term" . 2>/dev/null); then
-              echo "::error::DENYLIST HIT (roster line $n) in:"
-              printf '%s\n' "$hits" | sed 's/^/  /'
-              fail=1
-            fi
-          done < /tmp/roster.txt
-          rm -f /tmp/roster.txt
+            # LICENSE carries the copyright holder's name by definition, and
+            # this file is the gate itself. `.githooks` is deliberately NOT
+            # excluded: it is the local gate, and a gate this check cannot
+            # see is where a name slips out for anyone who never installed
+            # the hook.
+            # `.git` as a file too: in a worktree it is a pointer holding
+            # this machine's path, which is not repository content.
+            hits=$(grep $flags --exclude-dir=.git --exclude=.git --exclude-dir=target \
+                     --exclude=denylist.yml --exclude=LICENSE -- "$term" . 2>/dev/null)
+            rc=$?
+            case "$rc" in
+              0) echo "::error::DENYLIST HIT (roster line $line_no) in:"
+                 printf '%s\n' "$hits" | sed 's/^/  /'
+                 fail=1 ;;
+              1) ;;
+              # An error is not a clean result. Never print the term here
+              # either — only that the line could not be checked.
+              *) echo "::error::grep failed (exit $rc) on roster line $line_no — refusing to call that clean"
+                 exit 1 ;;
+            esac
+          done < "$roster"
 
           if [ "$n" -eq 0 ]; then
             echo "::error::the roster parsed to zero terms — refusing to call that clean"
             exit 1
           fi
           if [ "$fail" -ne 0 ]; then
-            echo "Run scripts/check-public-denylist.sh locally to see which term hit."
+            echo "To see which term hit, run .githooks/pre-push locally with the roster in place"
+            echo "(owner-only: the roster is deliberately not in this repository or this log)."
             exit 1
           fi
           echo "clean: $n roster term(s), no hits"

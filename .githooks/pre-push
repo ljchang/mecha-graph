@@ -30,40 +30,130 @@ MSG
     exit 1
 fi
 
-fail=0
-terms=0
-while IFS= read -r line; do
+# ── The roster ────────────────────────────────────────────────────────────
+#
+# Every way of writing the file that could silently shrink what gets checked
+# is either tolerated or refused, never passed over: a last line with no
+# trailing newline (`read` would drop it — and it is the line just added), CRLF
+# endings (every term would carry a `\r` and match nothing), stray spaces, and
+# a line with a kind but no term.
+w_terms=()
+p_terms=()
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n+1))
+    line=${line%$'\r'}
     case "$line" in ''|'#'*) continue ;; esac
-    kind=${line%% *}; term=${line#* }
+    kind=${line%% *}
+    term=${line#"$kind"}
+    term="${term#"${term%%[![:space:]]*}"}"
+    term="${term%"${term##*[![:space:]]}"}"
+    if [ -z "$term" ]; then
+        echo "pre-push REFUSED: roster line $n has a kind but no term" >&2
+        exit 1
+    fi
     case "$kind" in
         # Word boundary for short terms, substring for phrases. Losing this
         # distinction is not a near-miss: on the first run it flagged two
         # ordinary words that merely contained a short term, and refused a
         # clean tree. (Which words is deliberately not written down: naming
         # them would tell a reader which letters a roster term is made of.)
-        w) flags="-Iliw" ;;
-        p) flags="-IliF" ;;
-        *) echo "roster line $((terms+1)): unknown kind '$kind'" >&2; exit 1 ;;
+        w) w_terms+=("$term") ;;
+        p) p_terms+=("$term") ;;
+        *) echo "pre-push REFUSED: roster line $n: unknown kind '$kind'" >&2; exit 1 ;;
     esac
-    terms=$((terms+1))
-    # LICENSE carries the copyright holder's name by definition, and always
-    # will. Excluded here exactly as the original export gate excluded it.
-    if hits=$(git grep $flags -- "$term" -- ':!LICENSE' 2>/dev/null); then
-        # Local-only output, so naming the term is safe here and is what
-        # makes the finding actionable — the CI job deliberately cannot.
-        echo "DENYLIST HIT [$term]:" >&2
-        printf '%s\n' "$hits" | sed 's/^/  /' >&2
-        fail=1
-    fi
 done < "$ROSTER"
-
+terms=$(( ${#w_terms[@]} + ${#p_terms[@]} ))
 if [ "$terms" -eq 0 ]; then
     echo "pre-push REFUSED: roster at $ROSTER parsed to zero terms" >&2
     exit 1
 fi
+
+# ── What is being pushed ──────────────────────────────────────────────────
+#
+# git hands a pre-push hook one line per ref: <local ref> <local sha>
+# <remote ref> <remote sha>. The check is on the COMMITS those refs carry that
+# the remote does not have yet — every one of them, not only the tip, since an
+# intermediate commit is public by SHA once pushed even if a later one removed
+# the leak — and not on whatever happens to be checked out (`git push origin
+# other-branch` would otherwise check the wrong tree). Run by hand, with no
+# push on stdin, it checks the working tree.
+zero=0000000000000000000000000000000000000000
+commits=()
+if [ ! -t 0 ]; then
+    while read -r _lref lsha _rref rsha; do
+        [ -n "${lsha:-}" ] || continue
+        case "$lsha" in *[!0]*) ;; *) continue ;; esac   # a branch deletion
+        # A new branch, or a remote tip this clone has never fetched: every
+        # commit no remote-tracking ref already has.
+        if [[ "$rsha" == *[!0]* ]] && git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+            range=("$rsha..$lsha")
+        else
+            range=("$lsha" --not --remotes)
+        fi
+        # Unknown is never clean: commits that cannot be listed are commits
+        # that cannot be checked.
+        if ! list=$(git rev-list "${range[@]}"); then
+            echo "pre-push REFUSED: could not list the commits being pushed" >&2
+            exit 1
+        fi
+        [ -n "$list" ] && while read -r c; do commits+=("$c"); done <<<"$list"
+    done
+fi
+by_hand=0
+if [ ${#commits[@]} -eq 0 ] && [ -t 0 ]; then by_hand=1; fi
+
+# ── The check ─────────────────────────────────────────────────────────────
+#
+# Terms are fixed strings, never regular expressions (`-F`, for `w` terms too):
+# a term containing `(` or `[` is a broken regex, and git grep's error exit
+# must not read as "no match". Any exit other than 0 (found) or 1 (not found)
+# refuses the push. LICENSE carries the copyright holder's name by definition,
+# and always will — excluded exactly as the original export gate excluded it.
+fail=0
+[ "$by_hand" -eq 1 ] && targets=() || targets=("${commits[@]}")
+grep_terms() { # grep_terms <flags> <term>... — over every target at once
+    local flags=$1; shift
+    local e=(); for t in "$@"; do e+=(-e "$t"); done
+    git grep "$flags" "${e[@]}" "${targets[@]}" -- ':!LICENSE' 2>&1
+}
+scan() { # scan <flags> <term>... — one pass; per-term only to name a hit
+    local flags=$1; shift
+    [ "$#" -gt 0 ] || return 0
+    local out rc
+    out=$(grep_terms "$flags" "$@"); rc=$?
+    case "$rc" in
+        0)  for t in "$@"; do
+                out=$(grep_terms "$flags" "$t"); rc=$?
+                case "$rc" in
+                    0)  # Local-only output, so naming the term is safe here
+                        # and is what makes the finding actionable — the CI
+                        # job deliberately cannot.
+                        echo "DENYLIST HIT [$t]:" >&2
+                        printf '%s\n' "$out" | sed 's/^/  /' >&2
+                        fail=1 ;;
+                    1)  ;;
+                    *)  echo "pre-push REFUSED: git grep failed (exit $rc):" >&2
+                        printf '%s\n' "$out" | sed 's/^/  /' >&2; exit 1 ;;
+                esac
+            done ;;
+        1)  ;;
+        *)  echo "pre-push REFUSED: git grep failed (exit $rc):" >&2
+            printf '%s\n' "$out" | sed 's/^/  /' >&2; exit 1 ;;
+    esac
+}
+if [ "$by_hand" -eq 1 ] || [ ${#commits[@]} -gt 0 ]; then
+    scan -IliwF "${w_terms[@]}"
+    scan -IliF "${p_terms[@]}"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
     echo "pre-push REFUSED: $terms term(s) checked, see hits above." >&2
     exit 1
 fi
-echo "denylist: clean ($terms terms)"
+if [ "$by_hand" -eq 1 ]; then
+    echo "denylist: clean ($terms terms, working tree)"
+else
+    echo "denylist: clean ($terms terms, ${#commits[@]} new commit(s))"
+fi

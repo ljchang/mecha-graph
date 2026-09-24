@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The denylist gates can no longer pass a term they did not check.** Both
+  the pre-push hook and CI read a roster line with no trailing newline, strip
+  CRLF, trim stray spaces, and refuse a line with a kind but no term — each of
+  those used to shrink the check silently while it printed `clean`. Terms are
+  fixed strings for both kinds, so a term holding `[` is no longer a broken
+  regex whose error read as "no match" (verified: the old hook pushed a leak
+  past such a term). Any grep error refuses. The hook now checks every commit
+  being pushed that the remote lacks, not the checked-out tree, so pushing
+  another branch or a leak fixed in a later commit is caught; run by hand it
+  still checks the working tree. CI no longer excludes `.githooks`, writes the
+  roster to a private temp file removed on every exit, and its failure line
+  says the naming tool is owner-only.
+
 ### Changed
 
 - **`nightly.sh` resolves its precheck toggles before it sources
