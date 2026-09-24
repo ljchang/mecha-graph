@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The two nightlies take their precheck toggles from one resolver.**
+  `nightly-env.sh` already gave both halves one verdict on `nightly.env`;
+  now `nightly_env_toggle` gives them one value too. `nightly.sh` had read
+  the toggles from its live source, so a line conditional on the caller's
+  environment (`[ "$USER" = lab ] && PRECHECK_TRIAGE=0`) could switch triage
+  off at 03:30 and leave it on at 08:00. Both halves now read the file in the
+  same clean environment — including a fixed system `PATH` rather than each
+  caller's own — falling back to the process value, then to 1.
+
 - **Both nightlies run `precheck --triage`.** `scripts/nightly.sh` and
   `scripts/nightly-mecha.sh` pass the flag by default; `PRECHECK_TRIAGE=0`
   in `~/.mecha-graph/nightly.env` turns it off, beside

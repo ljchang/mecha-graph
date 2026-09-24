@@ -14,13 +14,16 @@
 # status, so the source's exit code cannot be the test. A sentinel printed
 # after the source in the same shell can — only a real abort skips it.
 #
-# The probe runs in a CLEAN environment (HOME, PATH, and MECHA_GRAPH_DIR as
-# the file's own directory, under `set -u`), never the caller's: the two
-# nightlies define different variables before they ask, so probing in their
-# live state would let one file that names a variable only one of them sets
-# get two answers. A shared rule must also be a shared answer.
+# The probe runs in a CLEAN environment (HOME, a fixed system PATH, and
+# MECHA_GRAPH_DIR as the file's own directory, under `set -u`), never the
+# caller's: the two nightlies define different variables — and build
+# different PATHs — before they ask, so probing in their live state would
+# let one file that names a variable only one of them sets get two answers.
+# A shared rule must also be a shared answer, for the verdict AND the values.
+NIGHTLY_ENV_PATH="/usr/local/bin:/usr/bin:/bin"
 nightly_env_clean() {
-    env -i HOME="$HOME" PATH="$PATH" MECHA_GRAPH_DIR="$(dirname "$1")" bash -u -c "$2" _ "$1" "${3:-}"
+    env -i HOME="$HOME" PATH="$NIGHTLY_ENV_PATH" MECHA_GRAPH_DIR="$(dirname "$1")" \
+        bash -u -c "$2" _ "$1" "${3:-}"
 }
 nightly_env_status() {
     local f=$1
@@ -39,4 +42,21 @@ nightly_env_status() {
 # status probe used; empty when the file leaves it unset.
 nightly_env_value() {
     nightly_env_clean "$1" '. "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' "$2"
+}
+
+# A precheck toggle, resolved the one way both nightlies use:
+#   STATUS ok      → the file's value (clean env), else PROCESS, else 1
+#   STATUS absent  → PROCESS, else 1
+#   anything else  → 0 (fail closed)
+# PROCESS is the caller's value from before it sourced anything, so a file
+# that sets the toggle conditionally on the caller's own environment cannot
+# make the halves disagree.
+nightly_env_toggle() {
+    local file=$1 status=$2 name=$3 process=${4:-} from_file=""
+    case "$status" in
+        ok) from_file="$(nightly_env_value "$file" "$name")" ;;
+        absent) ;;
+        *) printf '0'; return ;;
+    esac
+    printf '%s' "${from_file:-${process:-1}}"
 }
