@@ -1,4 +1,4 @@
-//! `pkg` CLI.
+//! `mecha-graph` CLI.
 
 mod render;
 mod tui;
@@ -3723,7 +3723,7 @@ reject: it was never true (retracted; the class learns)"
                             println!("    ↳ {r}");
                         }
                         println!(
-                            "    confirm: pkg shadow --confirm {u} · refute: pkg shadow --refute {u} --reason '…'",
+                            "    confirm: mecha-graph shadow --confirm {u} · refute: mecha-graph shadow --refute {u} --reason '…'",
                             u = s.fact.uid
                         );
                     }

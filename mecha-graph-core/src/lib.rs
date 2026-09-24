@@ -1,10 +1,10 @@
-//! # pkg-core
+//! # mecha-graph-core
 //!
 //! Personal knowledge graph core: ingest → enrich → resolve+link → retrieve.
 //!
 //! Three rules (spec §2):
-//! 1. pkg-core knows nothing about any agent. No MCP, no harness concepts.
-//! 2. MCP (in `pkg-mcp`) is the portability layer.
+//! 1. mecha-graph-core knows nothing about any agent. No MCP, no harness concepts.
+//! 2. MCP (in `mecha-graph-mcp`) is the portability layer.
 //! 3. Raw stays raw: transcripts live in their original stores; the graph
 //!    holds distilled, linked knowledge with pointers back.
 //!
@@ -49,6 +49,6 @@ pub mod verify;
 
 pub use error::{Error, Result};
 
-/// Re-exports so consumers (pkg-cli, pkg-mcp) use the same versions.
+/// Re-exports so consumers (mecha-graph, mecha-graph-mcp) use the same versions.
 pub use rusqlite;
 pub use toml;

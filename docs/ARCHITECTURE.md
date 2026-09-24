@@ -211,8 +211,8 @@ they have nothing to say:
 
 mecha-graph and mecha (`~/Github/mecha`) are deliberately separate repositories
 with **no compile-time dependency in either direction**. The entire
-interface is the MCP tool namespace (`pkg__kg_search`, `pkg__kg_upsert`,
-…); mecha's own eval suite tests against a *fixture* graph server, not
+interface is the MCP tool namespace (`kg_search`, `kg_upsert`, …, which carry
+their own `kg_` prefix, so a consumer registers them unprefixed); mecha's own eval suite tests against a *fixture* graph server, not
 against mecha-graph itself. Settled 2026-08-12; the reasoning is worth keeping
 because it will be re-litigated.
 

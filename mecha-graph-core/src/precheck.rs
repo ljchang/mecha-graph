@@ -738,7 +738,7 @@ pub fn precheck_pending_with(
     drop(rejected_stmt);
 
     // Semantic rejection memory (review-on-use §5): vectors of HUMAN-
-    // rejected statements, built incrementally by `pkg embed`. The exact
+    // rejected statements, built incrementally by `mecha-graph embed`. The exact
     // set above catches re-proposals verbatim; this catches the paraphrase
     // — same claim, different words — at the same 0.97 threshold the
     // live-fact dedup earned. Human rejects only, enforced at index build.
@@ -1517,7 +1517,7 @@ pub fn precheck_pending_with(
     Ok(report)
 }
 
-// ─── Live-fact near-duplicate pass (`pkg dedupe-facts`) ─────────────────────
+// ─── Live-fact near-duplicate pass (`mecha-graph dedupe-facts`) ─────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FactDupPair {

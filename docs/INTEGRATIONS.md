@@ -238,13 +238,16 @@ docs/OPERATIONS.md (gitignored) for this machine's values:
 # on the laptop — verify the transport first:
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | \
   ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/.cargo/bin/mecha-graph-mcp
+  '$HOME/.cargo/bin/mecha-graph-mcp'
 # expect a single JSON line back ({"id":1,...serverInfo...})
 
 # then register it:
 claude mcp add --scope user graph -- ssh -T -o LogLevel=ERROR examplehost \
-  $HOME/.cargo/bin/mecha-graph-mcp
+  '$HOME/.cargo/bin/mecha-graph-mcp'
 ```
+
+The single quotes matter: they defer `$HOME` to the graph host's shell, so a
+laptop with a different home path still names the host's binary.
 
 Notes: `-T` + `LogLevel=ERROR` keep stdio clean (any motd/banner corrupts
 JSON-RPC); use the absolute binary path (non-login shell, no PATH); writes
@@ -256,9 +259,15 @@ If full offline replicas are ever wanted instead, the uid-based `mecha-graph syn
 design is queued — the schema already carries sync identities.
 
 ### DuckDB
+DuckDB's `sqlite` extension cannot open a SQLCipher file, so an encrypted store
+is read from a plaintext snapshot (a plaintext store can be attached directly):
+
+```bash
+mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
+```
 ```sql
 INSTALL sqlite; LOAD sqlite;
-ATTACH '~/.mecha-graph/graph.db' AS graph (TYPE sqlite);
+ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
 ```
 Read-only analytics; never the system of record. (DuckDB wants a literal
 path — see docs/OPERATIONS.md, gitignored, for this machine's values.)

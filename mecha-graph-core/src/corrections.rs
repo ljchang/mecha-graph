@@ -1,4 +1,4 @@
-//! D3 wiring, pkg side — the error contract's data-repair duties.
+//! D3 wiring, mecha-graph side — the error contract's data-repair duties.
 //!
 //! mecha's session-end distiller ships every correction as an episode
 //! whose meta carries `corrections: [{fact_uid?, wrong?, right?, about?}]`

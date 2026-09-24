@@ -404,7 +404,7 @@ fn sweep_npmi_inner(
                         params![id, fresh],
                     )?;
                     // The old vector describes text that no longer exists;
-                    // dropping it re-queues the fact for `pkg embed`.
+                    // dropping it re-queues the fact for `mecha-graph embed`.
                     conn.execute("DELETE FROM vec_fact WHERE fact_id = ?1", params![id])?;
                 }
                 rep.refreshed += 1;

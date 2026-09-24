@@ -4,7 +4,7 @@
 //! break retrieval, so callers ignore the Result at the call site and the
 //! functions themselves keep to single statements that cannot half-apply.
 //!
-//! `pkg eval` passes `tool: None` and is never recorded: gold queries run
+//! `mecha-graph eval` passes `tool: None` and is never recorded: gold queries run
 //! repeatedly and would corrupt the demand signal (the same reproducibility
 //! rule that makes `mecha eval` force messaging off).
 
@@ -36,7 +36,7 @@ pub fn coverage_flags(pack: &ContextPack) -> Vec<&'static str> {
 pub fn record(conn: &Connection, tool: &str, pack: &ContextPack) -> Result<i64> {
     let flags = coverage_flags(pack);
     // Only empty/ambiguous mark a gap (the deferred-research work queue).
-    // `thin` stays descriptive — §1's division: pkg describes, the model
+    // `thin` stays descriptive — §1's division: mecha-graph describes, the model
     // judges whether one strong item actually answered the question.
     let status = if flags.contains(&"empty") || flags.contains(&"ambiguous") {
         "gap"

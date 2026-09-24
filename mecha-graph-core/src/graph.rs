@@ -1714,7 +1714,7 @@ pub fn merge_nodes(conn: &Connection, keep_id: &str, dup_id: &str) -> Result<()>
 /// Compared with punctuation and spacing normalised away, because an
 /// exact-equality join misses the commonest split there is: "Ada B Lovelace"
 /// and "Ada B. Lovelace" are one person and one period. Such a pair can sit
-/// as two separate nodes while `pkg dups` reports nothing, because the
+/// as two separate nodes while `mecha-graph dups` reports nothing, because the
 /// email pass only matches email-named nodes against name observations and
 /// this pass demanded byte equality — so a punctuation variant was
 /// invisible to both.
@@ -1769,11 +1769,11 @@ pub fn duplicate_person_candidates(conn: &Connection) -> Result<Vec<(String, Str
 /// ALIASES, so an email-named node that once saw a display name can pair
 /// with another email-named node of the same human. Single-token names are
 /// skipped entirely — same policy as `duplicate_person_candidates`, they're
-/// too collision-prone. Candidates are for REVIEW (`pkg merge`, TUI merge
+/// too collision-prone. Candidates are for REVIEW (`mecha-graph merge`, TUI merge
 /// screen); nothing auto-merges.
 ///
 /// Returns (named_node_id, email_node_id, "Name ↔ email") — named node
-/// first, because `pkg dups` suggests the first element as the keep and the
+/// first, because `mecha-graph dups` suggests the first element as the keep and the
 /// named node is the natural keep.
 pub fn email_duplicate_candidates(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let people = get_nodes_by_type(conn, "person", i64::MAX)?;
@@ -2618,7 +2618,7 @@ mod tests {
     #[test]
     fn a_period_does_not_hide_a_duplicate() {
         // The motivating bug: "Ada B Lovelace" and "Ada B. Lovelace" can
-        // sit as separate nodes while `pkg dups` reports nothing, because
+        // sit as separate nodes while `mecha-graph dups` reports nothing, because
         // this pass demanded byte equality and the email pass only looks
         // at email-named nodes.
         let conn = open_memory().unwrap();

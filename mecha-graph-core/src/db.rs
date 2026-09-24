@@ -69,9 +69,9 @@ pub fn resolve_key(db_path: &Path) -> Option<String> {
 ///
 /// Encryption (§10): if `MECHA_GRAPH_DB_KEY` is set or a `db.key` file sits next to
 /// the DB, the database is opened with SQLCipher (raw-key form for keyfiles —
-/// no per-open KDF cost). `pkg encrypt` migrates an existing plaintext DB.
+/// no per-open KDF cost). `mecha-graph encrypt` migrates an existing plaintext DB.
 /// The DuckDB analysis path (§8.4) can't read SQLCipher — use
-/// `pkg decrypt --out <snapshot>` for analytics on an encrypted store.
+/// `mecha-graph decrypt --out <snapshot>` for analytics on an encrypted store.
 pub fn open(path: &Path) -> Result<Connection> {
     register_vec_extension();
 

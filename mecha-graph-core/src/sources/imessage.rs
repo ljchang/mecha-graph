@@ -74,7 +74,7 @@ pub fn normalize_handle(h: &str) -> String {
     }
 }
 
-/// Connectivity probe for `pkg source test`.
+/// Connectivity probe for `mecha-graph source test`.
 pub fn probe(db: &str) -> Result<i64> {
     let conn =
         rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;

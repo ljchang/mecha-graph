@@ -3,10 +3,10 @@
 //! actual rows … deterministic checks first, model only for residue").
 //!
 //! The role itself lives in mecha — judging is conversational work and
-//! pkg stays non-conversational (ARCHITECTURE "Boundaries"). What lives
+//! mecha-graph stays non-conversational (ARCHITECTURE "Boundaries"). What lives
 //! here is the half that needs no model: **dereference the provenance
 //! and report what the rows actually say.** That is data work, and the
-//! data is pkg's.
+//! data is mecha-graph's.
 //!
 //! Why this matters more on a shared graph than anywhere else: every
 //! claim's provenance ref is dereferenceable, so "episode 4471 actually

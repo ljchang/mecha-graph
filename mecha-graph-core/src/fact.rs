@@ -886,7 +886,7 @@ pub fn attach_derivation(conn: &Connection, uid: &str, contributors: &[i64]) -> 
 
 /// Recompute a fact's confidence from its observation trail and store
 /// it. Called after every trail write; also the batch path for
-/// `pkg recompute-confidence`.
+/// `mecha-graph recompute-confidence`.
 pub fn recompute_confidence(conn: &Connection, fact_id: i64) -> Result<f64> {
     // Aggregate-method rows are one derivation, not independent
     // sightings — excluded from support so a derived class's confidence
@@ -1195,7 +1195,7 @@ pub struct ProposedFact {
     #[serde(default)]
     pub confidence: Option<f64>,
     /// Comma-separated labels, e.g. "recommendation,software" — the revisit
-    /// handle (`pkg facts --tag recommendation`).
+    /// handle (`mecha-graph facts --tag recommendation`).
     #[serde(default)]
     pub tags: Option<String>,
     /// Node ids behind `subject`/`object`, set only by producers that

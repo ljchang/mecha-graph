@@ -314,7 +314,7 @@ pub fn ensure_vec_dims(conn: &Connection, dims: usize) -> Result<bool> {
 /// default-width table beside non-default siblings — and sqlite-vec's
 /// dimension-mismatch error names the column, not the cause. The index is
 /// a derivable cache, so on mismatch it is dropped and rebuilt empty; the
-/// next `pkg embed` refills it.
+/// next `mecha-graph embed` refills it.
 pub fn ensure_vec_rejected(conn: &Connection) -> Result<()> {
     use rusqlite::OptionalExtension;
     let Some(dims) = declared_vec_dims(conn)? else {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The mecha-side half of the nightly: everything that needs the CHAT model on
-# llama-server, run after pkg's own sweep has finished with ollama.
+# llama-server, run after mecha-graph's own sweep has finished with ollama.
 #
 #   1. vet    — judge pending candidates in the auto-accept classes
 #   2. precheck --auto-accept --triage — bank the verdicts vet just filed
@@ -20,10 +20,10 @@
 # nothing had filed one. The queue went 3800 → 4275 in a night. vet ran only
 # when a human typed it, so the lane ran on fuel nobody was pouring.
 #
-# It lives here rather than in pkg's nightly for the same reason gossip does:
-# vet is a mecha agent run needing llama-server (8080), while pkg's extraction
+# It lives here rather than in mecha-graph's nightly for the same reason gossip does:
+# vet is a mecha agent run needing llama-server (8080), while mecha-graph's extraction
 # needs ollama, and on unified memory those two contend. This script is the
-# seam between the repos — pkg's nightly stays pure pkg.
+# seam between the repos — mecha-graph's nightly stays pure mecha-graph.
 #
 # Order matters: vet FILES verdicts, precheck CONSUMES them. Running precheck
 # first would bank nothing, which is exactly last night's result.
@@ -38,7 +38,7 @@
 # self-reinforcing loop, on a pool of only nine viable targets.
 #
 # The clean fix is upstream — gossip's own reads should not count as demand —
-# but that is a change to pkg's touch accounting with a schema question
+# but that is a change to mecha-graph's touch accounting with a schema question
 # attached. This is the cheap correct one: skip anything probed in the last
 # GOSSIP_COOLDOWN_DAYS, and it fails open (no history ⇒ nothing excluded).
 #
@@ -132,9 +132,9 @@ for pred in "${DURABLE_PREDICATES[@]}"; do
 done
 
 # ── 2. bank the verdicts ─────────────────────────────────────────────────────
-# pkg's nightly already ran precheck hours ago, before these verdicts existed.
+# mecha-graph's nightly already ran precheck hours ago, before these verdicts existed.
 # This second pass is what turns them into accepts.
-# Same flags as pkg's nightly, under the same toggles, read from the file
+# Same flags as mecha-graph's nightly, under the same toggles, read from the file
 # nightly.sh sources (same path resolution) — cron exports nothing, so an
 # off-switch written in the documented place must reach both halves or it
 # only half works. Only these two are taken, each in a subshell, so nothing

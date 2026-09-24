@@ -662,7 +662,7 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<(String, i64)>> {
 }
 
 /// Episodes carrying a given tag, newest first — the revisit surface
-/// (`pkg episodes --tag recommendation`).
+/// (`mecha-graph episodes --tag recommendation`).
 pub fn episodes_by_tag(conn: &Connection, tag: &str, limit: i64) -> Result<Vec<Episode>> {
     let tag = tag.trim().trim_start_matches('#').to_lowercase();
     let mut stmt = conn.prepare_cached(
@@ -705,7 +705,7 @@ pub fn set_sensitivity(conn: &Connection, episode_id: i64, sensitivity: &str) ->
     Ok(())
 }
 
-// ─── Undo (TUI deletes/edits only — `pkg redact` stays a true delete) ───────
+// ─── Undo (TUI deletes/edits only — `mecha-graph redact` stays a true delete) ───────
 
 fn value_to_json(v: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
     use rusqlite::types::ValueRef::*;
@@ -802,7 +802,7 @@ fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value
     }))
 }
 
-/// Redact with an undo snapshot — the TUI's delete. `pkg redact` (privacy,
+/// Redact with an undo snapshot — the TUI's delete. `mecha-graph redact` (privacy,
 /// §10) calls [`redact_episode`] directly and leaves NO copy behind.
 pub fn redact_episode_undoable(conn: &Connection, uid: &str) -> Result<bool> {
     let id: Option<i64> = conn
@@ -1284,7 +1284,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
 
-        // Lifting the tombstone (pkg tombstone rm) re-opens the door.
+        // Lifting the tombstone (mecha-graph tombstone rm) re-opens the door.
         conn.execute(
             "DELETE FROM episode_tombstone WHERE source = 'note' AND source_id = 'cal-1'",
             [],
