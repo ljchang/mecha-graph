@@ -15,8 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either side of a wrap passed both gates as clean. Each line is now also
   joined to the next — indentation and a leading comment marker stripped,
   whitespace collapsed — and multiword terms are looked for across the join,
-  in the tree, in what each commit adds, and in commit messages. A paragraph
-  break is not joined; path and ref-name lists are not joined either.
+  in the tree, in what each commit adds, and in commit messages — for any
+  term with a space in it, of either kind. A paragraph break, a hunk or file
+  boundary in a commit's additions, and path and ref-name lists are not
+  joined. A file the check cannot read refuses rather than being skipped. (A
+  term split across two breaks is still out of reach.)
 
 - **The denylist gates can no longer pass a term they did not check.** Both
   the pre-push hook and CI read a roster line with no trailing newline, strip

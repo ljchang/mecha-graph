@@ -245,7 +245,10 @@ for c in ${commits[@]+"${commits[@]}"}; do
     # could clear.
     diff=$(git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE') \
         || refuse_read "the changes of commit $c"
-    printf '%s\n' "$diff" | grep '^+' | grep -v '^+++ ' | cut -c2- >"$texts/additions-commit-${c:0:12}"
+    # Added lines only; each hunk or file boundary becomes a blank line, so
+    # the line-break check below never joins two unrelated additions.
+    printf '%s\n' "$diff" | awk '/^(@@|diff )/ { print ""; next } /^\+\+\+ / { next } /^\+/ { print substr($0, 2) }' \
+        >"$texts/additions-commit-${c:0:12}"
     git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
         >"$texts/paths-commit-${c:0:12}" || refuse_read "the changes of commit $c"
     git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}" || refuse_read "commit $c"
@@ -294,8 +297,11 @@ fi
 # "Doe" at the start of the next passed as clean. Each line is joined to the
 # next (indentation and a leading comment marker stripped, whitespace
 # collapsed) and the multiword terms are looked for across the join.
+# Any term with whitespace in it, of either kind: what a wrap can split is a
+# term's words, whatever the roster calls it (a two-word `w` term is as
+# splittable as a `p` one, and has no short-word hazard to guard against).
 multi=()
-for t in ${p_terms[@]+"${p_terms[@]}"}; do
+for t in ${w_terms[@]+"${w_terms[@]}"} ${p_terms[@]+"${p_terms[@]}"}; do
     case "$t" in *[[:space:]]*) multi+=("$t") ;; esac
 done
 join_lines() { # join_lines <file>... → "<file>\t<line> <next line>" for each adjacent pair
@@ -306,14 +312,26 @@ join_lines() { # join_lines <file>... → "<file>\t<line> <next line>" for each 
           if (prev != "" && l != "") print FILENAME, prev " " l
           prev = l }' "$@"
 }
+# 0: a text file to join. 1: binary or empty, rightly skipped. Anything else
+# — unreadable, an I/O error — refuses: a file this check could not read is
+# one it did not check, and a skip would still end in "clean".
+text_file() {
+    local rc=0
+    grep -Iq . "$1" 2>/dev/null || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) refuse_read "$1" ;;
+    esac
+}
 if [ ${#multi[@]} -gt 0 ]; then
     joined="$texts/.joined"
     : >"$joined"
-    add_tree() { # add_tree <dir> <label-prefix-to-strip>: its text files, LICENSE aside
+    add_tree() { # add_tree <dir>: its text files, LICENSE aside
         local f
         while IFS= read -r -d '' f; do
             [ "${f#"$1"/}" = LICENSE ] && continue
-            grep -Iq . "$f" 2>/dev/null || continue
+            text_file "$f" || continue
             join_lines "$f" >>"$joined" || refuse_read "$f"
         done < <(find "$1" -type f -not -path '*/.git/*' -print0)
     }
@@ -321,7 +339,8 @@ if [ ${#multi[@]} -gt 0 ]; then
         # `-z`: paths verbatim — a C-quoted non-ASCII path fails `[ -f ]`.
         while IFS= read -r -d '' f; do
             [ "$f" = LICENSE ] && continue
-            [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
+            [ -f "$f" ] || continue   # not a regular file (a symlink, a removed path)
+            text_file "$f" || continue
             join_lines "$f" >>"$joined" || refuse_read "$f"
         done < <(git ls-files -z -co --exclude-standard)
     else

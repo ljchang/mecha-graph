@@ -99,7 +99,8 @@ jobs:
           for c in "${commits[@]}"; do
             # `:!LICENSE` as in the tree scan: a year bump must not be a hit.
             git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE' \
-              | { grep '^+' || true; } | { grep -v '^+++ ' || true; } | cut -c2- >"$texts/additions-commit-${c:0:12}"
+              | awk '/^(@@|diff )/ { print ""; next } /^\+\+\+ / { next } /^\+/ { print substr($0, 2) }' \
+              >"$texts/additions-commit-${c:0:12}"
             git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
               >"$texts/paths-commit-${c:0:12}"
             git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
@@ -129,7 +130,12 @@ jobs:
           # that did not happen, not a clean one.
           while IFS= read -r -d '' f; do
             [ "$f" = LICENSE ] && continue
-            [ -f "$f" ] && grep -Iq . "$f" 2>/dev/null || continue
+            [ -f "$f" ] || continue
+            # 0: text to join; 1: binary or empty, rightly skipped; anything
+            # else is a file this check could not read — stop, not skip.
+            rc=0; grep -Iq . "$f" 2>/dev/null || rc=$?
+            [ "$rc" -eq 1 ] && continue
+            [ "$rc" -eq 0 ] || { echo "::error::could not read a tracked file for the line-break check"; exit 1; }
             join_lines "$f" >>"$joined" || { echo "::error::could not join the lines of a tracked file"; exit 1; }
           done < <(git ls-files -z)
           for f in "$texts"/additions-* "$texts"/message-*; do
@@ -234,7 +240,9 @@ jobs:
               *) echo "::error::grep failed (exit $rc) on names or messages, roster line $line_no"; exit 1 ;;
             esac
             # A multiword term across a line break — a count only, never where.
-            if [ "$kind" = p ] && [[ "$term" == *[[:space:]]* ]]; then
+            # Any term with whitespace, of either kind: a wrap splits words,
+            # whatever the roster calls the term.
+            if [[ "$term" == *[[:space:]]* ]]; then
               norm=$(printf '%s' "$term" | tr -s '[:space:]' ' ')
               rc=0
               # Distinct sources, not matching pairs: each inner line sits in two
