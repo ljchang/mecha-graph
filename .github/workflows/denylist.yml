@@ -99,10 +99,48 @@ jobs:
           for c in "${commits[@]}"; do
             # `:!LICENSE` as in the tree scan: a year bump must not be a hit.
             git diff-tree -p -r --no-commit-id --no-color -U0 --root -m --first-parent "$c" -- . ':!LICENSE' \
-              | { grep '^+' || true; } | { grep -v '^+++ ' || true; } | cut -c2- >"$texts/additions-commit-${c:0:12}"
+              | awk '/^(@@|diff )/ { print ""; next } /^\+\+\+ / { next } /^\+/ { print substr($0, 2) }' \
+              >"$texts/additions-commit-${c:0:12}"
             git diff-tree -r --no-commit-id --name-only --diff-filter=AR --root -m --first-parent "$c" -- . ':!LICENSE' \
               >"$texts/paths-commit-${c:0:12}"
             git log -1 --format=%B "$c" >"$texts/message-commit-${c:0:12}"
+          done
+
+          # grep is line-oriented, so a `p` term of several words is the one kind
+          # wrapped text can split — and prose here is hard-wrapped at ~75
+          # columns in docs, comments and commit messages alike. Each line is
+          # joined to the next (indentation and a leading comment marker
+          # stripped, whitespace collapsed); multiword terms are looked for
+          # across the join. Path and ref-name lists are not joined: they are
+          # one entry per line, and joining two would only invent a match.
+          joined=$(mktemp)
+          trap 'rm -f "$roster" "$joined"; rm -rf "$texts"' EXIT
+          join_lines() {
+            awk -v OFS='\t' 'FNR == 1 { prev = "" }
+              { l = $0
+                sub(/^[ \t]*(\/\/+!?|#+|\*+|--|;+|>+)?[ \t]*/, "", l)
+                gsub(/[ \t\r]+/, " ", l); sub(/ $/, "", l)
+                if (prev != "" && l != "") print FILENAME, prev " " l
+                prev = l }' "$@"
+          }
+          # `-z`: paths verbatim. Without it `git ls-files` C-quotes a path
+          # holding a non-ASCII byte, `[ -f ]` fails on the quoted form, and
+          # the file would be skipped here while the step still said clean.
+          # A join that fails stops the run: a short joined text is a check
+          # that did not happen, not a clean one.
+          while IFS= read -r -d '' f; do
+            [ "$f" = LICENSE ] && continue
+            [ -f "$f" ] || continue
+            # 0: text to join; 1: binary or empty, rightly skipped; anything
+            # else is a file this check could not read — stop, not skip.
+            rc=0; grep -Iq . "$f" 2>/dev/null || rc=$?
+            [ "$rc" -eq 1 ] && continue
+            [ "$rc" -eq 0 ] || { echo "::error::could not read a tracked file for the line-break check"; exit 1; }
+            join_lines "$f" >>"$joined" || { echo "::error::could not join the lines of a tracked file"; exit 1; }
+          done < <(git ls-files -z)
+          for f in "$texts"/additions-* "$texts"/message-*; do
+            [ -f "$f" ] || continue
+            join_lines "$f" >>"$joined" || { echo "::error::could not join the lines of a commit's text"; exit 1; }
           done
 
           # A `w` term is literal text bounded by anything that is not a letter or
@@ -201,6 +239,23 @@ jobs:
               1) ;;
               *) echo "::error::grep failed (exit $rc) on names or messages, roster line $line_no"; exit 1 ;;
             esac
+            # A multiword term across a line break — a count only, never where.
+            # Any term with whitespace, of either kind: a wrap splits words,
+            # whatever the roster calls the term.
+            if [[ "$term" == *[[:space:]]* ]]; then
+              norm=$(printf '%s' "$term" | tr -s '[:space:]' ' ')
+              rc=0
+              # Distinct sources, not matching pairs: each inner line sits in two
+              # pairs, so a pair count would report one place twice.
+              k=$(grep -iF -e "$norm" "$joined" 2>/dev/null | cut -f1 | sort -u | wc -l) || rc=$?
+              [ "$rc" -eq 0 ] && [ "$k" -eq 0 ] && rc=1
+              case "$rc" in
+                0) echo "::error::DENYLIST HIT (roster line $line_no) across a line break, in $k file(s) or commit(s)"
+                   fail=1 ;;
+                1) ;;
+                *) echo "::error::grep failed (exit $rc) across line breaks, roster line $line_no"; exit 1 ;;
+              esac
+            fi
           done < "$roster"
 
           if [ "$n" -eq 0 ]; then
