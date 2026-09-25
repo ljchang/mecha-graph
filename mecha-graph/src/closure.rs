@@ -72,7 +72,7 @@ pub enum Route {
 pub fn route(
     close_through: Result<Option<&str>, &str>,
     db: &Path,
-    served: &Path,
+    served: Option<&Path>,
     from: &str,
     to: &str,
     path: Option<&OsStr>,
@@ -84,46 +84,47 @@ pub fn route(
     if !crosses_line(from, to) && !reclose {
         return Route::Direct;
     }
+    // The status bar is one row, clipped at the terminal's width, and every
+    // refusal is shown after "nothing was changed: " — so each reason leads
+    // with what matters and stays short (review of #21).
     let program = match close_through {
         Ok(None) => return Route::Direct,
         Ok(Some(p)) => p,
         Err(why) => {
             return Route::Refuse(format!(
-                "the config could not be read ({why}), so whether closures go through \
-                 mecha is unknown"
+                "config unreadable, so whether closures go through mecha is unknown ({why})"
             ))
         }
     };
     if reclose {
         return Route::Refuse(format!(
-            "the task is already {from}, and {from} → {to} would change its closure's \
-             verdict with nothing recorded — reopen it, then close it as {to}"
+            "already {from}; reopen it, then close it as {to} ({from} → {to} would be \
+             recorded nowhere)"
         ));
     }
+    let Some(served) = served else {
+        return Route::Refuse("HOME is unset, so mecha's graph database is unknown".into());
+    };
     if !same_file(db, served) {
         return Route::Refuse(format!(
-            "[board] close_through is set, and this TUI is on {} — not {}, the database \
-             mecha's graph server opens",
+            "this TUI is not on mecha's graph database ({} is not {})",
             db.display(),
             served.display()
         ));
     }
     match find_program(program, path) {
         Some(exe) => Route::Through(exe),
-        None => Route::Refuse(format!(
-            "[board] close_through = {program:?}, and no such program was found"
-        )),
+        None => Route::Refuse(format!("close_through {program:?} not found")),
     }
 }
 
 /// The database mecha's graph server opens: the default path, resolved
 /// without `MECHA_GRAPH_DB` — which is removed from the child's environment
-/// for exactly that reason.
-pub fn served_db(home: Option<&OsStr>) -> PathBuf {
-    let home = home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".mecha-graph").join("graph.db")
+/// for exactly that reason. `None` without a `HOME`: `db::default_db_path`
+/// would fall back to the working directory there, and a guess is not a
+/// database anyone can vouch for.
+pub fn served_db(home: Option<&OsStr>) -> Option<PathBuf> {
+    Some(PathBuf::from(home?).join(".mecha-graph").join("graph.db"))
 }
 
 /// Two paths name the same file. A path that cannot be resolved names
@@ -197,6 +198,8 @@ enum Ended {
     Exited(std::process::ExitStatus),
     /// Still running at the deadline, and stopped.
     TimedOut,
+    /// Started, and then the wait on it failed.
+    Lost(String),
 }
 
 /// [`set_status`], with the wait bounded by `timeout`.
@@ -224,68 +227,83 @@ pub fn set_status_within(
                 .map(|()| String::new())
                 .map_err(|e| e.to_string())
         }
-        Route::Refuse(why) => return Err(format!("{why}; nothing was changed")),
+        // Every message below leads with its verdict: the status bar is one
+        // row clipped at the terminal's width (review of #21).
+        Route::Refuse(why) => return Err(format!("nothing was changed: {why}")),
         Route::Through(exe) => exe,
     };
-    let (ended, stderr) = run_bounded(&exe, &argv(task, to), timeout).map_err(|e| {
-        format!(
-            "{} could not be run ({e}); nothing was changed",
-            exe.display()
-        )
-    })?;
+    let (ended, stderr) = match run_bounded(&exe, &argv(task, to), timeout) {
+        Ok(r) => r,
+        // Refused before the child existed: nothing ran, nothing moved.
+        Err(Spawn::NotStarted(e)) => {
+            return Err(format!(
+                "nothing was changed: {} could not be run ({e})",
+                exe.display()
+            ))
+        }
+        // Started, then lost track of: the board decides, like any ending.
+        Err(Spawn::Lost(e)) => (Ended::Lost(e.to_string()), String::new()),
+    };
+    // The reason is the last line that is not the appraisal: a failure after
+    // the appraisal printed must not be reported as the appraisal.
+    let appraisal = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("mecha's appraisal of "))
+        .and_then(|l| l.split_once(": ").map(|(_, r)| r.trim().to_string()));
     let last = stderr
         .lines()
         .map(str::trim)
-        .rfind(|l| !l.is_empty())
+        .rfind(|l| !l.is_empty() && !l.starts_with("mecha's appraisal of "))
         .unwrap_or("it exited without saying why")
         .to_string();
     // mecha's word is not this board's: read the row back from the database
     // this screen shows, however the child ended.
     let now = gtd::get_task(conn, task)
         .map_err(|e| {
-            format!("mecha ran, and {task} could not be re-read to see whether it moved: {e}")
+            format!("unknown whether it moved: mecha ran, and {task} could not be re-read ({e})")
         })?
         .map(|t| t.status);
     let landed = now.as_deref() == Some(to);
     let reads = now.as_deref().unwrap_or("no such task");
+    let secs = timeout.as_secs();
     match ended {
-        Ended::Exited(status) if status.success() => {
-            if !landed {
-                return Err(format!(
-                    "mecha reported the move, but this board still reads {reads} — its graph \
-                     server may be on another database"
-                ));
-            }
-            let appraisal = stderr
-                .lines()
-                .find_map(|l| l.strip_prefix("mecha's appraisal of "))
-                .and_then(|l| l.split_once(": ").map(|(_, r)| r.trim().to_string()));
-            Ok(match appraisal {
-                Some(a) => format!("recorded by mecha — {a}"),
-                None => "recorded by mecha".to_string(),
-            })
-        }
-        Ended::Exited(_) if landed => Ok(format!(
-            "the move landed, but mecha ended with an error ({last}) — its record of it may \
-             stand uncertain until the task's next status change"
+        Ended::Exited(status) if status.success() && landed => Ok(match appraisal {
+            Some(a) => format!("recorded by mecha — {a}"),
+            None => "recorded by mecha".to_string(),
+        }),
+        Ended::Exited(status) if status.success() => Err(format!(
+            "not on this board: mecha reported the move, but this board reads {reads} — its \
+             graph server may be on another database"
         )),
-        Ended::Exited(_) => Err(format!("mecha refused: {last}")),
+        Ended::Exited(_) if landed => Ok(format!(
+            "landed, record uncertain: mecha ended with an error ({last})"
+        )),
+        Ended::Exited(_) => Err(format!("nothing was changed: mecha refused — {last}")),
         Ended::TimedOut if landed => Ok(format!(
-            "the move landed, but mecha did not finish within {}s and was stopped — its \
-             appraisal may not have run",
-            timeout.as_secs()
+            "landed, appraisal may not have run: mecha was stopped after {secs}s"
         )),
         Ended::TimedOut => Err(format!(
-            "mecha did not finish within {}s and was stopped; this board still reads {reads}",
-            timeout.as_secs()
+            "nothing was changed: mecha was stopped after {secs}s; the board reads {reads}"
+        )),
+        Ended::Lost(e) if landed => Ok(format!("landed, record uncertain: mecha was lost ({e})")),
+        Ended::Lost(e) => Err(format!(
+            "nothing was changed here: mecha was lost ({e}); the board reads {reads}"
         )),
     }
+}
+
+/// Why [`run_bounded`] could not report an ending.
+enum Spawn {
+    /// Before the child existed — its output files, or the spawn itself.
+    NotStarted(std::io::Error),
+    /// After: the wait itself failed.
+    Lost(std::io::Error),
 }
 
 /// Run `exe` with its output in owner-only scratch files, wait for the
 /// process (not its output) up to `timeout`, and hand back how it ended and
 /// what it wrote to stderr.
-fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> std::io::Result<(Ended, String)> {
+fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> Result<(Ended, String), Spawn> {
     use std::os::unix::fs::OpenOptionsExt;
     let stem = std::env::temp_dir().join(format!(
         "mecha-graph-close-{}-{}",
@@ -305,13 +323,20 @@ fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> std::io::Resul
             .args(args)
             .env_remove("MECHA_GRAPH_DB")
             .stdin(std::process::Stdio::null())
-            .stdout(open(&out_path)?)
-            .stderr(open(&err_path)?)
-            .spawn()?;
+            .stdout(open(&out_path).map_err(Spawn::NotStarted)?)
+            .stderr(open(&err_path).map_err(Spawn::NotStarted)?)
+            .spawn()
+            .map_err(Spawn::NotStarted)?;
         let deadline = Instant::now() + timeout;
         let ended = loop {
-            if let Some(status) = child.try_wait()? {
-                break Ended::Exited(status);
+            match child.try_wait() {
+                Ok(Some(status)) => break Ended::Exited(status),
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Spawn::Lost(e));
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -355,7 +380,7 @@ mod tests {
 
     /// The database at the default location under `home`, one open task.
     fn board(home: &Path) -> (Connection, PathBuf, String) {
-        let path = served_db(Some(home.as_os_str()));
+        let path = served_db(Some(home.as_os_str())).unwrap();
         let conn = db::open(&path).unwrap();
         let id = gtd::create_task(&conn, "Book the vendor walkthrough", None, None, None).unwrap();
         gtd::set_task_status(&conn, &id, "next").unwrap();
@@ -373,7 +398,7 @@ mod tests {
     /// empty) after the write and before it exits.
     fn fake_mecha_with(dir: &Path, home: &Path, exit: i32, apply: bool, extra: &str) -> PathBuf {
         let exe = dir.join("bin").join("mecha");
-        let db = served_db(Some(home.as_os_str()));
+        let db = served_db(Some(home.as_os_str())).unwrap();
         let log = dir.join("argv.json");
         let script = format!(
             "#!/usr/bin/env python3\n\
@@ -432,7 +457,14 @@ mod tests {
         let s = scratch("direct");
         let (conn, db, id) = board(&s.0);
         let path = s.0.join("bin");
-        let r = route(Ok(None), &db, &db, "next", "done", Some(path.as_os_str()));
+        let r = route(
+            Ok(None),
+            &db,
+            Some(&db),
+            "next",
+            "done",
+            Some(path.as_os_str()),
+        );
         assert_eq!(r, Route::Direct);
         assert_eq!(set_status(&conn, r, &id, "done"), Ok(String::new()));
         assert_eq!(status(&conn, &id), "done");
@@ -455,7 +487,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -484,7 +516,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "done",
             "next",
             Some(path.as_os_str()),
@@ -502,7 +534,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "waiting",
             Some(path.as_os_str()),
@@ -520,13 +552,13 @@ mod tests {
             let r = route(
                 Ok(Some(program)),
                 &db,
-                &db,
+                Some(&db),
                 "next",
                 "done",
                 Some(path.as_os_str()),
             );
             assert!(
-                matches!(r, Route::Refuse(ref why) if why.contains("no such program")),
+                matches!(r, Route::Refuse(ref why) if why.contains("not found")),
                 "{r:?}"
             );
             let e = set_status(&conn, r, &id, "done").unwrap_err();
@@ -551,7 +583,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &fork,
-            &served,
+            Some(&served),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -578,7 +610,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "done",
             "dropped",
             Some(path.as_os_str()),
@@ -591,12 +623,12 @@ mod tests {
         assert_eq!(status(&conn, &id), "done");
         assert!(logged(&s.0).is_none(), "mecha never ran");
         assert_eq!(
-            route(Ok(None), &db, &db, "done", "dropped", None),
+            route(Ok(None), &db, Some(&db), "done", "dropped", None),
             Route::Direct
         );
         // Re-asserting the same closed status changes no verdict.
         assert_eq!(
-            route(Ok(Some("mecha")), &db, &db, "done", "done", None),
+            route(Ok(Some("mecha")), &db, Some(&db), "done", "done", None),
             Route::Direct
         );
     }
@@ -630,7 +662,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -659,7 +691,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -689,7 +721,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -698,10 +730,40 @@ mod tests {
         let e = set_status_within(&conn, r, &id, "done", Duration::from_secs(1)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(8));
         assert!(
-            e.contains("did not finish") && e.contains("still reads next"),
+            e.contains("stopped after") && e.contains("reads next"),
             "{e}"
         );
         assert_eq!(status(&conn, &id), "next");
+    }
+
+    /// With no `HOME`, the database mecha's server opens is a guess about
+    /// the working directory — unknown, so never a match.
+    #[test]
+    fn with_no_home_the_served_database_is_unknown_and_a_close_refuses() {
+        assert_eq!(served_db(None), None);
+        let s = scratch("nohome");
+        let (_, db, _) = board(&s.0);
+        let r = route(Ok(Some("mecha")), &db, None, "next", "done", None);
+        assert!(
+            matches!(r, Route::Refuse(ref why) if why.contains("HOME is unset")),
+            "{r:?}"
+        );
+    }
+
+    /// Every refusal leads with its verdict: the status bar is one row,
+    /// clipped at the terminal's width.
+    #[test]
+    fn a_refusal_leads_with_its_verdict() {
+        let s = scratch("verdict");
+        let (conn, db, id) = board(&s.0);
+        let e = set_status(
+            &conn,
+            route(Ok(Some("mecha")), &db, None, "next", "done", None),
+            &id,
+            "done",
+        )
+        .unwrap_err();
+        assert!(e.starts_with("nothing was changed: "), "{e}");
     }
 
     /// A config that cannot be read cannot say whether the owner opted in:
@@ -710,7 +772,7 @@ mod tests {
     fn an_unreadable_config_refuses_a_close() {
         let s = scratch("config");
         let (conn, db, id) = board(&s.0);
-        let r = route(Err("bad toml"), &db, &db, "next", "done", None);
+        let r = route(Err("bad toml"), &db, Some(&db), "next", "done", None);
         assert!(
             matches!(r, Route::Refuse(ref why) if why.contains("bad toml")),
             "{r:?}"
@@ -719,7 +781,7 @@ mod tests {
         assert_eq!(status(&conn, &id), "next");
         // An open-to-open move needs no answer to that question.
         assert_eq!(
-            route(Err("bad toml"), &db, &db, "next", "waiting", None),
+            route(Err("bad toml"), &db, Some(&db), "next", "waiting", None),
             Route::Direct
         );
     }
@@ -739,7 +801,7 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
@@ -752,12 +814,12 @@ mod tests {
         let r = route(
             Ok(Some("mecha")),
             &db,
-            &db,
+            Some(&db),
             "next",
             "done",
             Some(path.as_os_str()),
         );
         let e = set_status(&conn, r, &id, "done").unwrap_err();
-        assert!(e.contains("still reads next"), "{e}");
+        assert!(e.contains("reads next"), "{e}");
     }
 }

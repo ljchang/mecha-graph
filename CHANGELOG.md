@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The TUI can close tasks through mecha, when you opt in.** With
+  `[board] close_through = "mecha"` (or a path to it) in
+  `~/.mecha-graph/config.toml`, closing a task (`d`, `x`) or reopening one runs
+  `mecha tasks set … --surface graph-tui`, so mecha records and appraises the
+  move. The route never falls back: a missing program, an unreadable config, a
+  TUI on any database but the default, or `done` ↔ `dropped` (a verdict change
+  mecha has no record for) refuses with nothing changed, and the row is read
+  back after mecha answers, however it answered. Without the key nothing is
+  different — the direct write, as before.
+
 ### Fixed
 
 - **A multiword denylist term split across a line break is caught.** grep

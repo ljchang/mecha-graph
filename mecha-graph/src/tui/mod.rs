@@ -2768,7 +2768,7 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_co
                         .map(Option::as_deref)
                         .map_err(String::as_str),
                     &app.db_path,
-                    &crate::closure::served_db(std::env::var_os("HOME").as_deref()),
+                    crate::closure::served_db(std::env::var_os("HOME").as_deref()).as_deref(),
                     from,
                     status,
                     std::env::var_os("PATH").as_deref(),
