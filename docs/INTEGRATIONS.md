@@ -37,7 +37,6 @@ need zero config.
 | llama-server (embed + extract) | infra | none (localhost) | ✅ shared with mecha; :8080 chat, :8081 embed |
 | Hermes (agent) | consumer | none (local stdio MCP) | ✅ wired |
 | Claude Code (agent) | consumer | none (local stdio MCP) | ✅ wired |
-| DuckDB analytics | consumer | none (reads the SQLite file) | ✅ |
 | DB encryption | infra | local keyfile (auto) | ✅ SQLCipher, enabled 2026-08-02 |
 | Email (live OAuth) | source | OAuth — lives in FlowMail/macOS | ⏳ FlowMail-side, by design |
 
@@ -153,7 +152,7 @@ geometry, KV arithmetic, the measured `-np` table, and the request contract.
   plaintext; see docs/OPERATIONS.md (gitignored) for this machine's
   values. `mecha-graph encrypt` migrated the store in place with count
   verification; `mecha-graph decrypt --out <path>` writes an ephemeral plaintext
-  snapshot for DuckDB analytics.
+  snapshot for a tool that cannot read SQLCipher.
 - **Back up the keyfile separately from the DB file** (e.g. a password
   manager) — without it the graph is unrecoverable; with only it, an
   attacker still needs the DB file.
@@ -210,8 +209,8 @@ removed before ever being used — see git history if it's ever wanted again):
    machine's values.
 
 Backups: copy `graph.db` (it's ciphertext at rest) + keep the keyfile in
-the password manager. `mecha-graph decrypt --out` produces plaintext snapshots for
-DuckDB — treat those as ephemeral.
+the password manager. `mecha-graph decrypt --out` produces plaintext snapshots; treat
+those as ephemeral.
 
 ## Consumers (MCP)
 
@@ -257,23 +256,6 @@ extracted facts stage on the next nightly.
 Multiple simultaneous clients are fine (SQLite WAL + busy_timeout).
 If full offline replicas are ever wanted instead, the uid-based `mecha-graph sync`
 design is queued — the schema already carries sync identities.
-
-### DuckDB
-DuckDB's `sqlite` extension cannot open a SQLCipher file, so an encrypted store
-is read from a plaintext snapshot (a plaintext store can be attached directly):
-
-```bash
-mecha-graph decrypt --out ~/.mecha-graph/analytics.db   # plaintext snapshot
-```
-```sql
-INSTALL sqlite; LOAD sqlite;
-ATTACH '/home/you/.mecha-graph/analytics.db' AS graph (TYPE sqlite);
-```
-The snapshot goes inside the store's own 0700 directory rather than `/tmp`:
-it is the whole graph in plaintext, and it is only chmod 600 once the copy
-has verified. Delete it when you are done.
-Read-only analytics; never the system of record. (DuckDB wants a literal
-path — see docs/OPERATIONS.md, gitignored, for this machine's values.)
 
 ## The credentialed sources in detail
 

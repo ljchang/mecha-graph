@@ -763,7 +763,7 @@ enum Command {
         #[arg(long)]
         purge_backup: bool,
     },
-    /// Write a plaintext snapshot (for DuckDB analytics on an encrypted DB)
+    /// Write a plaintext snapshot of an encrypted DB, for tools that cannot read SQLCipher
     Decrypt {
         #[arg(long)]
         out: PathBuf,
