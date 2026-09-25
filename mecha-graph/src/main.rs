@@ -1,5 +1,6 @@
 //! `mecha-graph` CLI.
 
+mod closure;
 mod render;
 mod tui;
 
@@ -2197,7 +2198,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
         }
 
         Command::Tui => {
-            tui::run(conn)?;
+            tui::run(conn, db_path.clone())?;
         }
 
         Command::Facts { tag, limit } => {

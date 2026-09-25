@@ -108,6 +108,33 @@ impl LlmConfig {
     }
 }
 
+/// `[board]` — how the task board's own interface (`mecha-graph tui`) moves a
+/// task across the open/closed line.
+///
+/// Empty is the standalone install, and it is the default: `done`, `dropped`
+/// and a reopen are written straight to this database, as they always were.
+/// Like `[llm] model_path`, the one field here is a permission granted by
+/// being **explicitly configured**, never discovered — nothing probes for a
+/// harness, and this crate still knows nothing about one (lib.rs rule 1): it
+/// holds a command, and what that command is for is the TUI's business.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BoardConfig {
+    /// A program that closes and reopens tasks on this board's behalf, so
+    /// the move is recorded where that program records moves — a name on
+    /// `PATH` (`"mecha"`) or a path. Set, the TUI hands every close and
+    /// reopen to it and **never falls back** to the direct write: a missing
+    /// program, or a database other than the default one, refuses the move
+    /// with nothing changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_through: Option<String>,
+}
+
+impl BoardConfig {
+    fn is_empty(&self) -> bool {
+        self.close_through.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -116,6 +143,9 @@ pub struct Config {
     /// `[llm]` table into every existing config on the next save.
     #[serde(default, skip_serializing_if = "LlmConfig::is_empty")]
     pub llm: LlmConfig,
+    /// Skipped when empty for the same reason as `llm`.
+    #[serde(default, skip_serializing_if = "BoardConfig::is_empty")]
+    pub board: BoardConfig,
 }
 
 pub fn config_path() -> PathBuf {
@@ -441,5 +471,23 @@ pub fn sync_source(
             Ok(report)
         }
         other => Err(Error::Other(format!("unknown source kind '{other}'"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `[board] close_through` is read when present, and an unset board
+    /// writes no table — `source add` must not start writing an inert
+    /// `[board]` into every config, nor opt anyone in.
+    #[test]
+    fn the_board_opt_in_is_read_and_an_empty_one_is_not_written() {
+        let c: Config = toml::from_str("[board]\nclose_through = \"mecha\"\n").unwrap();
+        assert_eq!(c.board.close_through.as_deref(), Some("mecha"));
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.board.close_through, None);
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("board"), "{written}");
     }
 }

@@ -438,6 +438,9 @@ struct GtdState {
 
 struct App {
     conn: Connection,
+    /// The database `conn` is open on — what a close routed through mecha
+    /// (`crate::closure`) must prove is the one mecha's graph server opens.
+    db_path: std::path::PathBuf,
     embedder: Option<mecha_graph_core::embed::Embedder>,
     screen: Screen,
     review: ReviewState,
@@ -462,12 +465,13 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
     ]
 }
 
-pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
+pub fn run(conn: Connection, db_path: std::path::PathBuf) -> mecha_graph_core::Result<()> {
     let embedder = mecha_graph_core::embed::Embedder::default();
     let embedder = embedder.available().then_some(embedder);
 
     let mut app = App {
         conn,
+        db_path,
         embedder,
         screen: Screen::Review,
         review: ReviewState {
@@ -2747,12 +2751,34 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_co
             .and_then(|i| app.gtd.items.get(i))
             .map(|t| (t.node_id.clone(), t.name.clone()));
         if let Some((id, name)) = task {
-            match gtd::set_task_status(&app.conn, &id, status) {
-                Ok(()) => {
-                    app.status = format!("{status}: {}", name.chars().take(50).collect::<String>())
-                }
-                Err(e) => app.status = format!("status change failed: {e}"),
-            }
+            // The status going in is read from the database now, not from
+            // the row this screen rendered: another surface may have closed
+            // the task since, and a move that looks open-to-open here would
+            // then be an unrecorded reopen.
+            let from = gtd::get_task(&app.conn, &id)?.map(|t| t.status);
+            let close_through = mecha_graph_core::integrations::load_config()
+                .map(|c| c.board.close_through)
+                .map_err(|e| e.to_string());
+            let route = match &from {
+                None => crate::closure::Route::Refuse(format!("{id} is no longer a task")),
+                Some(from) => crate::closure::route(
+                    close_through
+                        .as_ref()
+                        .map(Option::as_deref)
+                        .map_err(String::as_str),
+                    &app.db_path,
+                    &crate::closure::served_db(std::env::var_os("HOME").as_deref()),
+                    from,
+                    status,
+                    std::env::var_os("PATH").as_deref(),
+                ),
+            };
+            let name: String = name.chars().take(50).collect();
+            app.status = match crate::closure::set_status(&app.conn, route, &id, status) {
+                Ok(note) if note.is_empty() => format!("{status}: {name}"),
+                Ok(note) => format!("{status}: {name} — {note}"),
+                Err(e) => format!("status change failed: {e}"),
+            };
             app.reload_gtd()?;
         }
         Ok(())
