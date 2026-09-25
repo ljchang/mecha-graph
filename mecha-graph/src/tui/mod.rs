@@ -2755,13 +2755,14 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_co
             // the row this screen rendered: another surface may have closed
             // the task since, and a move that looks open-to-open here would
             // then be an unrecorded reopen.
-            let from = gtd::get_task(&app.conn, &id)?.map(|t| t.status);
+            let from = gtd::get_task(&app.conn, &id).map(|t| t.map(|t| t.status));
             let close_through = mecha_graph_core::integrations::load_config()
                 .map(|c| c.board.close_through)
                 .map_err(|e| e.to_string());
             let route = match &from {
-                None => crate::closure::Route::Refuse(format!("{id} is no longer a task")),
-                Some(from) => crate::closure::route(
+                Err(e) => crate::closure::Route::Refuse(format!("{id} could not be read ({e})")),
+                Ok(None) => crate::closure::Route::Refuse(format!("{id} is no longer a task")),
+                Ok(Some(from)) => crate::closure::route(
                     close_through
                         .as_ref()
                         .map(Option::as_deref)

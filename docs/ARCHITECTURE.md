@@ -234,7 +234,9 @@ landed here. What the opt-in changes, and what it does not:
   config, or a TUI on any database but the default one (a fork, another
   `--db`) refuses the move with nothing written. The child runs without
   `MECHA_GRAPH_DB`, so the server it starts opens the default database — the
-  one the TUI must be on.
+  one the TUI must be on. `done` ↔ `dropped` is refused too: it crosses no
+  line, so mecha would record nothing, yet it changes a recorded closure's
+  verdict — reopen, then close.
 - **Still no compile-time dependency either way**, and `mecha-graph-core`
   still knows nothing about any agent: it parses a command string; the argv
   and the `graph-tui` surface live in the `mecha-graph` binary

@@ -12,7 +12,9 @@
 //! ```
 //!
 //! and nothing else is. Moves between open statuses (`next` → `waiting`) stay
-//! direct writes: they are not verdicts, and mecha records none.
+//! direct writes: they are not verdicts, and mecha records none. `done` ↔
+//! `dropped` is the other way round — a verdict change mecha records no move
+//! for — so, opted in, it is refused: reopen, then close.
 //!
 //! **Opted in, the route never degrades.** A program that cannot be found, a
 //! config that cannot be read, or a database other than the one mecha's graph
@@ -74,7 +76,11 @@ pub fn route(
     to: &str,
     path: Option<&OsStr>,
 ) -> Route {
-    if !crosses_line(from, to) {
+    // `done` ↔ `dropped` crosses no line, so mecha records nothing for it —
+    // yet it changes the verdict a recorded closure carries. Opted in, it is
+    // refused below rather than written behind the record's back.
+    let reclose = is_closed(from) && is_closed(to) && from != to;
+    if !crosses_line(from, to) && !reclose {
         return Route::Direct;
     }
     let program = match close_through {
@@ -87,6 +93,12 @@ pub fn route(
             ))
         }
     };
+    if reclose {
+        return Route::Refuse(format!(
+            "the task is already {from}, and {from} → {to} would change its closure's \
+             verdict with nothing recorded — reopen it, then close it as {to}"
+        ));
+    }
     if !same_file(db, served) {
         return Route::Refuse(format!(
             "[board] close_through is set, and this TUI is on {} — not {}, the database \
@@ -122,20 +134,29 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// A program named with a slash is that file; a bare name is looked up on
-/// `path`, as a shell would.
+/// A program named with a slash is that file (a leading `~/` is the home
+/// directory, as a shell would read it); a bare name is looked up on `path`.
 fn find_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     let program = program.trim();
     if program.is_empty() {
         return None;
     }
     if program.contains('/') {
-        let p = PathBuf::from(program);
+        let p = expand_home(program, std::env::var_os("HOME").as_deref())?;
         return is_executable(&p).then_some(p);
     }
     std::env::split_paths(path?)
         .map(|dir| dir.join(program))
         .find(|p| is_executable(p))
+}
+
+/// `~/x` under `home`; any other path as written. `~/` with no home names
+/// nothing.
+fn expand_home(program: &str, home: Option<&OsStr>) -> Option<PathBuf> {
+    match program.strip_prefix("~/") {
+        Some(rest) => Some(PathBuf::from(home?).join(rest)),
+        None => Some(PathBuf::from(program)),
+    }
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -440,6 +461,56 @@ mod tests {
         assert!(set_status(&conn, r, &id, "done").is_err());
         assert_eq!(status(&conn, &id), "next");
         assert!(logged(&s.0).is_none(), "mecha never ran");
+    }
+
+    /// `done` → `dropped` crosses no line, so mecha would record nothing, yet
+    /// it changes a recorded closure's verdict: opted in, it is refused and
+    /// nothing is written; not opted in, it stays the direct write.
+    #[test]
+    fn opted_in_a_closed_task_is_not_reclosed_behind_the_record() {
+        let s = scratch("reclose");
+        let (conn, db, id) = board(&s.0);
+        gtd::set_task_status(&conn, &id, "done").unwrap();
+        fake_mecha(&s.0, &s.0, 0, true);
+        let path = s.0.join("bin");
+        let r = route(
+            Ok(Some("mecha")),
+            &db,
+            &db,
+            "done",
+            "dropped",
+            Some(path.as_os_str()),
+        );
+        assert!(
+            matches!(r, Route::Refuse(ref why) if why.contains("reopen it")),
+            "{r:?}"
+        );
+        assert!(set_status(&conn, r, &id, "dropped").is_err());
+        assert_eq!(status(&conn, &id), "done");
+        assert!(logged(&s.0).is_none(), "mecha never ran");
+        assert_eq!(
+            route(Ok(None), &db, &db, "done", "dropped", None),
+            Route::Direct
+        );
+        // Re-asserting the same closed status changes no verdict.
+        assert_eq!(
+            route(Ok(Some("mecha")), &db, &db, "done", "done", None),
+            Route::Direct
+        );
+    }
+
+    #[test]
+    fn a_home_relative_program_is_read_as_a_shell_would() {
+        let home = OsStr::new("/home/someone");
+        assert_eq!(
+            expand_home("~/.cargo/bin/mecha", Some(home)),
+            Some(PathBuf::from("/home/someone/.cargo/bin/mecha"))
+        );
+        assert_eq!(expand_home("~/.cargo/bin/mecha", None), None);
+        assert_eq!(
+            expand_home("/usr/local/bin/mecha", None),
+            Some(PathBuf::from("/usr/local/bin/mecha"))
+        );
     }
 
     /// A config that cannot be read cannot say whether the owner opted in:
