@@ -36,6 +36,7 @@ use mecha_graph_core::gtd;
 use mecha_graph_core::rusqlite::Connection;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The surface mecha records a closure from this TUI under.
 pub const SURFACE: &str = "graph-tui";
@@ -179,10 +180,44 @@ pub fn argv(task: &str, to: &str) -> Vec<String> {
     a
 }
 
+/// How long a close through mecha may take before it is stopped. It starts a
+/// graph server and appraises the closure — seconds, normally; the bound is
+/// for a child that never answers, since the TUI waits on it.
+pub const TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Make one status change the way [`route`] says, and answer with the line
 /// the status bar shows — `Err` when nothing changed or when what changed
 /// cannot be confirmed.
 pub fn set_status(conn: &Connection, route: Route, task: &str, to: &str) -> Result<String, String> {
+    set_status_within(conn, route, task, to, TIMEOUT)
+}
+
+/// How the program ended.
+enum Ended {
+    Exited(std::process::ExitStatus),
+    /// Still running at the deadline, and stopped.
+    TimedOut,
+}
+
+/// [`set_status`], with the wait bounded by `timeout`.
+///
+/// **Every ending is checked against this board**, not only success: mecha
+/// can move the board and then fail (its "outcome unknown" path), and a
+/// failure taken on its word would tell the owner nothing changed while a
+/// retry — now `done` to `done`, which routes direct — reported a success
+/// mecha never saw.
+///
+/// The child's output goes to files, never pipes: a pipe is only at its end
+/// when *every* holder closes it, and a graph server the child started could
+/// hold it past the child's own exit, freezing the TUI on the alternate
+/// screen. The wait is on the child process itself, with a deadline.
+pub fn set_status_within(
+    conn: &Connection,
+    route: Route,
+    task: &str,
+    to: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let exe = match route {
         Route::Direct => {
             return gtd::set_task_status(conn, task, to)
@@ -192,46 +227,105 @@ pub fn set_status(conn: &Connection, route: Route, task: &str, to: &str) -> Resu
         Route::Refuse(why) => return Err(format!("{why}; nothing was changed")),
         Route::Through(exe) => exe,
     };
-    let out = std::process::Command::new(&exe)
-        .args(argv(task, to))
-        .env_remove("MECHA_GRAPH_DB")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| {
-            format!(
-                "{} could not be run ({e}); nothing was changed",
-                exe.display()
-            )
-        })?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        let last = stderr
-            .lines()
-            .map(str::trim)
-            .rfind(|l| !l.is_empty())
-            .unwrap_or("it exited without saying why");
-        return Err(format!("mecha refused: {last}"));
-    }
-    // mecha's word is not this board's: read the row back from the database
-    // this screen shows, so a server that was on another one is caught.
-    let now = gtd::get_task(conn, task)
-        .map_err(|e| format!("mecha reported the move, and {task} could not be re-read: {e}"))?
-        .map(|t| t.status);
-    if now.as_deref() != Some(to) {
-        return Err(format!(
-            "mecha reported the move, but this board still reads {} — its graph server may \
-             be on another database",
-            now.as_deref().unwrap_or("no such task")
-        ));
-    }
-    let appraisal = stderr
+    let (ended, stderr) = run_bounded(&exe, &argv(task, to), timeout).map_err(|e| {
+        format!(
+            "{} could not be run ({e}); nothing was changed",
+            exe.display()
+        )
+    })?;
+    let last = stderr
         .lines()
-        .find_map(|l| l.strip_prefix("mecha's appraisal of "))
-        .and_then(|l| l.split_once(": ").map(|(_, r)| r.trim().to_string()));
-    Ok(match appraisal {
-        Some(a) => format!("recorded by mecha — {a}"),
-        None => "recorded by mecha".to_string(),
-    })
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("it exited without saying why")
+        .to_string();
+    // mecha's word is not this board's: read the row back from the database
+    // this screen shows, however the child ended.
+    let now = gtd::get_task(conn, task)
+        .map_err(|e| {
+            format!("mecha ran, and {task} could not be re-read to see whether it moved: {e}")
+        })?
+        .map(|t| t.status);
+    let landed = now.as_deref() == Some(to);
+    let reads = now.as_deref().unwrap_or("no such task");
+    match ended {
+        Ended::Exited(status) if status.success() => {
+            if !landed {
+                return Err(format!(
+                    "mecha reported the move, but this board still reads {reads} — its graph \
+                     server may be on another database"
+                ));
+            }
+            let appraisal = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("mecha's appraisal of "))
+                .and_then(|l| l.split_once(": ").map(|(_, r)| r.trim().to_string()));
+            Ok(match appraisal {
+                Some(a) => format!("recorded by mecha — {a}"),
+                None => "recorded by mecha".to_string(),
+            })
+        }
+        Ended::Exited(_) if landed => Ok(format!(
+            "the move landed, but mecha ended with an error ({last}) — its record of it may \
+             stand uncertain until the task's next status change"
+        )),
+        Ended::Exited(_) => Err(format!("mecha refused: {last}")),
+        Ended::TimedOut if landed => Ok(format!(
+            "the move landed, but mecha did not finish within {}s and was stopped — its \
+             appraisal may not have run",
+            timeout.as_secs()
+        )),
+        Ended::TimedOut => Err(format!(
+            "mecha did not finish within {}s and was stopped; this board still reads {reads}",
+            timeout.as_secs()
+        )),
+    }
+}
+
+/// Run `exe` with its output in owner-only scratch files, wait for the
+/// process (not its output) up to `timeout`, and hand back how it ended and
+/// what it wrote to stderr.
+fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> std::io::Result<(Ended, String)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let stem = std::env::temp_dir().join(format!(
+        "mecha-graph-close-{}-{}",
+        std::process::id(),
+        mecha_graph_core::ids::new_uid()
+    ));
+    let (out_path, err_path) = (stem.with_extension("out"), stem.with_extension("err"));
+    let open = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(p)
+    };
+    let result = (|| {
+        let mut child = std::process::Command::new(exe)
+            .args(args)
+            .env_remove("MECHA_GRAPH_DB")
+            .stdin(std::process::Stdio::null())
+            .stdout(open(&out_path)?)
+            .stderr(open(&err_path)?)
+            .spawn()?;
+        let deadline = Instant::now() + timeout;
+        let ended = loop {
+            if let Some(status) = child.try_wait()? {
+                break Ended::Exited(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Ended::TimedOut;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        Ok((ended, stderr))
+    })();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    result
 }
 
 #[cfg(test)]
@@ -272,19 +366,27 @@ mod tests {
     /// server — writes the status to the default database under `home`,
     /// unless `apply` is false.
     fn fake_mecha(dir: &Path, home: &Path, exit: i32, apply: bool) -> PathBuf {
+        fake_mecha_with(dir, home, exit, apply, "")
+    }
+
+    /// [`fake_mecha`], running the Python statement `extra` (one line, or
+    /// empty) after the write and before it exits.
+    fn fake_mecha_with(dir: &Path, home: &Path, exit: i32, apply: bool, extra: &str) -> PathBuf {
         let exe = dir.join("bin").join("mecha");
         let db = served_db(Some(home.as_os_str()));
         let log = dir.join("argv.json");
         let script = format!(
             "#!/usr/bin/env python3\n\
-             import json, os, sqlite3, sys\n\
+             import json, os, sqlite3, subprocess, sys, time\n\
              a = sys.argv[1:]\n\
              json.dump({{'argv': a, 'db_env': os.environ.get('MECHA_GRAPH_DB')}}, open({log:?}, 'w'))\n\
-             if {apply} and {exit} == 0:\n\
+             if {apply}:\n\
              \x20   c = sqlite3.connect({db:?})\n\
              \x20   c.execute('UPDATE task_detail SET status = ? WHERE node_id = ?', (a[a.index('--status') + 1], a[2]))\n\
              \x20   c.commit()\n\
+             if {apply} and {exit} == 0:\n\
              \x20   sys.stderr.write(\"mecha's appraisal of %s: pride · +0.5\\n\" % a[2])\n\
+             {extra}\n\
              if {exit} != 0:\n\
              \x20   sys.stderr.write('mecha: task-x is already done — nothing was changed\\n')\n\
              sys.exit({exit})\n",
@@ -511,6 +613,95 @@ mod tests {
             expand_home("/usr/local/bin/mecha", None),
             Some(PathBuf::from("/usr/local/bin/mecha"))
         );
+    }
+
+    /// mecha can move the board and then fail (its unknown-outcome path): the
+    /// board, re-read, is the answer — "landed", not "refused".
+    #[test]
+    fn a_failure_after_the_move_landed_is_reported_as_landed() {
+        if !python() {
+            eprintln!("skipping: no python3 for the stand-in mecha");
+            return;
+        }
+        let s = scratch("landed");
+        let (conn, db, id) = board(&s.0);
+        fake_mecha(&s.0, &s.0, 1, true);
+        let path = s.0.join("bin");
+        let r = route(
+            Ok(Some("mecha")),
+            &db,
+            &db,
+            "next",
+            "done",
+            Some(path.as_os_str()),
+        );
+        let line = set_status(&conn, r, &id, "done").unwrap();
+        assert!(
+            line.contains("landed") && line.contains("ended with an error"),
+            "{line}"
+        );
+        assert_eq!(status(&conn, &id), "done");
+    }
+
+    /// A process mecha started that outlives it — its graph server — holds
+    /// whatever mecha's stderr was. On a pipe that is an end that never
+    /// comes; the wait is on the child, so the TUI is not frozen.
+    #[test]
+    fn a_process_left_holding_the_output_does_not_hold_the_tui() {
+        if !python() {
+            eprintln!("skipping: no python3 for the stand-in mecha");
+            return;
+        }
+        let s = scratch("linger");
+        let (conn, db, id) = board(&s.0);
+        fake_mecha_with(&s.0, &s.0, 0, true, "subprocess.Popen(['sleep', '15'])");
+        let path = s.0.join("bin");
+        let r = route(
+            Ok(Some("mecha")),
+            &db,
+            &db,
+            "next",
+            "done",
+            Some(path.as_os_str()),
+        );
+        let started = Instant::now();
+        let line = set_status(&conn, r, &id, "done").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "waited {:?} on a lingering holder",
+            started.elapsed()
+        );
+        assert!(line.contains("pride"), "{line}");
+    }
+
+    /// A child that never finishes is stopped at the deadline, and the board
+    /// says what happened.
+    #[test]
+    fn a_child_that_never_finishes_is_stopped_at_the_deadline() {
+        if !python() {
+            eprintln!("skipping: no python3 for the stand-in mecha");
+            return;
+        }
+        let s = scratch("hang");
+        let (conn, db, id) = board(&s.0);
+        fake_mecha_with(&s.0, &s.0, 0, false, "time.sleep(30)");
+        let path = s.0.join("bin");
+        let r = route(
+            Ok(Some("mecha")),
+            &db,
+            &db,
+            "next",
+            "done",
+            Some(path.as_os_str()),
+        );
+        let started = Instant::now();
+        let e = set_status_within(&conn, r, &id, "done", Duration::from_secs(1)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(
+            e.contains("did not finish") && e.contains("still reads next"),
+            "{e}"
+        );
+        assert_eq!(status(&conn, &id), "next");
     }
 
     /// A config that cannot be read cannot say whether the owner opted in:
