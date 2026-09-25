@@ -216,6 +216,39 @@ their own `kg_` prefix, so a consumer registers them unprefixed); mecha's own ev
 against mecha-graph itself. Settled 2026-08-12; the reasoning is worth keeping
 because it will be re-litigated.
 
+**One opt-in runtime dependency, and only the TUI holds it** (ruled
+2026-09-25, mecha's `APPRAISAL-WIRING-DESIGN.md` row 1c, option A3). A task
+moved to `done` or `dropped`, or reopened, is a verdict mecha records on its
+closure record and appraises; the TUI's status keys used to write it
+straight here, where mecha never saw it. With `[board] close_through =
+"mecha"` in `~/.mecha-graph/config.toml`, the TUI hands exactly those moves
+to `mecha tasks set <task> --status <s> --surface graph-tui` (`--only-open`
+on a close) and writes nothing itself; mecha's own graph server makes the
+write through `kg_task_update`, and the TUI reads the row back to confirm it
+landed here. What the opt-in changes, and what it does not:
+
+- **Without it, nothing is different.** No code looks for mecha; standalone
+  installs keep the direct write. Moves between open statuses stay direct
+  even when opted in — they are not verdicts.
+- **With it, the route never degrades.** A missing program, an unreadable
+  config, or a TUI on any database but the default one (a fork, another
+  `--db`) refuses the move with nothing written. The child runs without
+  `MECHA_GRAPH_DB`, so the server it starts opens the default database — the
+  one the TUI must be on. `done` ↔ `dropped` is refused too: it crosses no
+  line, so mecha would record nothing, yet it changes a recorded closure's
+  verdict — reopen, then close.
+- **Still no compile-time dependency either way**, and `mecha-graph-core`
+  still knows nothing about any agent: it parses a command string; the argv
+  and the `graph-tui` surface live in the `mecha-graph` binary
+  (`src/closure.rs`). The CLI and the MCP server are unchanged — the MCP
+  server *is* the write path mecha uses.
+- **It is a config key, not an environment variable**, on the `[llm]
+  model_path` precedent: a permission granted by being explicitly
+  configured. The environment variables here name locations and secrets; an
+  opt-in carried in the environment would be lost by the next shell that
+  did not export it, and silently reverting to the direct write is the
+  failure the opt-in exists to prevent.
+
 ### Why separate
 
 **Durability asymmetry — the decisive argument.** mecha-graph holds an

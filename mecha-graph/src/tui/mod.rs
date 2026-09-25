@@ -438,6 +438,12 @@ struct GtdState {
 
 struct App {
     conn: Connection,
+    /// The database `conn` is open on — what a close routed through mecha
+    /// (`crate::closure`) must prove is the one mecha's graph server opens.
+    db_path: std::path::PathBuf,
+    /// A board move routed through mecha, run by the event loop once the
+    /// frame saying so has been drawn.
+    pending_close: Option<PendingClose>,
     embedder: Option<mecha_graph_core::embed::Embedder>,
     screen: Screen,
     review: ReviewState,
@@ -462,12 +468,14 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
     ]
 }
 
-pub fn run(conn: Connection) -> mecha_graph_core::Result<()> {
+pub fn run(conn: Connection, db_path: std::path::PathBuf) -> mecha_graph_core::Result<()> {
     let embedder = mecha_graph_core::embed::Embedder::default();
     let embedder = embedder.available().then_some(embedder);
 
     let mut app = App {
         conn,
+        db_path,
+        pending_close: None,
         embedder,
         screen: Screen::Review,
         review: ReviewState {
@@ -569,6 +577,52 @@ fn io_err(e: std::io::Error) -> mecha_graph_core::Error {
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// A board move waiting to be handed to mecha (`crate::closure`).
+struct PendingClose {
+    exe: std::path::PathBuf,
+    id: String,
+    name: String,
+    status: String,
+}
+
+/// Run a close through mecha, say how it ended, and discard every key that
+/// arrived while it ran: the owner typed them at a frame that no longer
+/// matches the board, and a replayed `d` would close whichever task the
+/// reload slid under the cursor — a verdict mecha would then record.
+fn run_pending_close(app: &mut App, p: PendingClose) -> mecha_graph_core::Result<()> {
+    let PendingClose {
+        exe,
+        id,
+        name,
+        status,
+    } = p;
+    app.status = match crate::closure::set_status(
+        &app.conn,
+        crate::closure::Route::Through(exe),
+        &id,
+        &status,
+    ) {
+        Ok(note) => format!("{status}: {name} — {note}"),
+        Err(e) => format!("status change failed: {e}"),
+    };
+    app.reload_gtd()?;
+    let mut dropped = 0usize;
+    while event::poll(std::time::Duration::ZERO).map_err(io_err)? {
+        if let Event::Key(k) = event::read().map_err(io_err)? {
+            if k.kind == KeyEventKind::Press {
+                dropped += 1;
+            }
+        }
+    }
+    if dropped > 0 {
+        app.status = format!(
+            "{} (ignored {dropped} key(s) pressed meanwhile)",
+            app.status
+        );
+    }
+    Ok(())
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -579,6 +633,13 @@ fn event_loop(
             app.needs_clear = false;
         }
         terminal.draw(|f| draw(f, app)).map_err(io_err)?;
+
+        // A close through mecha, now that the frame saying it is in flight
+        // is on screen.
+        if let Some(pending) = app.pending_close.take() {
+            run_pending_close(app, pending)?;
+            continue;
+        }
 
         // Debounced live search: fire once typing pauses.
         if let Some(t) = app.search.dirty_since {
@@ -2747,12 +2808,50 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_co
             .and_then(|i| app.gtd.items.get(i))
             .map(|t| (t.node_id.clone(), t.name.clone()));
         if let Some((id, name)) = task {
-            match gtd::set_task_status(&app.conn, &id, status) {
-                Ok(()) => {
-                    app.status = format!("{status}: {}", name.chars().take(50).collect::<String>())
-                }
-                Err(e) => app.status = format!("status change failed: {e}"),
+            // The status going in is read from the database now, not from
+            // the row this screen rendered: another surface may have closed
+            // the task since, and a move that looks open-to-open here would
+            // then be an unrecorded reopen.
+            let from = gtd::get_task(&app.conn, &id).map(|t| t.map(|t| t.status));
+            let close_through = mecha_graph_core::integrations::load_config()
+                .map(|c| c.board.close_through)
+                .map_err(|e| e.to_string());
+            let route = match &from {
+                Err(e) => crate::closure::Route::Refuse(format!("{id} could not be read ({e})")),
+                Ok(None) => crate::closure::Route::Refuse(format!("{id} is no longer a task")),
+                Ok(Some(from)) => crate::closure::route(
+                    close_through
+                        .as_ref()
+                        .map(Option::as_deref)
+                        .map_err(String::as_str),
+                    &app.db_path,
+                    crate::closure::served_db(std::env::var_os("HOME").as_deref()).as_deref(),
+                    from,
+                    status,
+                    std::env::var_os("PATH").as_deref(),
+                ),
+            };
+            let name: String = name.chars().take(50).collect();
+            // A move through mecha waits on a child that starts a graph
+            // server and appraises: say so on screen first, and run it from
+            // the event loop after that frame is drawn (`run_pending_close`),
+            // which also discards the keys typed while it ran — replayed, they
+            // would land on whichever row the reload slid under the cursor.
+            if let crate::closure::Route::Through(exe) = route {
+                app.status = format!("{status}: {name} — through mecha… (keys wait)");
+                app.pending_close = Some(PendingClose {
+                    exe,
+                    id,
+                    name,
+                    status: status.to_string(),
+                });
+                return Ok(());
             }
+            app.status = match crate::closure::set_status(&app.conn, route, &id, status) {
+                Ok(note) if note.is_empty() => format!("{status}: {name}"),
+                Ok(note) => format!("{status}: {name} — {note}"),
+                Err(e) => format!("status change failed: {e}"),
+            };
             app.reload_gtd()?;
         }
         Ok(())

@@ -75,6 +75,14 @@ contradictions and near-duplicates, and unresolvable subjects.
 | `gtd` | The task board: next / inbox / waiting / scheduled. |
 | `tasks` | List and update tasks from the shell. |
 
+The TUI's board screen moves a task with one key per status. Closing a task
+(`d`, `x`) or reopening one writes straight to the database unless
+`[board] close_through` is set in `~/.mecha-graph/config.toml`; set (to
+`"mecha"`, or a path to it), those moves go through `mecha tasks set …
+--surface graph-tui` so mecha records and appraises them, and are refused,
+with nothing changed, when that program is missing or the TUI is not on the
+default database. See docs/ARCHITECTURE.md, "Boundaries".
+
 ## Maintain and repair
 
 | Command | What it does |
