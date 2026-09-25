@@ -303,7 +303,13 @@ enum Spawn {
 /// Run `exe` with its output in owner-only scratch files, wait for the
 /// process (not its output) up to `timeout`, and hand back how it ended and
 /// what it wrote to stderr.
+///
+/// The files are unlinked as soon as the child holds them, and stderr is read
+/// back through the handle kept here: what mecha prints is plaintext about an
+/// encrypted store, and nothing of it may outlive this call on disk, however
+/// this process ends (review of #21).
 fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> Result<(Ended, String), Spawn> {
+    use std::io::{Read, Seek};
     use std::os::unix::fs::OpenOptionsExt;
     let stem = std::env::temp_dir().join(format!(
         "mecha-graph-close-{}-{}",
@@ -313,20 +319,25 @@ fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> Result<(Ended,
     let (out_path, err_path) = (stem.with_extension("out"), stem.with_extension("err"));
     let open = |p: &Path| {
         std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(p)
     };
     let result = (|| {
-        let mut child = std::process::Command::new(exe)
+        let out = open(&out_path).map_err(Spawn::NotStarted)?;
+        let mut err = open(&err_path).map_err(Spawn::NotStarted)?;
+        let spawned = std::process::Command::new(exe)
             .args(args)
             .env_remove("MECHA_GRAPH_DB")
             .stdin(std::process::Stdio::null())
-            .stdout(open(&out_path).map_err(Spawn::NotStarted)?)
-            .stderr(open(&err_path).map_err(Spawn::NotStarted)?)
-            .spawn()
-            .map_err(Spawn::NotStarted)?;
+            .stdout(out)
+            .stderr(err.try_clone().map_err(Spawn::NotStarted)?)
+            .spawn();
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&err_path);
+        let mut child = spawned.map_err(Spawn::NotStarted)?;
         let deadline = Instant::now() + timeout;
         let ended = loop {
             match child.try_wait() {
@@ -345,9 +356,12 @@ fn run_bounded(exe: &Path, args: &[String], timeout: Duration) -> Result<(Ended,
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let mut stderr = String::new();
+        let _ = err.rewind().and_then(|()| err.read_to_string(&mut stderr));
         Ok((ended, stderr))
     })();
+    // Already gone on every path that spawned; this covers the ones that
+    // failed before it.
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
     result

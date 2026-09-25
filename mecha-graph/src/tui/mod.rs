@@ -441,6 +441,9 @@ struct App {
     /// The database `conn` is open on — what a close routed through mecha
     /// (`crate::closure`) must prove is the one mecha's graph server opens.
     db_path: std::path::PathBuf,
+    /// A board move routed through mecha, run by the event loop once the
+    /// frame saying so has been drawn.
+    pending_close: Option<PendingClose>,
     embedder: Option<mecha_graph_core::embed::Embedder>,
     screen: Screen,
     review: ReviewState,
@@ -472,6 +475,7 @@ pub fn run(conn: Connection, db_path: std::path::PathBuf) -> mecha_graph_core::R
     let mut app = App {
         conn,
         db_path,
+        pending_close: None,
         embedder,
         screen: Screen::Review,
         review: ReviewState {
@@ -573,6 +577,52 @@ fn io_err(e: std::io::Error) -> mecha_graph_core::Error {
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// A board move waiting to be handed to mecha (`crate::closure`).
+struct PendingClose {
+    exe: std::path::PathBuf,
+    id: String,
+    name: String,
+    status: String,
+}
+
+/// Run a close through mecha, say how it ended, and discard every key that
+/// arrived while it ran: the owner typed them at a frame that no longer
+/// matches the board, and a replayed `d` would close whichever task the
+/// reload slid under the cursor — a verdict mecha would then record.
+fn run_pending_close(app: &mut App, p: PendingClose) -> mecha_graph_core::Result<()> {
+    let PendingClose {
+        exe,
+        id,
+        name,
+        status,
+    } = p;
+    app.status = match crate::closure::set_status(
+        &app.conn,
+        crate::closure::Route::Through(exe),
+        &id,
+        &status,
+    ) {
+        Ok(note) => format!("{status}: {name} — {note}"),
+        Err(e) => format!("status change failed: {e}"),
+    };
+    app.reload_gtd()?;
+    let mut dropped = 0usize;
+    while event::poll(std::time::Duration::ZERO).map_err(io_err)? {
+        if let Event::Key(k) = event::read().map_err(io_err)? {
+            if k.kind == KeyEventKind::Press {
+                dropped += 1;
+            }
+        }
+    }
+    if dropped > 0 {
+        app.status = format!(
+            "{} (ignored {dropped} key(s) pressed meanwhile)",
+            app.status
+        );
+    }
+    Ok(())
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -583,6 +633,13 @@ fn event_loop(
             app.needs_clear = false;
         }
         terminal.draw(|f| draw(f, app)).map_err(io_err)?;
+
+        // A close through mecha, now that the frame saying it is in flight
+        // is on screen.
+        if let Some(pending) = app.pending_close.take() {
+            run_pending_close(app, pending)?;
+            continue;
+        }
 
         // Debounced live search: fire once typing pauses.
         if let Some(t) = app.search.dirty_since {
@@ -2775,6 +2832,21 @@ fn handle_gtd(app: &mut App, key: KeyCode, mods: KeyModifiers) -> mecha_graph_co
                 ),
             };
             let name: String = name.chars().take(50).collect();
+            // A move through mecha waits on a child that starts a graph
+            // server and appraises: say so on screen first, and run it from
+            // the event loop after that frame is drawn (`run_pending_close`),
+            // which also discards the keys typed while it ran — replayed, they
+            // would land on whichever row the reload slid under the cursor.
+            if let crate::closure::Route::Through(exe) = route {
+                app.status = format!("{status}: {name} — through mecha… (keys wait)");
+                app.pending_close = Some(PendingClose {
+                    exe,
+                    id,
+                    name,
+                    status: status.to_string(),
+                });
+                return Ok(());
+            }
             app.status = match crate::closure::set_status(&app.conn, route, &id, status) {
                 Ok(note) if note.is_empty() => format!("{status}: {name}"),
                 Ok(note) => format!("{status}: {name} — {note}"),
