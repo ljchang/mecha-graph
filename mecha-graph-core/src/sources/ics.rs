@@ -54,8 +54,11 @@ fn unfold(text: &str) -> Vec<String> {
     out
 }
 
+/// A content line split into (name, params, value).
+type ContentLine = (String, Vec<(String, String)>, String);
+
 /// Split "NAME;PARAM=x;PARAM=y:VALUE" into (name, params, value).
-fn split_content_line(line: &str) -> Option<(String, Vec<(String, String)>, String)> {
+fn split_content_line(line: &str) -> Option<ContentLine> {
     // The ':' separating name+params from value is the first ':' not inside
     // a double-quoted param value.
     let mut in_quotes = false;
@@ -365,10 +368,7 @@ fn ingest_ics_texts(
             )?;
 
             // Event node, so tasks/facts can attach (discussed_at → Event).
-            let event_node_id = format!(
-                "event-{}",
-                crate::ids::content_hash(&ep.source_id)[..16].to_string()
-            );
+            let event_node_id = format!("event-{}", &crate::ids::content_hash(&ep.source_id)[..16]);
             let mut event_node = graph::Node::new(
                 &event_node_id,
                 "event",
@@ -421,7 +421,7 @@ fn ingest_ics_texts(
 
             if max_occurred
                 .as_deref()
-                .map_or(true, |m| ep.occurred_at.as_str() > m)
+                .is_none_or(|m| ep.occurred_at.as_str() > m)
             {
                 max_occurred = Some(ep.occurred_at.clone());
             }

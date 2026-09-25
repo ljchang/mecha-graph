@@ -95,7 +95,7 @@ contradictions and near-duplicates, and unresolvable subjects.
 
 | Command | What it does |
 |---|---|
-| `encrypt` / `decrypt` | Move between encrypted and plaintext copies. `decrypt --out /tmp/analytics.db` makes the ephemeral snapshot DuckDB can attach. |
+| `encrypt` / `decrypt` | Move between encrypted and plaintext copies. `decrypt --out <path>` writes a plaintext snapshot any SQLite tool can open; keep it inside `~/.mecha-graph/` and delete it after. |
 | `fork` | A full encrypted copy under a fresh key — the test bed for experiments that must not touch the live store. |
 | `redact --episode <uid>` | True delete: the episode, its raw archive, mentions, embeddings, FTS rows, enrichment, and derived facts. |
 

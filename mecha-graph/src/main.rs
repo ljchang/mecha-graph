@@ -763,7 +763,7 @@ enum Command {
         #[arg(long)]
         purge_backup: bool,
     },
-    /// Write a plaintext snapshot (for DuckDB analytics on an encrypted DB)
+    /// Write a plaintext snapshot of an encrypted DB, for tools that cannot read SQLCipher
     Decrypt {
         #[arg(long)]
         out: PathBuf,
@@ -1147,6 +1147,9 @@ enum TombstoneAction {
     },
 }
 
+// Parsed once per invocation, so the size of the largest variant costs nothing;
+// boxing clap's derived arguments would only make them harder to read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum SourceAction {
     /// List configured sources with auth + sync status
@@ -1821,8 +1824,8 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 let total: usize = rows.iter().map(|p| p.pending).sum();
                 println!("{total} pending from {} proposer(s)\n", rows.len());
                 println!(
-                    "{:>6}  {:<30} {:>10} {:>9}  {:<9} {}",
-                    "PEND", "PROPOSER", "YOU SAID", "CONFIDENT", "EVIDENCE", "AUTO-DROPPED"
+                    "{:>6}  {:<30} {:>10} {:>9}  {:<9} AUTO-DROPPED",
+                    "PEND", "PROPOSER", "YOU SAID", "CONFIDENT", "EVIDENCE"
                 );
                 for p in &rows {
                     // A rate with no denominator prints as a dash, never as
@@ -2975,7 +2978,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 *by_name.entry(r.alias.clone()).or_default() += 1;
             }
             let mut rows: Vec<_> = by_name.into_iter().collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
             for (alias, n) in rows.iter().take(20) {
                 println!("  {n:>6}  {alias}");
             }
@@ -4146,8 +4149,8 @@ reject: it was never true (retracted; the class learns)"
             match action {
                 SourceAction::List => {
                     println!(
-                        "{:<12} {:<10} {:<8} {:<40} {:<20} {}",
-                        "NAME", "KIND", "ENABLED", "STATUS", "LAST OK", "ITEMS"
+                        "{:<12} {:<10} {:<8} {:<40} {:<20} ITEMS",
+                        "NAME", "KIND", "ENABLED", "STATUS", "LAST OK"
                     );
                     for (name, cfg) in &config.sources {
                         let test = integrations::test_source(name, cfg);

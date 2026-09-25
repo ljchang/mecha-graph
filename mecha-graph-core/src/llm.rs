@@ -496,7 +496,8 @@ mod tests {
         // The server bounds thinking at 4096. A max_tokens at or below that
         // is how a turn comes back with reasoning and an empty answer — the
         // exact shape of the bug this module exists to stop returning.
-        assert!(DEFAULT_MAX_TOKENS > 4096);
+        // Checked at compile time: the bound is a constant.
+        const { assert!(DEFAULT_MAX_TOKENS > 4096) };
     }
 
     #[test]

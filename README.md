@@ -15,8 +15,8 @@ returns a token-bounded, provenance-carrying, freshness-stamped slice.
   │ mbox mail exports     │───▶│   Rust library        │───▶│ Claude Code  (MCP)  │
   │ Slack · iMessage      │    │   ingest · enrich ·   │    │ any MCP client      │
   │ notes · wearables     │    │   link · retrieve     │    │ mecha-graph CLI     │
-  └───────────────────────┘    │   SQLite (SQLCipher)  │    │ DuckDB (analytics)  │
-                               │   + sqlite-vec + FTS5 │    └─────────────────────┘
+  └───────────────────────┘    │   SQLite (SQLCipher)  │    └─────────────────────┘
+                               │   + sqlite-vec + FTS5 │
                                └───────────────────────┘
 ```
 
@@ -142,18 +142,16 @@ claude mcp add graph -- mecha-graph-mcp
 - **Local by construction.** Nothing reaches the network except the
   integrations you enable and a llama-server on localhost.
 
-## Analytics
+## A plaintext snapshot
 
-DuckDB can't read SQLCipher, so analytics use an ephemeral snapshot:
+An encrypted store opens only through mecha-graph. For a tool that cannot read
+SQLCipher, `decrypt --out` writes a plaintext copy any SQLite tool can open:
 
 ```bash
-mecha-graph decrypt --out /tmp/analytics.db   # plaintext snapshot, chmod 600
+mecha-graph decrypt --out ~/.mecha-graph/snapshot.db   # inside the 0700 store dir, not /tmp
 ```
-```sql
-INSTALL sqlite; LOAD sqlite;
-ATTACH '/tmp/analytics.db' AS graph (TYPE sqlite);
-SELECT source, COUNT(*) FROM graph.episode GROUP BY source;
-```
+
+It is the whole graph in plaintext; delete it when you are done.
 
 ## Layout
 

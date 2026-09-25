@@ -184,10 +184,8 @@ pub fn ingest_zip(conn: &Connection, zip_path: &Path) -> Result<IngestReport> {
             break;
         }
     }
-    if verified && !episode_ids.is_empty() {
-        if std::fs::remove_file(zip_path).is_ok() {
-            report.deleted_files = 1;
-        }
+    if verified && !episode_ids.is_empty() && std::fs::remove_file(zip_path).is_ok() {
+        report.deleted_files = 1;
     }
     Ok(report)
 }
@@ -340,8 +338,10 @@ pub fn process_notes(conn: &Connection) -> Result<ProcessReport> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
 
-    let mut report = ProcessReport::default();
-    report.scanned = notes.len();
+    let mut report = ProcessReport {
+        scanned: notes.len(),
+        ..Default::default()
+    };
 
     for (eid, body) in notes {
         let (title, attrs) = parse_note(&body);

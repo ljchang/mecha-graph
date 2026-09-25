@@ -2544,11 +2544,7 @@ pub fn generate_memory_md(conn: &Connection, max_tokens: usize) -> Result<String
 
     if !facts.is_empty() {
         out.push_str("## Facts\n");
-        let mut n = 0;
-        for (statement, valid_from, _extractor) in facts {
-            if n >= 20 {
-                break;
-            }
+        for (statement, valid_from, _extractor) in facts.into_iter().take(20) {
             let line = match valid_from {
                 Some(v) => format!("- as of {}: {}\n", &v[..10.min(v.len())], statement),
                 None => format!("- {}\n", statement),
@@ -2559,7 +2555,6 @@ pub fn generate_memory_md(conn: &Connection, max_tokens: usize) -> Result<String
             }
             spent += t;
             out.push_str(&line);
-            n += 1;
         }
         out.push('\n');
     }

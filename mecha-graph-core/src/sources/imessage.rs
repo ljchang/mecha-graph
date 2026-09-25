@@ -35,7 +35,7 @@ impl IMessageSource {
             ),
             self_handles: cfg
                 .get_str("self_handles")
-                .map(|s| s.split(',').map(|x| normalize_handle(x)).collect())
+                .map(|s| s.split(',').map(normalize_handle).collect())
                 .unwrap_or_default(),
         })
     }

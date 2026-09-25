@@ -146,7 +146,9 @@ pub fn process_pending(conn: &Connection, limit: i64) -> Result<CorrectionSummar
 }
 
 enum Target {
-    Live(Fact),
+    /// Boxed: a `Fact` dwarfs the other two variants, and this is only ever
+    /// a short-lived return value.
+    Live(Box<Fact>),
     AlreadyClosed,
     Unresolved,
 }
@@ -158,7 +160,9 @@ enum Target {
 fn resolve_target(conn: &Connection, c: &Correction) -> Result<Target> {
     if let Some(uid) = &c.fact_uid {
         return Ok(match fact::get_fact_by_uid(conn, uid)? {
-            Some(f) if f.invalidated_at.is_none() && f.valid_to.is_none() => Target::Live(f),
+            Some(f) if f.invalidated_at.is_none() && f.valid_to.is_none() => {
+                Target::Live(Box::new(f))
+            }
             Some(_) => Target::AlreadyClosed,
             None => Target::Unresolved,
         });
@@ -189,7 +193,7 @@ fn resolve_target(conn: &Connection, c: &Correction) -> Result<Target> {
         .into_iter()
         .partition(|f| f.valid_to.is_none() && f.invalidated_at.is_none());
     Ok(match (live.len(), closed.len()) {
-        (1, _) => Target::Live(live.remove(0)),
+        (1, _) => Target::Live(Box::new(live.remove(0))),
         // No live match but a closed one: a distiller retry of a
         // correction that already landed — not an unresolved mystery.
         (0, 1..) => Target::AlreadyClosed,

@@ -238,8 +238,8 @@ pushing orchestration out — the `ask_ada` route, pack flags that
 *describe* rather than decide, mecha-graph not writing into mecha's mailbox. In
 one workspace that constraint erodes by convenience.
 
-**Multiple consumers.** Claude Code and Hermes over MCP, the `mecha-graph` CLI,
-DuckDB for analytics; FlowMail is a future consumer on macOS. Even at
+**Multiple consumers.** Claude Code and Hermes over MCP, and the `mecha-graph`
+CLI; FlowMail is a future consumer on macOS. Even at
 one real consumer the MCP surface costs nothing already being paid.
 
 ### The two invariants that keep the split clean

@@ -323,7 +323,7 @@ pub fn detect_entities(
                     interaction_count: pi.map(|p| p.interaction_count).unwrap_or(0),
                 });
             }
-            candidates.sort_by(|a, b| b.interaction_count.cmp(&a.interaction_count));
+            candidates.sort_by_key(|c| std::cmp::Reverse(c.interaction_count));
             ambiguous.push(AmbiguousEntity {
                 matched,
                 candidates,
@@ -964,14 +964,11 @@ fn recall_into(
         vec![]
     };
     for hit in fact_hits {
-        if let Some(f) = conn
-            .query_row(
-                "SELECT * FROM fact WHERE id = ?1",
-                params![hit.id],
-                crate::fact::row_to_fact,
-            )
-            .ok()
-        {
+        if let Ok(f) = conn.query_row(
+            "SELECT * FROM fact WHERE id = ?1",
+            params![hit.id],
+            crate::fact::row_to_fact,
+        ) {
             let text = match &f.valid_from {
                 Some(v) => format!("as of {}: {}", v, f.statement),
                 None => f.statement.clone(),

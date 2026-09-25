@@ -1126,7 +1126,7 @@ impl App {
             .flatten();
         let eps = episode::episodes_for_node(&self.conn, id, 4).unwrap_or_default();
         let mut out = format!("{}\n{}\n", node.name, id);
-        out.push_str(&format!("identifiers:\n"));
+        out.push_str("identifiers:\n");
         for i in &idents {
             out.push_str(&format!("  {i}\n"));
         }
@@ -1232,7 +1232,17 @@ fn spawn_editor(initial: &str) -> mecha_graph_core::Result<Option<String>> {
     // on any install that never had it. The store's own directory is the
     // one the doc comment above always named.
     let dir = std::path::PathBuf::from(home).join(".mecha-graph");
-    std::fs::create_dir_all(&dir).map_err(io_err)?;
+    // 0700, as `db::open` makes it: the store's directory holds concentrated
+    // personal data, and this can be the first thing to create it (a fork
+    // opened with --db on a host that never opened the default store).
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).map_err(io_err)?;
     let path = dir.join(".edit.md");
     std::fs::write(&path, initial).map_err(io_err)?;
     #[cfg(unix)]

@@ -754,8 +754,10 @@ pub fn precheck_pending_with(
             let v = match r.get_ref(1)? {
                 rusqlite::types::ValueRef::Text(t) => serde_json::from_slice::<Vec<f32>>(t).ok(),
                 rusqlite::types::ValueRef::Blob(b) => Some(
-                    b.chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
                         .collect(),
                 ),
                 _ => None,
@@ -789,8 +791,10 @@ pub fn precheck_pending_with(
             let raw = r.get_ref(1)?;
             let v = match raw {
                 rusqlite::types::ValueRef::Blob(b) if b.len() % 4 == 0 => Some(
-                    b.chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
                         .collect::<Vec<f32>>(),
                 ),
                 rusqlite::types::ValueRef::Text(t) => serde_json::from_slice(t).ok(),
@@ -1554,8 +1558,10 @@ pub fn live_fact_dups(conn: &Connection, threshold: f64, exact: bool) -> Result<
             let raw = r.get_ref(6)?;
             let vec = match raw {
                 rusqlite::types::ValueRef::Blob(b) if b.len() % 4 == 0 => b
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
                 rusqlite::types::ValueRef::Text(t) => serde_json::from_slice(t).unwrap_or_default(),
                 _ => Vec::new(), // includes NULL from the LEFT JOIN
@@ -3693,7 +3699,7 @@ pub fn review_clusters(conn: &Connection, sample_n: usize) -> Result<Vec<ReviewC
             samples,
         });
     }
-    clusters.sort_by(|a, b| b.pending.cmp(&a.pending));
+    clusters.sort_by_key(|c| std::cmp::Reverse(c.pending));
     Ok(clusters)
 }
 
@@ -3797,6 +3803,6 @@ pub fn proposer_stats(conn: &Connection) -> Result<Vec<ProposerStat>> {
             s.oldest = ages.get(&s.proposer).cloned();
         }
     }
-    out.sort_by(|a, b| b.pending.cmp(&a.pending));
+    out.sort_by_key(|c| std::cmp::Reverse(c.pending));
     Ok(out)
 }
