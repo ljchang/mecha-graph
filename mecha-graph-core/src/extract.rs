@@ -516,8 +516,9 @@ fn server_answers(
     })
 }
 
-/// One extraction attempt. `Ok(Some(e))` is an answer that failed, for
-/// [`extract_settled`] to charge; `Err` is no answer at all, or a local error.
+/// One extraction attempt. `Ok(Some(e))` is a request that failed — a failed
+/// answer, or none at all — for [`extract_settled`] to settle; `Err` is a
+/// local error (the database).
 fn extract_episode(
     conn: &Connection,
     chat: &ChatClient,

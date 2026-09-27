@@ -156,8 +156,9 @@ impl Backend {
                     std::thread::sleep(Duration::from_millis(500));
                     match health(base_url) {
                         Health::Ready => return shared(),
-                        Health::Loading if Instant::now() < deadline => {}
-                        Health::Loading => {
+                        // A stall mid-load is still a load in progress.
+                        Health::Loading | Health::Unknown(_) if Instant::now() < deadline => {}
+                        Health::Loading | Health::Unknown(_) => {
                             return Err(Error::Other(format!(
                                 "llama-server at {base_url} is still loading after {}s",
                                 load_wait.as_secs()
@@ -170,6 +171,13 @@ impl Backend {
                         }
                     }
                 }
+            }
+            Health::Unknown(why) => {
+                return Err(Error::Other(format!(
+                    "{base_url}/health gave no clean answer ({why}). Something may be \
+                     listening there, busy, so mecha-graph neither uses it nor starts a \
+                     second server over it; nothing was marked attempted."
+                )))
             }
             Health::Absent => {}
         }
@@ -275,6 +283,10 @@ struct Served {
     /// found answering whose `/props` does not is unknown, and unknown is not
     /// "not a router": `connect` refuses rather than send an unchecked name.
     props_read: bool,
+    /// Why `/props` gave nothing, when it did not: the refusal names it,
+    /// because a stall on a busy server and a server with no `/props` call
+    /// for different fixes (found on review of #22).
+    props_error: Option<String>,
     resident: Option<String>,
     /// `Some` on a router: `Some(ids)` from a `/models` it read, `Some(None)`
     /// when that list could not be read.
@@ -304,21 +316,29 @@ struct Served {
 fn probe(base_url: &str) -> Served {
     // Ten seconds, not 1.5: a shared server's queue can hold a probe as it
     // holds a request, and a probe that times out is now a refusal.
-    let get = |path: &str| -> Option<serde_json::Value> {
+    let fetch = |path: &str| -> std::result::Result<serde_json::Value, String> {
         ureq::get(&format!("{base_url}{path}"))
             .timeout(Duration::from_secs(10))
             .call()
-            .ok()?
+            .map_err(|e| e.to_string())?
             .into_json()
-            .ok()
+            .map_err(|e| format!("unreadable body: {e}"))
     };
-    let Some(props) = get("/props") else {
-        return Served::default();
+    let get = |path: &str| fetch(path).ok();
+    let props = match fetch("/props") {
+        Ok(p) => p,
+        Err(why) => {
+            return Served {
+                props_error: Some(why),
+                ..Default::default()
+            }
+        }
     };
     let router = props.get("role").and_then(|r| r.as_str()) == Some("router");
     let models = if router { get("/models") } else { None };
     Served {
         props_read: true,
+        props_error: None,
         resident: served_from(&props, models.as_ref()),
         router_ids: router.then(|| router_ids(models.as_ref())),
     }
@@ -378,14 +398,20 @@ fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) ->
 }
 
 /// What `/health` says about the server behind a URL.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Health {
     /// 2xx: up, with its model loaded.
     Ready,
     /// 503: llama-server is there and loading a model.
     Loading,
-    /// Anything else: no llama-server here to share.
+    /// Nothing listening (connection refused), or something that is not
+    /// llama-server answering (a 404 from ollama): no server here to share.
     Absent,
+    /// No clean answer — a timeout, a reset, a read that failed. Something
+    /// may be listening, busy, so this is neither "share it" nor "start one":
+    /// starting one is a second copy of the model at a URL that answers
+    /// (found on review of #22).
+    Unknown(String),
 }
 
 fn health(base_url: &str) -> Health {
@@ -400,7 +426,11 @@ fn health(base_url: &str) -> Health {
     {
         Ok(_) => Health::Ready,
         Err(ureq::Error::Status(503, _)) => Health::Loading,
-        Err(_) => Health::Absent,
+        Err(ureq::Error::Status(..)) => Health::Absent,
+        Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
+            Health::Absent
+        }
+        Err(e) => Health::Unknown(e.to_string()),
     }
 }
 
@@ -479,12 +509,17 @@ impl ChatClient {
         let served = probe(backend.base_url());
         if !served.props_read {
             return Err(Error::Other(format!(
-                "mecha-graph: {} answered its health check but not /props, so what it \
-                 serves — and, on a router, what it will accept — is unknown. Refusing \
-                 before any request, so nothing is marked attempted. This client needs \
-                 llama-server's /props: an OpenAI-compatible server without it (vLLM, a \
-                 proxy) is not supported as the chat endpoint.",
-                backend.base_url()
+                "mecha-graph: {} answered its health check but not /props ({}), so what \
+                 it serves — and, on a router, what it will accept — is unknown. Refusing \
+                 before any request, so nothing is marked attempted. A timeout is a busy \
+                 server, and tomorrow's run retries; a 404 is a server without \
+                 llama-server's /props (vLLM, a proxy), which is not supported as the \
+                 chat endpoint.",
+                backend.base_url(),
+                served
+                    .props_error
+                    .as_deref()
+                    .unwrap_or("no reason recorded")
             )));
         }
         let model = match served.resident {
@@ -1003,6 +1038,19 @@ mod tests {
 
         let url = stub(vec![(404, "{}".into())]);
         assert_eq!(health(&url), Health::Absent);
+
+        // A reset is no clean answer: refused, never spawned over.
+        let url = dead_server();
+        assert!(
+            matches!(health(&url), Health::Unknown(_)),
+            "{:?}",
+            health(&url)
+        );
+        let Err(Error::Other(m)) = Backend::resolve_within(&url, "m", Duration::from_secs(1))
+        else {
+            panic!("an unknown health is a refusal")
+        };
+        assert!(m.contains("neither uses it nor starts"), "{m}");
     }
 
     /// The canary passes on any JSON answer, and fails on a refusal and on
