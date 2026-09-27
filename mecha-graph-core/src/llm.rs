@@ -291,6 +291,9 @@ struct Served {
     /// `Some` on a router: `Some(ids)` from a `/models` it read, `Some(None)`
     /// when that list could not be read.
     router_ids: Option<Option<Vec<String>>>,
+    /// Why a router's `/models` gave nothing, for the same reason as
+    /// `props_error`: busy and absent call for different fixes.
+    models_error: Option<String>,
 }
 
 /// What the server actually has loaded, from its own `/props`.
@@ -324,7 +327,6 @@ fn probe(base_url: &str) -> Served {
             .into_json()
             .map_err(|e| format!("unreadable body: {e}"))
     };
-    let get = |path: &str| fetch(path).ok();
     let props = match fetch("/props") {
         Ok(p) => p,
         Err(why) => {
@@ -335,12 +337,17 @@ fn probe(base_url: &str) -> Served {
         }
     };
     let router = props.get("role").and_then(|r| r.as_str()) == Some("router");
-    let models = if router { get("/models") } else { None };
+    let (models, models_error) = match router.then(|| fetch("/models")) {
+        Some(Ok(m)) => (Some(m), None),
+        Some(Err(why)) => (None, Some(why)),
+        None => (None, None),
+    };
     Served {
         props_read: true,
         props_error: None,
         resident: served_from(&props, models.as_ref()),
         router_ids: router.then(|| router_ids(models.as_ref())),
+        models_error,
     }
 }
 
@@ -543,7 +550,13 @@ impl ChatClient {
                     let listed = ids.as_ref().is_some_and(|l| l.iter().any(|i| i == &wanted));
                     if !listed {
                         let what = match ids {
-                            None => "its /models could not be read".to_string(),
+                            None => format!(
+                                "its /models could not be read ({})",
+                                served
+                                    .models_error
+                                    .as_deref()
+                                    .unwrap_or("a list this client does not fully read")
+                            ),
                             Some(l) if l.is_empty() => "it lists no models".to_string(),
                             Some(l) => format!("it lists: {}", l.join(", ")),
                         };
@@ -603,6 +616,27 @@ impl ChatClient {
         self.post(system, user, Self::schema_format(name, schema))
     }
 
+    /// [`ChatClient::complete_schema`] without the backoff between retries:
+    /// for a request made *because* the canary just answered, where waiting
+    /// out a server recovery pays for a condition already ruled out (found
+    /// on review of #22: ~100 s of sleep per episode on a server that 5xx's
+    /// one input).
+    pub fn complete_schema_once(
+        &self,
+        system: &str,
+        user: &str,
+        name: &str,
+        schema: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post_within(
+            system,
+            user,
+            Self::schema_format(name, schema),
+            self.timeout,
+            &[],
+        )
+    }
+
     /// The `response_format` [`ChatClient::complete_json`] sends.
     pub fn json_object_format() -> serde_json::Value {
         serde_json::json!({ "type": "json_object" })
@@ -633,9 +667,19 @@ impl ChatClient {
     /// the server refuses would 400 every episode while a two-field literal
     /// answered, and the canary would sign off a whole batch as poison (found
     /// on review of #22). Any JSON answer passes; the content is not graded.
+    ///
+    /// Sent once, with no retries: it is a liveness check, so its bound is
+    /// `canary_timeout` and nothing more, and failing it stops the run with
+    /// nothing marked — the side to err on.
     pub fn canary(&self, system: &str, response_format: serde_json::Value) -> Result<()> {
-        self.post_within(system, CANARY_INPUT, response_format, self.canary_timeout)
-            .map(|_| ())
+        self.post_within(
+            system,
+            CANARY_INPUT,
+            response_format,
+            self.canary_timeout,
+            &[],
+        )
+        .map(|_| ())
     }
 
     fn post(
@@ -644,7 +688,13 @@ impl ChatClient {
         user: &str,
         response_format: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.post_within(system, user, response_format, self.timeout)
+        self.post_within(
+            system,
+            user,
+            response_format,
+            self.timeout,
+            &self.retry_delays,
+        )
     }
 
     fn post_within(
@@ -653,6 +703,7 @@ impl ChatClient {
         user: &str,
         response_format: serde_json::Value,
         timeout: Duration,
+        retry_delays: &[Duration],
     ) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -714,7 +765,7 @@ impl ChatClient {
                     ))
                 }
             };
-            match self.retry_delays.get(attempt) {
+            match retry_delays.get(attempt) {
                 Some(wait) => {
                     attempt += 1;
                     eprintln!("mecha-graph: {err} — retrying in {}s", wait.as_secs());
@@ -1002,6 +1053,32 @@ mod tests {
             Err(Error::Timeout(m)) => assert!(m.contains("timed out"), "{m}"),
             other => panic!("a timeout is neither Other nor Transport: {other:?}"),
         }
+    }
+
+    /// The canary and the request made after it answered are sent once: the
+    /// backoff is for a server recovering, which the canary rules out (found
+    /// on review of #22: ~100 s of sleep per episode otherwise). The 200
+    /// queued behind each 503 is never reached.
+    #[test]
+    fn the_canary_and_the_request_after_it_do_not_back_off() {
+        let busy = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let ok = answer(r#"{"a":1}"#);
+        let mut c = ChatClient::at(&stub(vec![busy.clone(), ok.clone()]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        assert!(matches!(
+            c.canary("s", ChatClient::json_object_format()),
+            Err(Error::Transport(_))
+        ));
+        let mut c = ChatClient::at(&stub(vec![busy.clone(), ok.clone()]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        let once = c.complete_schema_once("s", "u", "x", serde_json::json!({"type": "object"}));
+        assert!(matches!(once, Err(Error::Transport(_))), "{once:?}");
+        // The ordinary request still waits the load out.
+        let mut c = ChatClient::at(&stub(vec![busy, ok]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        assert!(c
+            .complete_schema("s", "u", "x", serde_json::json!({"type": "object"}))
+            .is_ok());
     }
 
     /// A router loading a model answers 503 first; the retry is the warm-up.

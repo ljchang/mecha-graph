@@ -475,7 +475,7 @@ fn extract_settled(
     report: &mut ExtractReport,
 ) -> Result<()> {
     report.episodes += 1;
-    let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
+    let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report, true)?;
     if let Some(e @ (Error::Timeout(_) | Error::Transport(_))) = &failed {
         server_answers(chat, system, schema, episode.id, e)?;
         eprintln!(
@@ -483,7 +483,10 @@ fn extract_settled(
              so the episode gets one more try",
             episode.id
         );
-        failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
+        // No backoff: the canary just showed the server answering.
+        failed = extract_episode(
+            conn, chat, system, schema, episode, committed, report, false,
+        )?;
     }
     if let Some(e) = failed {
         server_answers(chat, system, schema, episode.id, &e)?;
@@ -519,6 +522,7 @@ fn server_answers(
 /// One extraction attempt. `Ok(Some(e))` is a request that failed — a failed
 /// answer, or none at all — for [`extract_settled`] to settle; `Err` is a
 /// local error (the database).
+#[allow(clippy::too_many_arguments)]
 fn extract_episode(
     conn: &Connection,
     chat: &ChatClient,
@@ -527,6 +531,7 @@ fn extract_episode(
     episode: &Pending,
     committed: &mut std::collections::HashSet<String>,
     report: &mut ExtractReport,
+    backoff: bool,
 ) -> Result<Option<Error>> {
     let &Pending {
         id: episode_id,
@@ -557,8 +562,12 @@ fn extract_episode(
         let user =
             format!("Episode date: {occurred_at}\n{hints}\n{body_trunc}\n\n{CLOSING_IMPERATIVE}");
 
-        let parsed: Extraction = match chat
-            .complete_schema(system, &user, "extraction", schema.clone())
+        let answer = if backoff {
+            chat.complete_schema(system, &user, "extraction", schema.clone())
+        } else {
+            chat.complete_schema_once(system, &user, "extraction", schema.clone())
+        };
+        let parsed: Extraction = match answer
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         {
             Ok(p) => p,
