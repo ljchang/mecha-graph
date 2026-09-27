@@ -226,13 +226,63 @@ impl Drop for Backend {
 /// `qwen3.6-35b-a3b` while the box actually serves gemma4 would put a false
 /// value in `extract_state.model`, which is the one column that answers "what
 /// produced this fact" and the one PROMPT_VERSION re-extraction keys off.
+///
+/// **Behind a llama-server router the bare `/props` is a placeholder**
+/// (`role: "router"`, `model_alias: "llama-server"`), and the request's
+/// `model` field *selects* rather than being ignored. Reading that placeholder
+/// as the served model sent `"model": "llama-server"` on every request, which
+/// the router refuses — 2026-09-27, the night mecha's :8080 became a router:
+/// 100 extractions and 30 summaries failed, and the extractions were marked
+/// attempted. So on a router the answer is the one model resident there, read
+/// from `/models`; `None` — use the configured model — when that cannot be
+/// told (nothing loaded, two loaded, or a list this does not fully read).
 fn served_model(base_url: &str) -> Option<String> {
-    let resp = ureq::get(&format!("{base_url}/props"))
-        .timeout(Duration::from_millis(1500))
-        .call()
-        .ok()?;
-    let body: serde_json::Value = resp.into_json().ok()?;
-    body.get("model_alias")
+    let get = |path: &str| -> Option<serde_json::Value> {
+        ureq::get(&format!("{base_url}{path}"))
+            .timeout(Duration::from_millis(1500))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()
+    };
+    let props = get("/props")?;
+    let models = if props.get("role").and_then(|r| r.as_str()) == Some("router") {
+        Some(get("/models")?)
+    } else {
+        None
+    };
+    served_from(&props, models.as_ref())
+}
+
+/// The pure half of [`served_model`]: a single-model server's `model_alias`,
+/// or a router's one resident model.
+fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) -> Option<String> {
+    if props.get("role").and_then(|r| r.as_str()) == Some("router") {
+        // Only from a list whose every status is known: "nothing resident" or
+        // "this one" is a claim a list this does not understand cannot back.
+        // Same rule as mecha's provider::router::readable.
+        const KNOWN: [&str; 5] = ["unloaded", "loading", "loaded", "sleeping", "downloading"];
+        let data = models?.get("data")?.as_array()?;
+        let status = |m: &serde_json::Value| {
+            m.get("status")
+                .and_then(|s| s.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if data.is_empty() || data.iter().any(|m| !KNOWN.contains(&status(m).as_str())) {
+            return None;
+        }
+        let mut resident = data
+            .iter()
+            .filter(|m| matches!(status(m).as_str(), "loaded" | "loading" | "sleeping"));
+        return match (resident.next(), resident.next()) {
+            (Some(one), None) => one.get("id").and_then(|i| i.as_str()).map(str::to_string),
+            _ => None,
+        };
+    }
+    props
+        .get("model_alias")
         .and_then(|m| m.as_str())
         .filter(|m| !m.is_empty())
         .map(str::to_string)
@@ -463,6 +513,57 @@ fn strip_code_fence(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A router's bare `/props` is never the answer — the night it was, every
+    /// request named "llama-server" and the router refused them all.
+    #[test]
+    fn a_router_is_asked_for_its_resident_model_not_its_placeholder() {
+        let placeholder = serde_json::json!({"role": "router", "model_alias": "llama-server"});
+        let listing = |pairs: &[(&str, &str)]| serde_json::json!({"data": pairs.iter().map(|(id, v)| serde_json::json!({"id": id, "status": {"value": v}})).collect::<Vec<_>>()});
+        let one = listing(&[
+            ("qwen3.6-35b-a3b", "unloaded"),
+            ("qwen3.6-35b-a3b-uncensored", "loaded"),
+        ]);
+        assert_eq!(
+            served_from(&placeholder, Some(&one)).as_deref(),
+            Some("qwen3.6-35b-a3b-uncensored")
+        );
+        // No list, nothing resident, two resident, an unknown status: no
+        // answer, so the configured model is used — never "llama-server".
+        assert_eq!(served_from(&placeholder, None), None);
+        assert_eq!(
+            served_from(&placeholder, Some(&listing(&[("a", "unloaded")]))),
+            None
+        );
+        assert_eq!(
+            served_from(
+                &placeholder,
+                Some(&listing(&[("a", "loaded"), ("b", "loading")]))
+            ),
+            None
+        );
+        assert_eq!(
+            served_from(&placeholder, Some(&listing(&[("a", "resident")]))),
+            None
+        );
+        assert_eq!(
+            served_from(&placeholder, Some(&serde_json::json!({"data": []}))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_single_model_server_answers_with_its_alias() {
+        let props = serde_json::json!({"model_alias": "qwen3.6-35b-a3b"});
+        assert_eq!(
+            served_from(&props, None).as_deref(),
+            Some("qwen3.6-35b-a3b")
+        );
+        assert_eq!(
+            served_from(&serde_json::json!({"model_alias": ""}), None),
+            None
+        );
+    }
 
     #[test]
     fn plain_json_is_untouched() {
