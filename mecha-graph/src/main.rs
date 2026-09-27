@@ -4089,15 +4089,17 @@ reject: it was never true (retracted; the class learns)"
             for (uid, at, why) in charged {
                 println!("{uid}\t{at}\t{why}");
             }
-            // Unknown is not clean: a mark from before V026 carries no reason,
-            // so it may be a charge or an episode that held nothing. Counted,
-            // never listed as either.
+            // Unknown is not clean: a mark whose writer recorded no reason —
+            // from before V026, or copied from a store older than V027 — may
+            // be a charge or an episode that held nothing. Counted, never
+            // listed as either.
             let unexplained = mecha_graph_core::extract::unexplained_marks(&conn)?;
             if unexplained > 0 {
                 eprintln!(
                     "({unexplained} episode(s) were marked with nothing extracted and no reason \
-                     recorded — marks from before this build, which cannot say whether they \
-                     were charged or held nothing; not listed)"
+                     recorded — written before reasons were kept, or copied from a store older \
+                     than V027 — so they cannot say whether they were charged or held nothing; \
+                     not listed)"
                 );
             }
         }

@@ -14,8 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure — marked attempted so one bad input cannot wedge every night —
   now records the reason, and `--charged` lists them (uid, date, reason),
   running no model; `extract --episode <id>` re-runs one. The nightly's
-  ALERTS line counts tonight's charges and points here. Marks written before
-  V026 carry no reason and are not listed.
+  ALERTS line counts tonight's charges and points here. Every write since
+  records whether it had a reason (`extract_state.reason_recorded`, V027),
+  so marks that did not — written before V026, or copied from a store older
+  than V027 — are counted as unknown, never listed.
 - **The TUI can close tasks through mecha, when you opt in.** With
   `[board] close_through = "mecha"` (or a path to it) in
   `~/.mecha-graph/config.toml`, closing a task (`d`, `x`) or reopening one runs

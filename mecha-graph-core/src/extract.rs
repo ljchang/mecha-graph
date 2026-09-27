@@ -1425,4 +1425,45 @@ mod tests {
         assert_eq!(unexplained_marks(&conn).unwrap(), 1);
         assert_eq!(charged_episodes(&conn).unwrap().len(), 1);
     }
+
+    /// V027's backfill, executed: rows a V026 build wrote are marked
+    /// recorded, a charge by its reason and a clean row by its time, and a
+    /// row from before V026 stays unknown (found on review of mecha-graph#23:
+    /// no test reached the UPDATE, since a fresh store's table is empty when
+    /// V027 runs).
+    #[test]
+    fn the_v027_backfill_marks_what_a_v026_build_wrote_and_nothing_older() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        // Back to "V026 applied at a known time, V027 not yet".
+        conn.execute_batch(
+            "ALTER TABLE extract_state DROP COLUMN reason_recorded;
+             DELETE FROM _migrations WHERE version = 27;
+             UPDATE _migrations SET applied_at = '2026-09-27 00:00:00' WHERE version = 26;",
+        )
+        .unwrap();
+        for (id, failure, at) in [
+            (1, None, "2026-09-01 00:00:00"),        // before V026: unknown
+            (2, None, "2026-09-27 12:00:00"),        // clean, after V026: recorded
+            (3, Some("bad"), "2026-09-01 00:00:00"), // a charge: recorded by its reason
+        ] {
+            conn.execute(
+                "INSERT INTO extract_state
+                     (episode_id, model, prompt_version, candidates_created, failure, extracted_at)
+                 VALUES (?1, 'm', ?2, 0, ?3, ?4)",
+                params![id, PROMPT_VERSION, failure, at],
+            )
+            .unwrap();
+        }
+        crate::migrations::run_migrations(&conn).unwrap();
+        let recorded: Vec<i64> = conn
+            .prepare("SELECT reason_recorded FROM extract_state ORDER BY episode_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(recorded, vec![0, 1, 1]);
+        assert_eq!(unexplained_marks(&conn).unwrap(), 1);
+    }
 }
