@@ -112,7 +112,8 @@ isolated.
   - embeddings — `MECHA_GRAPH_EMBED_URL` or `[llm] embed_url`,
     default `http://127.0.0.1:8081`
 - **Shared by default, never duplicated.** `Backend::resolve` probes
-  `{base_url}/health`; if anything answers, it is used as-is — as long as it
+  `{base_url}/health`; if anything answers, it is used as-is (a 503 is a
+  server loading a model, and is waited for, never spawned over) — as long as it
   is llama-server: `connect` refuses a server that answers `/health` but not
   `/props`, because on a router what it serves cannot otherwise be told, so a
   bare OpenAI-compatible endpoint (vLLM, a proxy) is not supported as the chat

@@ -359,7 +359,7 @@ pub fn extract_pending(
             body: &body,
             occurred_at: &occurred_at,
         };
-        extract_settled(
+        if let Err(e) = extract_settled(
             conn,
             chat,
             &system,
@@ -367,7 +367,20 @@ pub fn extract_pending(
             &episode,
             &mut committed,
             &mut report,
-        )?;
+        ) {
+            // Say what was done before stopping: what this batch staged is
+            // committed, and a log reading only "failed" would understate it
+            // (as summarize already guards; found on review of #22).
+            eprintln!(
+                "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
+                 {} fact and {} commitment candidate(s) staged before the stop",
+                report.episodes,
+                report.errors,
+                report.fact_candidates,
+                report.commitment_candidates
+            );
+            return Err(e);
+        }
     }
     Ok(report)
 }

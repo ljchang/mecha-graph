@@ -102,6 +102,11 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// of weights took 14 s warm on this box; cold off a slow disk is minutes.
 const SPAWN_HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long to wait for a server that is already there, and loading, to
+/// finish — the same allowance as one we started, because it is the same
+/// load. Waited out rather than spawned over: the port is taken.
+const LOAD_WAIT: Duration = SPAWN_HEALTH_TIMEOUT;
+
 /// Where the completions go, and who owns the process behind them.
 pub enum Backend {
     /// Someone else's server — mecha's, or one the user started. We never
@@ -125,10 +130,44 @@ impl Backend {
     /// Probe first, spawn only if told how. See the module note for why the
     /// order and the gate are both load-bearing.
     pub fn resolve(base_url: &str, model: &str) -> Result<Self> {
-        if health_ok(base_url) {
-            return Ok(Backend::Shared {
+        Self::resolve_within(base_url, model, LOAD_WAIT)
+    }
+
+    fn resolve_within(base_url: &str, model: &str, load_wait: Duration) -> Result<Self> {
+        let shared = || {
+            Ok(Backend::Shared {
                 base_url: base_url.to_string(),
-            });
+            })
+        };
+        match health(base_url) {
+            Health::Ready => return shared(),
+            // Someone is there, mid-load: a server starting, or one swapping
+            // its model (503 "Loading model"). Neither is "nothing is
+            // answering" — reading it that way refused the night with a false
+            // cause, or spawned a second server onto a taken port (found on
+            // review of #22). Wait for the load; never spawn over it.
+            Health::Loading => {
+                let deadline = Instant::now() + load_wait;
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    match health(base_url) {
+                        Health::Ready => return shared(),
+                        Health::Loading if Instant::now() < deadline => {}
+                        Health::Loading => {
+                            return Err(Error::Other(format!(
+                                "llama-server at {base_url} is still loading after {}s",
+                                load_wait.as_secs()
+                            )))
+                        }
+                        Health::Absent => {
+                            return Err(Error::Other(format!(
+                                "llama-server at {base_url} was loading, then stopped answering"
+                            )))
+                        }
+                    }
+                }
+            }
+            Health::Absent => {}
         }
 
         let cfg = crate::integrations::load_config()?.llm;
@@ -191,7 +230,7 @@ impl Backend {
 
         let deadline = Instant::now() + SPAWN_HEALTH_TIMEOUT;
         while Instant::now() < deadline {
-            if health_ok(base_url) {
+            if health(base_url) == Health::Ready {
                 return Ok(backend);
             }
             if let Backend::Managed { child, .. } = &mut backend {
@@ -334,16 +373,31 @@ fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) ->
         .map(str::to_string)
 }
 
-fn health_ok(base_url: &str) -> bool {
+/// What `/health` says about the server behind a URL.
+#[derive(Debug, PartialEq)]
+enum Health {
+    /// 2xx: up, with its model loaded.
+    Ready,
+    /// 503: llama-server is there and loading a model.
+    Loading,
+    /// Anything else: no llama-server here to share.
+    Absent,
+}
+
+fn health(base_url: &str) -> Health {
     // /health rather than / on purpose: it is llama-server's, so an ollama
     // listening on the same port answers 404 and is correctly not adopted.
     // The probe's 10 s, for the probe's reason: a shared server's queue can
     // hold /health too, and a stall here does not refuse — it falls through
     // to spawning a second copy of the model (found on review).
-    ureq::get(&format!("{base_url}/health"))
+    match ureq::get(&format!("{base_url}/health"))
         .timeout(Duration::from_secs(10))
         .call()
-        .is_ok()
+    {
+        Ok(_) => Health::Ready,
+        Err(ureq::Error::Status(503, _)) => Health::Loading,
+        Err(_) => Health::Absent,
+    }
 }
 
 fn port_of(base_url: &str) -> Option<u16> {
@@ -530,8 +584,7 @@ impl ChatClient {
     ///
     /// Sent through the same path as every request, so it fails on what they
     /// would: an unlisted model (the router's refusal of 2026-09-27), a
-    /// server ignoring `enable_thinking=false` (the empty-completion guard),
-    /// no answer at all.
+    /// reply with no content (the empty-completion guard), no answer at all.
     pub fn canary(&self) -> Result<()> {
         let v = self.post_within(
             "Reply with the JSON object {\"ok\": true}.",
@@ -925,6 +978,28 @@ mod tests {
         c.retry_delays = vec![Duration::from_millis(50)];
         let got = c.complete_schema("s", "u", "x", serde_json::json!({"type": "object"}));
         assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// A 503 from `/health` is a server loading, not an absent one: waited
+    /// for and then shared, never refused as "nothing is answering" or
+    /// spawned over (found on review of #22). A 404 is still not adopted.
+    #[test]
+    fn a_loading_server_is_waited_for_not_spawned_over() {
+        let loading = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let url = stub(vec![loading.clone(), loading.clone(), (200, "{}".into())]);
+        assert_eq!(health(&url), Health::Loading);
+        let got = Backend::resolve_within(&url, "m", Duration::from_secs(30));
+        assert!(matches!(got, Ok(Backend::Shared { .. })), "{:?}", got.err());
+
+        let url = stub(vec![loading.clone(), loading.clone(), loading]);
+        let got = Backend::resolve_within(&url, "m", Duration::from_millis(300));
+        let Err(Error::Other(m)) = got else {
+            panic!("a load that does not finish is an error, not a spawn")
+        };
+        assert!(m.contains("still loading"), "{m}");
+
+        let url = stub(vec![(404, "{}".into())]);
+        assert_eq!(health(&url), Health::Absent);
     }
 
     /// The canary passes on an answer, and fails on a refusal and on silence
