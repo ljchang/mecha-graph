@@ -33,13 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The poison-episode mark exists so one bad episode cannot wedge every night,
   and it was applied to every failure — so a refusing or absent server aged
   out a whole batch. Who a failure belongs to is now settled by asking: after
-  a failed episode, `ChatClient::canary` sends the server one trivial request
-  with the same model and options. If that fails too, the run stops with an
-  error and marks nothing, every episode staying pending; if it answers, the
-  failure was the episode's and it is marked. A timeout gets one more try
-  first, because a link that stalled and recovered looks the same as a slow
-  episode. A 5xx or refused connection is retried for ~50 s before counting
-  (a router answers 503 while it loads a model). `summarize` asks the same
+  a failed episode, `ChatClient::canary` sends the server the same request —
+  same model, system prompt and schema — with an empty input. If that fails
+  too, the run stops with an error and marks nothing, every episode staying
+  pending; if it answers, the failure was the episode's and it is marked. No
+  answer at all (a timeout, or a 5xx or dropped connection that outlasts ~50 s
+  of retries — a router answers 503 while it loads a model) gets one more try
+  first, because a server that recovered looks the same as a failing
+  episode. A server still loading at `connect` is waited for rather than
+  refused or spawned over. `summarize` asks the same
   question and stops with an error instead of waiting out every node against
   a hung server. `extract --episode` is settled the same way. `connect` also
   refuses when a server that passed its health check does not answer

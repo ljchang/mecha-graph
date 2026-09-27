@@ -90,6 +90,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 /// still pending — never a lost one.
 const CANARY_TIMEOUT_SECS: u64 = 180;
 
+/// What the canary asks about: nothing, so that whatever fails on it is the
+/// request's and not an input's.
+const CANARY_INPUT: &str = "(This input is empty. There is nothing in it.)";
+
 /// Must sit **comfortably above** the server's `--reasoning-budget` (4096),
 /// or the thinking block consumes the whole allowance and the turn comes back
 /// with an empty `content`. That is not a hypothetical: at `max_tokens` 1024
@@ -548,7 +552,7 @@ impl ChatClient {
     /// One JSON-mode completion, shape unconstrained beyond "is an object".
     /// For callers whose output shape is a single obvious field.
     pub fn complete_json(&self, system: &str, user: &str) -> Result<serde_json::Value> {
-        self.post(system, user, serde_json::json!({ "type": "json_object" }))
+        self.post(system, user, Self::json_object_format())
     }
 
     /// One completion whose output is constrained by `schema` at the sampler.
@@ -561,18 +565,25 @@ impl ChatClient {
         name: &str,
         schema: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.post(
-            system,
-            user,
-            serde_json::json!({
-                "type": "json_schema",
-                "json_schema": { "name": name, "strict": true, "schema": schema },
-            }),
-        )
+        self.post(system, user, Self::schema_format(name, schema))
     }
 
-    /// Does the server answer *this* request — same model, same options —
-    /// right now? One trivial completion under a short timeout.
+    /// The `response_format` [`ChatClient::complete_json`] sends.
+    pub fn json_object_format() -> serde_json::Value {
+        serde_json::json!({ "type": "json_object" })
+    }
+
+    /// The `response_format` [`ChatClient::complete_schema`] sends.
+    pub fn schema_format(name: &str, schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": name, "strict": true, "schema": schema },
+        })
+    }
+
+    /// Does the server answer *this* request — same model, same system
+    /// prompt, same `response_format` — with nothing in it? One completion of
+    /// an empty input under a short timeout.
     ///
     /// This is how a failed input is charged: an input that fails while the
     /// canary answers is the input's; one that fails with the canary is the
@@ -582,33 +593,14 @@ impl ChatClient {
     /// the messages are built from values constant across a batch (found on
     /// review of #22).
     ///
-    /// Sent through the same path as every request, so it fails on what they
-    /// would: an unlisted model (the router's refusal of 2026-09-27), a
-    /// reply with no content (the empty-completion guard), no answer at all.
-    pub fn canary(&self) -> Result<()> {
-        let v = self.post_within(
-            "Reply with the JSON object {\"ok\": true}.",
-            "ok",
-            serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "canary",
-                    "strict": true,
-                    "schema": {
-                        "type": "object",
-                        "properties": { "ok": { "type": "boolean" } },
-                        "required": ["ok"],
-                    },
-                },
-            }),
-            self.canary_timeout,
-        )?;
-        match v.get("ok") {
-            Some(serde_json::Value::Bool(_)) => Ok(()),
-            _ => Err(Error::Other(format!(
-                "the canary was answered without the field it asked for: {v}"
-            ))),
-        }
+    /// The caller's system prompt and format, not a stand-in, because both
+    /// are built from graph data: an extraction schema whose predicate enum
+    /// the server refuses would 400 every episode while a two-field literal
+    /// answered, and the canary would sign off a whole batch as poison (found
+    /// on review of #22). Any JSON answer passes; the content is not graded.
+    pub fn canary(&self, system: &str, response_format: serde_json::Value) -> Result<()> {
+        self.post_within(system, CANARY_INPUT, response_format, self.canary_timeout)
+            .map(|_| ())
     }
 
     fn post(
@@ -768,12 +760,12 @@ pub(crate) mod test_http {
     /// Read one whole HTTP request — headers, then `Content-Length` bytes —
     /// so a stub never answers (and closes) mid-upload, which a client sees
     /// as a reset: a no-answer error the test did not mean to produce.
-    fn read_request(s: &mut std::net::TcpStream) {
+    fn read_request(s: &mut std::net::TcpStream) -> String {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let head_end = loop {
             match s.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => return String::new(),
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
             if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -788,10 +780,11 @@ pub(crate) mod test_http {
             .unwrap_or(0);
         while buf.len() < head_end + len {
             match s.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => return String::new(),
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
         }
+        String::from_utf8_lossy(&buf[head_end..]).into_owned()
     }
 
     /// A reply `stub` never sends: it reads the request and holds the
@@ -810,14 +803,24 @@ pub(crate) mod test_http {
     /// Answers each request with the next canned status and body, in order
     /// ([`HANG`] holds that one unanswered).
     pub(crate) fn stub(replies: Vec<(u16, String)>) -> String {
+        stub_recording(replies).0
+    }
+
+    /// [`stub`], also keeping each request's body, in order.
+    pub(crate) fn stub_recording(
+        replies: Vec<(u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
         std::thread::spawn(move || {
             for (code, body) in replies {
                 let Ok((mut s, _)) = listener.accept() else {
                     return;
                 };
-                read_request(&mut s);
+                let request = read_request(&mut s);
+                log.lock().unwrap().push(request);
                 if code == HANG {
                     // Leaked, not dropped: a closed socket is a reset, the
                     // no-answer case, where this reply means "no answer yet".
@@ -831,7 +834,7 @@ pub(crate) mod test_http {
                 );
             }
         });
-        url
+        (url, seen)
     }
 
     /// Accepts and drops every connection without answering — the no-answer
@@ -1002,19 +1005,20 @@ mod tests {
         assert_eq!(health(&url), Health::Absent);
     }
 
-    /// The canary passes on an answer, and fails on a refusal and on silence
-    /// — each the way the request it stands for would have.
+    /// The canary passes on any JSON answer, and fails on a refusal and on
+    /// silence — each the way the request it stands for would have.
     #[test]
     fn the_canary_fails_where_the_request_would() {
-        let c = ChatClient::at(&stub(vec![answer(r#"{"ok":true}"#)]));
-        assert!(c.canary().is_ok());
+        let fmt = || ChatClient::json_object_format();
+        let c = ChatClient::at(&stub(vec![answer(r#"{"anything":[]}"#)]));
+        assert!(c.canary("s", fmt()).is_ok());
         let refused = r#"{"error":{"message":"model 'llama-server' not found"}}"#;
         let c = ChatClient::at(&stub(vec![(400, refused.into())]));
-        assert!(c.canary().is_err());
+        assert!(c.canary("s", fmt()).is_err());
         let c = ChatClient::at(&hung_server());
-        assert!(matches!(c.canary(), Err(Error::Timeout(_))));
-        let c = ChatClient::at(&stub(vec![answer(r#"{"nope":1}"#)]));
-        assert!(c.canary().is_err(), "an answer without the asked-for field");
+        assert!(matches!(c.canary("s", fmt()), Err(Error::Timeout(_))));
+        let c = ChatClient::at(&stub(vec![answer("not json")]));
+        assert!(c.canary("s", fmt()).is_err(), "an answer that is not JSON");
     }
 
     #[test]

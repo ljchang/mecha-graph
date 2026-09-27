@@ -170,7 +170,7 @@ pub fn refresh_summaries(
             // Stop, and fail the command so the nightly logs and alerts it.
             // If it answers, the failure was this node's; record it and go on.
             Err(e) => {
-                if let Err(canary) = chat.canary() {
+                if let Err(canary) = chat.canary(SYSTEM_PROMPT, ChatClient::json_object_format()) {
                     // Say what was done before stopping: the summaries written
                     // so far are committed, and the log must not understate them.
                     eprintln!(

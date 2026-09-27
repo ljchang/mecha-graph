@@ -302,7 +302,7 @@ case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) STALE="${STALE:+$STALE; }nightly.env $NIGHTLY_ENV_STATUS (precheck toggles forced off)" ;;
 esac
-if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+if [ -n "${FAILED_STEPS[*]-}" ]; then
     STALE="${STALE:+$STALE; }failed: $(IFS=,; echo "${FAILED_STEPS[*]}" | sed 's/,/, /g')"
 fi
 

@@ -456,9 +456,15 @@ struct Pending<'a> {
 ///   marked attempted, so one bad episode cannot wedge every night —
 ///   however many bad episodes sit together, and however alike their
 ///   errors read.
-/// - A timeout gets one more try once the canary answers, because a link
-///   that stalled mid-request and has since recovered also looks like a
-///   timeout; charging the episode for it would lose it on one blip.
+/// - No answer — a timeout, or a 5xx or dropped connection that outlasted
+///   the client's retries — gets one more try once the canary answers,
+///   because a link or server that failed mid-request and has since
+///   recovered looks the same as an input that fails; charging the episode
+///   for it would lose it on one blip. A 5xx can be the input's own
+///   (llama.cpp 500s on a prompt it cannot tokenize or fit), so it is
+///   settled by the canary too, never by its status alone — or that one
+///   episode would stop every night at the same place (found on review
+///   of #22).
 fn extract_settled(
     conn: &Connection,
     chat: &ChatClient,
@@ -470,30 +476,42 @@ fn extract_settled(
 ) -> Result<()> {
     report.episodes += 1;
     let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
-    if let Some(e @ Error::Timeout(_)) = &failed {
-        server_answers(chat, episode.id, e)?;
+    if let Some(e @ (Error::Timeout(_) | Error::Transport(_))) = &failed {
+        server_answers(chat, system, schema, episode.id, e)?;
         eprintln!(
-            "extract: episode {}: the server answers a trivial request, so the episode gets \
-             one more try",
+            "extract: episode {}: the server answers the same request with an empty input, \
+             so the episode gets one more try",
             episode.id
         );
         failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
     }
     if let Some(e) = failed {
+        server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
-        server_answers(chat, episode.id, &e)?;
         mark_attempted(conn, episode.id, &chat.model)?;
     }
     Ok(())
 }
 
-/// `Ok` when the server answers the canary; the stopping error when not.
-fn server_answers(chat: &ChatClient, episode_id: i64, failure: &Error) -> Result<()> {
-    chat.canary().map_err(|canary| {
+/// `Ok` when the server answers the canary — this run's own system prompt
+/// and schema, with an empty input; the stopping error when not.
+fn server_answers(
+    chat: &ChatClient,
+    system: &str,
+    schema: &serde_json::Value,
+    episode_id: i64,
+    failure: &Error,
+) -> Result<()> {
+    chat.canary(
+        system,
+        ChatClient::schema_format("extraction", schema.clone()),
+    )
+    .map_err(|canary| {
         Error::Other(format!(
-            "extract: episode {episode_id} failed ({failure}) and a trivial request then \
-             failed too ({canary}) — the server or the request is at fault, not the episode, \
-             so the run stops with it and every later episode unmarked and pending"
+            "extract: episode {episode_id} failed ({failure}) and the same request with an \
+                 empty input then failed too ({canary}) — the server or the request is at \
+                 fault, not the episode, so the run stops with it and every later episode \
+                 unmarked and pending"
         ))
     })
 }
@@ -543,18 +561,8 @@ fn extract_episode(
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         {
             Ok(p) => p,
-            // No answer from the server is not the episode's doing: stop the
-            // batch and mark nothing, so this and every later episode stay
-            // pending for the next run. Marking them is how one restart (or a
-            // router's 503 while it swaps a model) aged out a whole batch.
-            Err(e @ Error::Transport(_)) => {
-                eprintln!(
-                    "extract: episode {episode_id}: {e} — stopping the batch; nothing marked"
-                );
-                return Err(e);
-            }
-            // An answer that failed, or a timeout: the episode's or the
-            // request's. Not marked here — `extract_settled` asks the server.
+            // A failed answer, or none: the episode's or the request's. Not
+            // marked here — `extract_settled` asks the server which.
             Err(e) => {
                 eprintln!("extract: episode {episode_id}: {e}");
                 return Ok(Some(e));
@@ -1111,6 +1119,7 @@ mod tests {
     /// whole batch; a closed port is the no-answer case.
     #[test]
     fn an_unanswered_request_stops_the_batch_and_marks_no_episode() {
+        // (The canary goes unanswered too, which is what stops it.)
         let conn = open_memory().unwrap();
         crate::episode::upsert_episode(&conn, &plain_episode("note", "a", "2026-01-05 10:00:00"))
             .unwrap();
@@ -1118,7 +1127,7 @@ mod tests {
             .unwrap();
         let chat = crate::llm::ChatClient::at(&dead_server());
         let got = extract_pending(&conn, &chat, 10, None, None);
-        assert!(matches!(got, Err(Error::Transport(_))), "{got:?}");
+        assert!(got.is_err(), "{got:?}");
         let marked: i64 = conn
             .query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
             .unwrap();
@@ -1232,5 +1241,60 @@ mod tests {
         assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
         assert_eq!(marked(&conn), 0);
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 3);
+    }
+
+    /// The canary is the failed request itself with an empty input — the
+    /// same system prompt and the same schema, both built from graph data —
+    /// so a refusal the schema causes is one the canary shares (found on
+    /// review of #22: a two-field literal answered while every episode 400d).
+    #[test]
+    fn the_canary_is_the_failed_request_with_an_empty_input() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let (url, seen) = crate::llm::test_http::stub_recording(vec![
+            (400, r#"{"error":{"message":"bad episode"}}"#.into()),
+            answer(NOTHING),
+        ]);
+        let chat = crate::llm::ChatClient::at(&url);
+        extract_pending(&conn, &chat, 10, None, None).unwrap();
+        let seen = seen.lock().unwrap();
+        let body = |i: usize| serde_json::from_str::<serde_json::Value>(&seen[i]).unwrap();
+        let (episode, canary) = (body(0), body(1));
+        assert_eq!(
+            episode["messages"][0], canary["messages"][0],
+            "the same system prompt"
+        );
+        assert_eq!(
+            episode["response_format"], canary["response_format"],
+            "the same schema"
+        );
+        assert_ne!(
+            episode["messages"][1], canary["messages"][1],
+            "an empty input"
+        );
+    }
+
+    /// A 5xx is settled by the canary like any failure: one that recovered
+    /// gets the episode another try; one the server keeps giving only on
+    /// this episode is the episode's, and it is marked rather than stopping
+    /// every night at the same place (found on review of #22).
+    #[test]
+    fn a_5xx_the_server_does_not_share_is_the_episodes() {
+        let e500 = (
+            500,
+            r#"{"error":{"message":"failed to tokenize"}}"#.to_string(),
+        );
+        let conn = open_memory().unwrap();
+        episodes(&conn, 2);
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            e500.clone(),
+            answer(NOTHING),
+            e500,
+            answer(NOTHING),
+            answer(NOTHING),
+        ]));
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!((report.episodes, report.errors), (2, 1));
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 0);
     }
 }
