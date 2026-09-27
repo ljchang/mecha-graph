@@ -142,6 +142,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "extract_state_failure",
         sql: V026_EXTRACT_STATE_FAILURE,
     },
+    Migration {
+        version: 27,
+        name: "extract_state_reason_recorded",
+        sql: V027_EXTRACT_STATE_REASON_RECORDED,
+    },
 ];
 
 /// Semantic rejection memory (review-on-use §5): the embedded index of
@@ -1211,4 +1216,25 @@ ALTER TABLE cooccurrence_alarm ADD COLUMN first_observed_co INTEGER;
 /// 2026-09-27 batch was marked before it existed.
 const V026_EXTRACT_STATE_FAILURE: &str = r#"
 ALTER TABLE extract_state ADD COLUMN failure TEXT;
+"#;
+
+/// Whether this row's writer recorded a reason when there was one — 1 from
+/// every write since, so a NULL `failure` beside it is a clean extraction;
+/// 0 (the default) on rows from before, whose NULL is unknown. On the row
+/// itself rather than inferred from when V026 was applied, because
+/// `_migrations` does not travel: a fork or decrypted snapshot re-runs the
+/// migrations at copy time, so every copied row predated the copy's own V026
+/// and the count reverted to the inflated figure (found on review of
+/// mecha-graph#23). A source without this column copies in as 0 — unknown,
+/// the honest answer for it.
+///
+/// The backfill runs once, on the store it migrates: there `_migrations`
+/// holds the real V026 time, so rows written since (clean or charged) are
+/// marked recorded. On a copy it runs on an empty table first and each row
+/// then brings its own value.
+const V027_EXTRACT_STATE_REASON_RECORDED: &str = r#"
+ALTER TABLE extract_state ADD COLUMN reason_recorded INTEGER NOT NULL DEFAULT 0;
+UPDATE extract_state SET reason_recorded = 1
+ WHERE failure IS NOT NULL
+    OR extracted_at >= (SELECT applied_at FROM _migrations WHERE version = 26);
 "#;
