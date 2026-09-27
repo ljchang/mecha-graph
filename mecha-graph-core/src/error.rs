@@ -21,6 +21,13 @@ pub enum Error {
     /// an infrastructure blip ages out every episode behind it (2026-09-27).
     #[error("{0}")]
     Transport(String),
+    /// The server took the request and gave no answer within the client's
+    /// timeout. Whose that is cannot be read off the error: a server working
+    /// through a very long input and a link that stalled mid-request look the
+    /// same from here. Callers ask the server (`ChatClient::canary`) and give
+    /// the input one more try before charging it (found on review of #22).
+    #[error("{0}")]
+    Timeout(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

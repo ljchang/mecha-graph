@@ -29,13 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now the one resident in `/models`, and a configured fallback the router does
   not list makes `connect` refuse before the first request, so a batch is never
   burned.
-- **`extract` no longer marks an episode attempted when the server gave no
-  answer.** A 5xx (a router answers 503 while it swaps a model), a timeout or
-  a refused connection is `Error::Transport`: the batch stops and nothing is
-  marked, so every episode stays pending. The poison-episode mark is kept for
-  answers that are the episode's doing — a 4xx, unparseable output, an empty
-  completion. `connect` also refuses when a server that passed its health
-  check does not answer `/props` (a probe now waits 10 s, not 1.5).
+- **`extract` no longer marks an episode attempted for the server's failure.**
+  The poison-episode mark exists so one bad episode cannot wedge every night,
+  and it was applied to every failure — so a refusing or absent server aged
+  out a whole batch. Who a failure belongs to is now settled by asking: after
+  a failed episode, `ChatClient::canary` sends the server one trivial request
+  with the same model and options. If that fails too, the run stops with an
+  error and marks nothing, every episode staying pending; if it answers, the
+  failure was the episode's and it is marked. A timeout gets one more try
+  first, because a link that stalled and recovered looks the same as a slow
+  episode. A 5xx or refused connection is retried for ~50 s before counting
+  (a router answers 503 while it loads a model). `summarize` asks the same
+  question and stops with an error instead of waiting out every node against
+  a hung server. `extract --episode` is settled the same way. `connect` also
+  refuses when a server that passed its health check does not answer
+  `/props` (a probe now waits 10 s, not 1.5).
 
 - **A multiword denylist term split across a line break is caught.** grep
   reads one line at a time, and prose here is hard-wrapped at ~75 columns in

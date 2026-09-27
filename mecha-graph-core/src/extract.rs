@@ -353,56 +353,22 @@ pub fn extract_pending(
         ..Default::default()
     };
 
-    let mut held: Vec<i64> = Vec::new();
-    let mut held_error: Option<String> = None;
     for (episode_id, _uid, body, occurred_at) in rows {
-        let failed = extract_episode(
+        let episode = Pending {
+            id: episode_id,
+            body: &body,
+            occurred_at: &occurred_at,
+        };
+        extract_settled(
             conn,
             chat,
             &system,
             &schema,
-            episode_id,
-            &body,
-            &occurred_at,
+            &episode,
             &mut committed,
             &mut report,
         )?;
-        match failed {
-            None => {
-                // A success after failures: those were the episodes' own.
-                for id in held.drain(..) {
-                    mark_attempted(conn, id, &chat.model)?;
-                }
-                held_error = None;
-            }
-            Some(err) => {
-                if held_error.as_deref() != Some(err.as_str()) {
-                    // A different failure: the ones before it were not the
-                    // request's (they did not repeat), so mark them.
-                    for id in held.drain(..) {
-                        mark_attempted(conn, id, &chat.model)?;
-                    }
-                    held_error = Some(err);
-                }
-                held.push(episode_id);
-                if held.len() >= STOP_AFTER_CONSECUTIVE_FAILURES {
-                    return Err(Error::Other(format!(
-                        "extract: {} episodes in a row failed identically — a failure that \
-                         repeats is the request's, not the episodes' — so the batch stops and \
-                         none is marked; they stay pending (the errors above say why)",
-                        held.len()
-                    )));
-                }
-            }
-        }
     }
-    // At the end: one leftover failure is treated as poison, as before; two or
-    // more alike are left pending — too few to call the request's, too alike
-    // to call the episodes'. The next run, with more episodes, decides.
-    if held.len() == 1 {
-        mark_attempted(conn, held[0], &chat.model)?;
-    }
-
     Ok(report)
 }
 
@@ -440,38 +406,102 @@ pub fn reextract_episode(
         ..Default::default()
     };
     let mut committed = commitment_block_set(conn)?;
-    let failed = extract_episode(
+    let episode = Pending {
+        id: episode_id,
+        body: &body,
+        occurred_at: &occurred_at,
+    };
+    // Settled as a batch's episode is: a targeted re-run while the server is
+    // down must not mark the episode it was run to recover.
+    extract_settled(
         conn,
         chat,
         &system,
         &schema,
-        episode_id,
-        &body,
-        &occurred_at,
+        &episode,
         &mut committed,
         &mut report,
     )?;
-    // A targeted re-run that fails is marked, as a batch's lone failure is.
-    if failed.is_some() {
-        mark_attempted(conn, episode_id, &chat.model)?;
-    }
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One episode a run is about to extract.
+struct Pending<'a> {
+    id: i64,
+    body: &'a str,
+    occurred_at: &'a str,
+}
+
+/// Extract one episode, and settle who a failure belongs to by asking the
+/// server rather than reading the error.
+///
+/// - A failure the server also fails the canary on is the server's or the
+///   request's (`400 model 'llama-server' not found` on every request,
+///   2026-09-27): the run stops with `Err`, this episode and every later one
+///   unmarked and pending.
+/// - A failure while the canary answers is the episode's (poison input):
+///   marked attempted, so one bad episode cannot wedge every night —
+///   however many bad episodes sit together, and however alike their
+///   errors read.
+/// - A timeout gets one more try once the canary answers, because a link
+///   that stalled mid-request and has since recovered also looks like a
+///   timeout; charging the episode for it would lose it on one blip.
+fn extract_settled(
+    conn: &Connection,
+    chat: &ChatClient,
+    system: &str,
+    schema: &serde_json::Value,
+    episode: &Pending,
+    committed: &mut std::collections::HashSet<String>,
+    report: &mut ExtractReport,
+) -> Result<()> {
+    report.episodes += 1;
+    let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
+    if let Some(e @ Error::Timeout(_)) = &failed {
+        server_answers(chat, episode.id, e)?;
+        eprintln!(
+            "extract: episode {}: the server answers a trivial request, so the episode gets \
+             one more try",
+            episode.id
+        );
+        failed = extract_episode(conn, chat, system, schema, episode, committed, report)?;
+    }
+    if let Some(e) = failed {
+        report.errors += 1;
+        server_answers(chat, episode.id, &e)?;
+        mark_attempted(conn, episode.id, &chat.model)?;
+    }
+    Ok(())
+}
+
+/// `Ok` when the server answers the canary; the stopping error when not.
+fn server_answers(chat: &ChatClient, episode_id: i64, failure: &Error) -> Result<()> {
+    chat.canary().map_err(|canary| {
+        Error::Other(format!(
+            "extract: episode {episode_id} failed ({failure}) and a trivial request then \
+             failed too ({canary}) — the server or the request is at fault, not the episode, \
+             so the run stops with it and every later episode unmarked and pending"
+        ))
+    })
+}
+
+/// One extraction attempt. `Ok(Some(e))` is an answer that failed, for
+/// [`extract_settled`] to charge; `Err` is no answer at all, or a local error.
 fn extract_episode(
     conn: &Connection,
     chat: &ChatClient,
     system: &str,
     schema: &serde_json::Value,
-    episode_id: i64,
-    body: &str,
-    occurred_at: &str,
+    episode: &Pending,
     committed: &mut std::collections::HashSet<String>,
     report: &mut ExtractReport,
-) -> Result<Option<String>> {
+) -> Result<Option<Error>> {
+    let &Pending {
+        id: episode_id,
+        body,
+        occurred_at,
+    } = episode;
     {
-        report.episodes += 1;
         let body_trunc: String = body.chars().take(6000).collect();
         // Entities the deterministic alias scan already linked: anchoring
         // the model to canonical names is what keeps subjects resolvable —
@@ -510,13 +540,11 @@ fn extract_episode(
                 );
                 return Err(e);
             }
-            // An answer that failed: possibly the episode's (poison input),
-            // possibly the request's. Not marked here — the caller marks it
-            // once it knows which (see `extract_pending`).
+            // An answer that failed, or a timeout: the episode's or the
+            // request's. Not marked here — `extract_settled` asks the server.
             Err(e) => {
-                report.errors += 1;
                 eprintln!("extract: episode {episode_id}: {e}");
-                return Ok(Some(e.to_string()));
+                return Ok(Some(e));
             }
         };
 
@@ -649,19 +677,6 @@ fn mark_attempted(conn: &Connection, episode_id: i64, model: &str) -> Result<()>
     )?;
     Ok(())
 }
-
-/// Consecutive *alike* failures after which a batch stops, marking none.
-///
-/// The poison-episode rule only has to survive ONE bad episode. A failure
-/// that repeats **identically**, episode after episode, is the request's —
-/// a model name the server refuses (`400 model 'X' not found`, 2026-09-27), a
-/// flag a newer server rejects — and marking each would age out the batch.
-/// Failures that differ (an empty completion after N chars of reasoning, a
-/// timeout on a long transcript) are the episodes' own, even three in a row,
-/// and are marked: stopping on them would wedge every night at the same spot.
-/// So a failure is held while it repeats the one before it; a success or a
-/// different failure marks what was held; this many alike stops the run.
-const STOP_AFTER_CONSECUTIVE_FAILURES: usize = 3;
 
 /// Accept a commitment candidate: materialize Task node + task_detail +
 /// waiting_on/originated_in facts (§6's payoff graph shape).
@@ -851,7 +866,7 @@ mod tests {
     use super::*;
 
     use crate::db::open_memory;
-    use crate::llm::test_http::{dead_server, stub};
+    use crate::llm::test_http::{answer, dead_server, hung_server, stub, HANG};
 
     fn stub_all(code: u16, body: &str, n: usize) -> String {
         stub((0..n).map(|_| (code, body.to_string())).collect())
@@ -1098,8 +1113,6 @@ mod tests {
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
     }
 
-    /// The 2026-09-27 shape — every request refused alike — stops the batch
-    /// after three and marks none; a short run of failures is still marked,
     fn episodes(conn: &Connection, n: usize) {
         for i in 0..n {
             let at = format!("2026-01-{:02} 10:00:00", i + 1);
@@ -1113,45 +1126,98 @@ mod tests {
             .unwrap()
     }
 
-    /// The 2026-09-27 shape — every request refused alike — stops the batch
-    /// after three and marks none.
+    const REFUSED: &str = r#"{"error":{"code":400,"message":"model 'llama-server' not found"}}"#;
+    const CANARY_OK: &str = r#"{"ok":true}"#;
+    const NOTHING: &str = r#"{"entities":[],"facts":[],"commitments":[]}"#;
+
+    /// The 2026-09-27 shape — every request refused, the canary with them —
+    /// stops the run at the first episode and marks none, whether a batch or
+    /// a targeted re-run (the one run to recover a lost episode).
     #[test]
-    fn a_failure_repeated_identically_stops_the_batch_unmarked() {
-        let refused = r#"{"error":{"code":400,"message":"model 'llama-server' not found"}}"#;
+    fn a_failure_the_canary_shares_stops_the_run_unmarked() {
         let conn = open_memory().unwrap();
         episodes(&conn, 5);
-        let chat = crate::llm::ChatClient::at(&stub_all(400, refused, 10));
+        let chat = crate::llm::ChatClient::at(&stub_all(400, REFUSED, 10));
         assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
         assert_eq!(marked(&conn), 0);
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 5);
 
-        // Two alike at the end of a batch: too few to blame the request, too
-        // alike to blame the episodes — left pending, not marked.
-        let conn = open_memory().unwrap();
-        episodes(&conn, 2);
-        let chat = crate::llm::ChatClient::at(&stub_all(400, refused, 10));
-        assert!(extract_pending(&conn, &chat, 10, None, None).is_ok());
+        let chat = crate::llm::ChatClient::at(&stub_all(400, REFUSED, 10));
+        assert!(reextract_episode(&conn, &chat, "1").is_err());
         assert_eq!(marked(&conn), 0);
     }
 
-    /// Failures that differ are the episodes' own: three in a row are marked
-    /// and do not stop the batch, or three adjacent bad episodes would wedge
-    /// every night at the same place.
+    /// Failures while the canary answers are the episodes' own, and are
+    /// marked however many sit together and however alike they read — the
+    /// error text is built from values constant across a batch, so "alike"
+    /// could not tell three bad episodes from a refused request, and held
+    /// them pending forever (found on review of #22).
     #[test]
-    fn failures_that_differ_are_the_episodes_and_are_marked() {
+    fn failures_while_the_canary_answers_are_the_episodes_and_are_marked() {
         let conn = open_memory().unwrap();
         episodes(&conn, 3);
-        let chat = crate::llm::ChatClient::at(&stub(
-            (0..3)
-                .map(|i| {
-                    (
-                        400,
-                        format!(r#"{{"error":{{"message":"episode-specific {i}"}}}}"#),
-                    )
-                })
-                .collect(),
-        ));
-        assert!(extract_pending(&conn, &chat, 10, None, None).is_ok());
+        let bad = (
+            400,
+            r#"{"error":{"message":"the prompt is too long"}}"#.to_string(),
+        );
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            bad.clone(),
+            answer(CANARY_OK),
+            bad.clone(),
+            answer(CANARY_OK),
+            bad,
+            answer(CANARY_OK),
+        ]));
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
         assert_eq!(marked(&conn), 3);
+        assert_eq!((report.episodes, report.errors), (3, 3));
+    }
+
+    /// A timeout followed by an answering canary is retried once: a link that
+    /// stalled and recovered must not cost the episode. Two timeouts with the
+    /// server answering between them are the episode's, and it is marked.
+    #[test]
+    fn a_timeout_gets_one_more_try_once_the_canary_answers() {
+        let hang = (HANG, String::new());
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let mut chat = crate::llm::ChatClient::at(&stub(vec![
+            hang.clone(),
+            answer(CANARY_OK),
+            answer(NOTHING),
+        ]));
+        chat.timeout = std::time::Duration::from_secs(1);
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!(
+            (report.episodes, report.errors),
+            (1, 0),
+            "the retry succeeded"
+        );
+
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let mut chat = crate::llm::ChatClient::at(&stub(vec![
+            hang.clone(),
+            answer(CANARY_OK),
+            hang,
+            answer(CANARY_OK),
+        ]));
+        chat.timeout = std::time::Duration::from_secs(1);
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!((report.episodes, report.errors), (1, 1));
+        assert_eq!(marked(&conn), 1);
+    }
+
+    /// A hung server times out the episode and then the canary: the run
+    /// stops with every episode pending.
+    #[test]
+    fn a_hung_server_stops_the_run_unmarked() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let mut chat = crate::llm::ChatClient::at(&hung_server());
+        chat.timeout = std::time::Duration::from_secs(1);
+        assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
+        assert_eq!(marked(&conn), 0);
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 3);
     }
 }

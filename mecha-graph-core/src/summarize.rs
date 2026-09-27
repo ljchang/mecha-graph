@@ -163,24 +163,32 @@ pub fn refresh_summaries(
         match summarize_node(conn, chat, &id) {
             Ok(true) => report.refreshed += 1,
             Ok(false) => {}
-            // No answer from the server: every later node would wait out the
-            // same timeout (900 s each) for the same nothing. Stop, and fail
-            // the command so the nightly logs and alerts it (found on review).
-            Err(e @ Error::Transport(_)) => {
-                // Say what was done before stopping: the summaries written so
-                // far are committed, and the log must not understate them.
-                eprintln!(
-                    "summarize: stopping — {} refreshed, {} failed before the server stopped \
-                     answering",
-                    report.refreshed,
-                    report.errors.len()
-                );
-                for e in &report.errors {
-                    eprintln!("summarize: {e}");
+            // Whose failure is it? Ask the server (`ChatClient::canary`): if
+            // it cannot answer a trivial request either, every later node
+            // would wait out the same timeout (900 s each) for the same
+            // nothing, and a hung server would hold the nightly for hours.
+            // Stop, and fail the command so the nightly logs and alerts it.
+            // If it answers, the failure was this node's; record it and go on.
+            Err(e) => {
+                if let Err(canary) = chat.canary() {
+                    // Say what was done before stopping: the summaries written
+                    // so far are committed, and the log must not understate them.
+                    eprintln!(
+                        "summarize: stopping — {} refreshed, {} failed before the server \
+                         stopped answering",
+                        report.refreshed,
+                        report.errors.len()
+                    );
+                    for e in &report.errors {
+                        eprintln!("summarize: {e}");
+                    }
+                    return Err(Error::Other(format!(
+                        "summarize: {id} failed ({e}) and a trivial request then failed too \
+                         ({canary}) — the server is not answering"
+                    )));
                 }
-                return Err(e);
+                report.errors.push(format!("{id}: {e}"));
             }
-            Err(e) => report.errors.push(format!("{id}: {e}")),
         }
     }
     Ok(report)
@@ -279,5 +287,36 @@ mod tests {
             !ev.contains("private matter"),
             "private episodes must not feed summaries"
         );
+    }
+
+    fn two_stale(conn: &Connection) {
+        for id in ["a", "b"] {
+            upsert_node(conn, &Node::new(id, "project", id)).unwrap();
+            seed(conn, id, 4, "personal");
+        }
+    }
+
+    /// A node's failure while the server answers the canary is that node's;
+    /// one the canary shares — a hung server — stops the run with an error,
+    /// so the nightly alerts instead of waiting out every node (found on
+    /// review of #22: a timeout used to fall through and return `Ok`).
+    #[test]
+    fn a_failure_is_charged_by_asking_the_server() {
+        use crate::llm::test_http::{answer, hung_server, stub};
+        let conn = open_memory().unwrap();
+        two_stale(&conn);
+        let chat = ChatClient::at(&stub(vec![
+            (400, r#"{"error":{"message":"bad node"}}"#.into()),
+            answer(r#"{"ok":true}"#),
+            answer(r#"{"summary":"A project."}"#),
+        ]));
+        let r = refresh_summaries(&conn, &chat, 10).unwrap();
+        assert_eq!((r.refreshed, r.errors.len()), (1, 1));
+
+        let conn = open_memory().unwrap();
+        two_stale(&conn);
+        let mut chat = ChatClient::at(&hung_server());
+        chat.timeout = std::time::Duration::from_secs(1);
+        assert!(refresh_summaries(&conn, &chat, 10).is_err());
     }
 }

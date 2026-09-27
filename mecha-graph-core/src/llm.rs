@@ -84,6 +84,12 @@ pub const DEFAULT_MODEL: &str = "qwen3.6-35b-a3b";
 /// episode into a dropped one. mecha's own provider allows 900 s.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
+/// The canary's own ceiling (`ChatClient::canary`). Room for a router's cold
+/// load (33–39 s measured) and a queue behind other tenants, far short of a
+/// real request's 900 s. Erring short costs a stopped batch — every episode
+/// still pending — never a lost one.
+const CANARY_TIMEOUT_SECS: u64 = 180;
+
 /// Must sit **comfortably above** the server's `--reasoning-budget` (4096),
 /// or the thinking block consumes the whole allowance and the turn comes back
 /// with an empty `content`. That is not a hypothetical: at `max_tokens` 1024
@@ -360,6 +366,9 @@ pub struct ChatClient {
     /// a refused or reset connection). A router answers 503 while it loads a
     /// model, and a load takes 30–40 s from disk, so the default spans ~50 s.
     retry_delays: Vec<Duration>,
+    /// How long [`ChatClient::canary`] waits. Short, because the canary is
+    /// trivial: a server that cannot answer it in this long is not answering.
+    canary_timeout: Duration,
     backend: Backend,
 }
 
@@ -374,6 +383,7 @@ impl ChatClient {
             max_tokens: 64,
             think: false,
             retry_delays: Vec::new(),
+            canary_timeout: Duration::from_secs(1),
             backend: Backend::Shared {
                 base_url: base_url.to_string(),
             },
@@ -468,6 +478,7 @@ impl ChatClient {
             max_tokens: DEFAULT_MAX_TOKENS,
             think: true,
             retry_delays: [5, 15, 30].map(Duration::from_secs).to_vec(),
+            canary_timeout: Duration::from_secs(CANARY_TIMEOUT_SECS),
             backend,
         })
     }
@@ -506,11 +517,62 @@ impl ChatClient {
         )
     }
 
+    /// Does the server answer *this* request — same model, same options —
+    /// right now? One trivial completion under a short timeout.
+    ///
+    /// This is how a failed input is charged: an input that fails while the
+    /// canary answers is the input's; one that fails with the canary is the
+    /// server's or the request's. Asked, never read off the error — comparing
+    /// error strings cannot tell a slow input from a stalled link, or three
+    /// episodes that each time out from a server refusing them all, because
+    /// the messages are built from values constant across a batch (found on
+    /// review of #22).
+    ///
+    /// Sent through the same path as every request, so it fails on what they
+    /// would: an unlisted model (the router's refusal of 2026-09-27), a
+    /// server ignoring `enable_thinking=false` (the empty-completion guard),
+    /// no answer at all.
+    pub fn canary(&self) -> Result<()> {
+        let v = self.post_within(
+            "Reply with the JSON object {\"ok\": true}.",
+            "ok",
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "canary",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": { "ok": { "type": "boolean" } },
+                        "required": ["ok"],
+                    },
+                },
+            }),
+            self.canary_timeout,
+        )?;
+        match v.get("ok") {
+            Some(serde_json::Value::Bool(_)) => Ok(()),
+            _ => Err(Error::Other(format!(
+                "the canary was answered without the field it asked for: {v}"
+            ))),
+        }
+    }
+
     fn post(
         &self,
         system: &str,
         user: &str,
         response_format: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post_within(system, user, response_format, self.timeout)
+    }
+
+    fn post_within(
+        &self,
+        system: &str,
+        user: &str,
+        response_format: serde_json::Value,
+        timeout: Duration,
     ) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -530,18 +592,17 @@ impl ChatClient {
         }
 
         // Three outcomes, and who they belong to decides what callers do:
-        // - an answer that refuses (4xx) is `Other` — possibly the input's;
-        // - no answer in `self.timeout` is `Other` too: a server that is up
-        //   and working through a long input is telling us about the input
-        //   (a very long episode), and blaming the server would stop every
-        //   night at the same episode;
+        // - an answer that refuses (4xx) is `Other` — the input's or the
+        //   request's, which only `canary` can tell apart;
+        // - no answer within `timeout` is `Timeout`: a slow input or a
+        //   stalled link, which the error alone cannot tell apart either;
         // - no answer at all (a 5xx, a refused or reset connection) is the
         //   server's. It is retried over `retry_delays` — a router answers 503
         //   while it loads a model — and only a sustained one is `Transport`.
         let mut attempt = 0;
         let resp = loop {
             let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
-                .timeout(self.timeout)
+                .timeout(timeout)
                 .send_json(body.clone());
             let err = match sent {
                 Ok(r) => break r,
@@ -562,10 +623,9 @@ impl ChatClient {
                 Err(other) => {
                     let text = other.to_string();
                     if text.contains("timed out") {
-                        return Err(Error::Other(format!(
-                            "no answer from llama-server within {}s (timed out) — a server \
-                             that is up and still working is slow on this input",
-                            self.timeout.as_secs()
+                        return Err(Error::Timeout(format!(
+                            "no answer from llama-server within {}s (timed out)",
+                            timeout.as_secs()
                         )));
                     }
                     Error::Transport(format!(
@@ -681,7 +741,21 @@ pub(crate) mod test_http {
         }
     }
 
-    /// Answers each request with the next canned status and body, in order.
+    /// A reply `stub` never sends: it reads the request and holds the
+    /// connection open, so the client times out.
+    pub(crate) const HANG: u16 = 0;
+
+    /// A 200 carrying `content` as the model's answer.
+    pub(crate) fn answer(content: &str) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({"choices": [{"message": {"content": content}, "finish_reason": "stop"}]})
+                .to_string(),
+        )
+    }
+
+    /// Answers each request with the next canned status and body, in order
+    /// ([`HANG`] holds that one unanswered).
     pub(crate) fn stub(replies: Vec<(u16, String)>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -691,6 +765,12 @@ pub(crate) mod test_http {
                     return;
                 };
                 read_request(&mut s);
+                if code == HANG {
+                    // Leaked, not dropped: a closed socket is a reset, the
+                    // no-answer case, where this reply means "no answer yet".
+                    std::mem::forget(s);
+                    continue;
+                }
                 let _ = write!(
                     s,
                     "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -733,7 +813,7 @@ pub(crate) mod test_http {
 
 #[cfg(test)]
 mod tests {
-    use super::test_http::{dead_server, hung_server, stub};
+    use super::test_http::{answer, dead_server, hung_server, stub};
     use super::*;
 
     /// A router's bare `/props` is never the answer — the night it was, every
@@ -802,9 +882,8 @@ mod tests {
         );
     }
 
-    /// A 5xx and no answer at all are the server's; a 4xx is an answer.
     /// A 5xx and no answer at all are the server's; a 4xx is an answer; a
-    /// timeout is the input's (the server is up and slow on it).
+    /// timeout is its own class, because the error cannot say whose it is.
     #[test]
     fn who_a_failure_belongs_to_decides_its_error() {
         let schema = serde_json::json!({"type": "object"});
@@ -829,8 +908,8 @@ mod tests {
         let mut c = ChatClient::at(&hung_server());
         c.timeout = Duration::from_secs(1);
         match c.complete_schema("s", "u", "x", schema) {
-            Err(Error::Other(m)) => assert!(m.contains("timed out"), "{m}"),
-            other => panic!("a timeout is the input's, not Transport: {other:?}"),
+            Err(Error::Timeout(m)) => assert!(m.contains("timed out"), "{m}"),
+            other => panic!("a timeout is neither Other nor Transport: {other:?}"),
         }
     }
 
@@ -846,6 +925,21 @@ mod tests {
         c.retry_delays = vec![Duration::from_millis(50)];
         let got = c.complete_schema("s", "u", "x", serde_json::json!({"type": "object"}));
         assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// The canary passes on an answer, and fails on a refusal and on silence
+    /// — each the way the request it stands for would have.
+    #[test]
+    fn the_canary_fails_where_the_request_would() {
+        let c = ChatClient::at(&stub(vec![answer(r#"{"ok":true}"#)]));
+        assert!(c.canary().is_ok());
+        let refused = r#"{"error":{"message":"model 'llama-server' not found"}}"#;
+        let c = ChatClient::at(&stub(vec![(400, refused.into())]));
+        assert!(c.canary().is_err());
+        let c = ChatClient::at(&hung_server());
+        assert!(matches!(c.canary(), Err(Error::Timeout(_))));
+        let c = ChatClient::at(&stub(vec![answer(r#"{"nope":1}"#)]));
+        assert!(c.canary().is_err(), "an answer without the asked-for field");
     }
 
     #[test]
