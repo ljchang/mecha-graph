@@ -467,6 +467,10 @@ pub struct ChatClient {
     /// #22). One that cannot answer an empty input in the time a real one is
     /// allowed is a server not answering.
     canary_timeout: Duration,
+    /// How often a request answered 503 ("loading") asks again, and for how
+    /// long in all ([`LOAD_WAIT`] outside tests).
+    load_poll: Duration,
+    load_wait: Duration,
     backend: Backend,
 }
 
@@ -482,6 +486,8 @@ impl ChatClient {
             think: false,
             retry_delays: Vec::new(),
             canary_timeout: Duration::from_secs(1),
+            load_poll: Duration::from_millis(20),
+            load_wait: Duration::from_secs(5),
             backend: Backend::Shared {
                 base_url: base_url.to_string(),
             },
@@ -589,6 +595,8 @@ impl ChatClient {
             think: true,
             retry_delays: [5, 15, 30].map(Duration::from_secs).to_vec(),
             canary_timeout: timeout,
+            load_poll: Duration::from_secs(5),
+            load_wait: LOAD_WAIT,
             backend,
         })
     }
@@ -735,6 +743,7 @@ impl ChatClient {
         //   server's. It is retried over `retry_delays` — a router answers 503
         //   while it loads a model — and only a sustained one is `Transport`.
         let mut attempt = 0;
+        let mut loading_since: Option<Instant> = None;
         let resp = loop {
             let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
                 .timeout(timeout)
@@ -752,6 +761,23 @@ impl ChatClient {
                     );
                     if code < 500 {
                         return Err(Error::Other(msg));
+                    }
+                    // 503 is a router loading a model on demand (30–40 s cold)
+                    // — the same load `Backend::resolve` waits LOAD_WAIT for.
+                    // Waited out on its own clock, for every request and the
+                    // canary alike: counted against retry_delays (~50 s), a
+                    // cold load read as a server not answering and stopped
+                    // the night having done nothing (found on review of #22).
+                    if code == 503 {
+                        let since = *loading_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() < self.load_wait {
+                            std::thread::sleep(self.load_poll);
+                            continue;
+                        }
+                        return Err(Error::Transport(format!(
+                            "{msg} — still loading after {}s",
+                            self.load_wait.as_secs()
+                        )));
                     }
                     Error::Transport(msg)
                 }
@@ -1039,8 +1065,10 @@ mod tests {
     #[test]
     fn who_a_failure_belongs_to_decides_its_error() {
         let schema = serde_json::json!({"type": "object"});
+        // A 500, not a 503: a 503 is a load in progress, waited out
+        // (`a_load_in_progress_is_waited_out_even_without_retries`).
         let url = stub(vec![
-            (503, r#"{"error":{"message":"Loading model"}}"#.into()),
+            (500, r#"{"error":{"message":"internal error"}}"#.into()),
             (400, r#"{"error":{"message":"bad request"}}"#.into()),
         ]);
         let c = ChatClient::at(&url);
@@ -1071,7 +1099,10 @@ mod tests {
     /// queued behind each 503 is never reached.
     #[test]
     fn the_canary_and_the_request_after_it_do_not_back_off() {
-        let busy = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let busy = (
+            500,
+            r#"{"error":{"message":"failed to tokenize"}}"#.to_string(),
+        );
         let ok = answer(r#"{"a":1}"#);
         let mut c = ChatClient::at(&stub(vec![busy.clone(), ok.clone()]));
         c.retry_delays = vec![Duration::from_millis(50)];
@@ -1089,6 +1120,28 @@ mod tests {
         assert!(c
             .complete_schema("s", "u", "x", serde_json::json!({"type": "object"}))
             .is_ok());
+    }
+
+    /// A 503 is a load in progress, waited out for every request — the canary
+    /// and the post-canary retry too, which take no ordinary retries — so a
+    /// cold on-demand load is not read as a server that does not answer
+    /// (found on review of #22).
+    #[test]
+    fn a_load_in_progress_is_waited_out_even_without_retries() {
+        let loading = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let c = ChatClient::at(&stub(vec![loading.clone(), loading.clone(), answer("{}")]));
+        assert!(c.canary("s", ChatClient::json_object_format()).is_ok());
+        let c = ChatClient::at(&stub(vec![loading.clone(), answer(r#"{"a":1}"#)]));
+        assert!(c
+            .complete_schema_once("s", "u", "x", serde_json::json!({"type": "object"}))
+            .is_ok());
+        // Past the allowance it is the server's, as before.
+        let mut c = ChatClient::at(&stub(vec![loading.clone(); 50]));
+        c.load_wait = Duration::from_millis(100);
+        assert!(matches!(
+            c.canary("s", ChatClient::json_object_format()),
+            Err(Error::Transport(m)) if m.contains("still loading")
+        ));
     }
 
     /// A router loading a model answers 503 first; the retry is the warm-up.

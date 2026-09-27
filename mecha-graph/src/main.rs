@@ -4089,11 +4089,17 @@ reject: it was never true (retracted; the class learns)"
             for (uid, at, why) in charged {
                 println!("{uid}\t{at}\t{why}");
             }
-            // Unknown is not clean: a mark from before V026 carries no reason.
-            eprintln!(
-                "(episodes marked attempted before this build recorded no reason and are not \
-                 listed — including the 2026-09-27 batch)"
-            );
+            // Unknown is not clean: a mark from before V026 carries no reason,
+            // so it may be a charge or an episode that held nothing. Counted,
+            // never listed as either.
+            let unexplained = mecha_graph_core::extract::unexplained_marks(&conn)?;
+            if unexplained > 0 {
+                eprintln!(
+                    "({unexplained} episode(s) were marked with nothing extracted and no reason \
+                     recorded — marks from before this build, which cannot say whether they \
+                     were charged or held nothing; not listed)"
+                );
+            }
         }
 
         Command::Extract { limit, model, source, exclude_source, episode, .. } => {
@@ -4111,6 +4117,7 @@ reject: it was never true (retracted; the class learns)"
                     (!excluded.is_empty()).then_some(&excluded[..]),
                 )?
             };
+            // **scripts/nightly.sh parses this line** for its ALERTS count.
             println!(
                 "extracted {} episodes → {} mentions, {} fact candidates, {} commitments ({} errors)",
                 report.episodes, report.mentions, report.fact_candidates,

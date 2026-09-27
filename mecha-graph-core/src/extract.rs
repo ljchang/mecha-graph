@@ -371,6 +371,9 @@ pub fn extract_pending(
             // Say what was done before stopping: what this batch staged is
             // committed, and a log reading only "failed" would understate it
             // (as summarize already guards; found on review of #22).
+            // **scripts/nightly.sh parses this line** for its ALERTS count —
+            // reword it and change the sed there with it, or charges read as
+            // a clean night.
             eprintln!(
                 "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
                  {} fact and {} commitment candidate(s) staged before the stop",
@@ -722,6 +725,18 @@ fn mark_attempted(conn: &Connection, episode_id: i64, model: &str, failure: &Err
         params![episode_id, model, PROMPT_VERSION, why],
     )?;
     Ok(())
+}
+
+/// Episodes marked attempted at the current prompt version with nothing
+/// extracted and no recorded reason: marks from before V026, which cannot say
+/// whether the episode was charged or simply held nothing. Unknown, not clean.
+pub fn unexplained_marks(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM extract_state
+         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1",
+        params![PROMPT_VERSION],
+        |r| r.get(0),
+    )?)
 }
 
 /// Episodes charged as their own failure at the current prompt version:
