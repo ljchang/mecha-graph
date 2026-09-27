@@ -95,7 +95,18 @@ SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
-run() { log "\$ $*"; "$@" >>"$LOG" 2>&1 || log "FAILED (exit $?): $*"; }
+# Every failed step is also collected for the header's ALERTS line: a step
+# that refuses (fail-closed) does nothing, and "nothing" must not read as a
+# clean night in the one line people scan (found on review, 2026-09-27).
+FAILED_STEPS=()
+run() {
+    log "\$ $*"
+    "$@" >>"$LOG" 2>&1 || {
+        local rc=$?
+        log "FAILED (exit $rc): $*"
+        FAILED_STEPS+=("$(basename "$1")${2:+ $2}")
+    }
+}
 case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — skipped; precheck toggles forced OFF" ;;
@@ -217,7 +228,19 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     run "$PKG" embed
     EXTRACT_ARGS=(--limit "$EXTRACT_LIMIT" --model "$EXTRACT_MODEL")
     for src in $EXTRACT_EXCLUDE; do EXTRACT_ARGS+=(--exclude-source "$src"); done
+    EXTRACT_FROM=$(( $(wc -l <"$LOG") + 1 ))
     run "$PKG" extract "${EXTRACT_ARGS[@]}"
+    # An episode charged as its own failure exits 0 — the poison-episode rule
+    # working — but each is marked attempted for good, and a night that
+    # charges many is 2026-09-27's loss by a route the canary cannot see. So
+    # tonight's count goes in the one line people scan, read from tonight's
+    # report line only (found on review of #22).
+    # Either line: a run that charged some and then stopped prints only its
+    # `extract: stopping —` line, and must not read like one that never ran.
+    EXTRACT_CHARGED="$(tail -n +"$EXTRACT_FROM" "$LOG" \
+        | sed -n -e 's/^extracted \([0-9]*\) episodes.*(\([0-9]*\) errors)$/\2 of \1/p' \
+                 -e 's/^extract: stopping — \([0-9]*\) episode(s) tried, \([0-9]*\) charged.*/\2 of \1/p' \
+        | tail -n 1)"
     # Auto-triage the fresh candidates: duplicates die, contradictions get
     # flagged, and (opt-in) clean novel facts accept themselves. --triage
     # adds the lanes calibrated on the owner's verdicts (precheck.rs):
@@ -291,6 +314,13 @@ case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) STALE="${STALE:+$STALE; }nightly.env $NIGHTLY_ENV_STATUS (precheck toggles forced off)" ;;
 esac
+case "${EXTRACT_CHARGED:-}" in
+    "" | "0 of "*) ;;
+    *) STALE="${STALE:+$STALE; }extract charged $EXTRACT_CHARGED episode(s) as their own failure (\`mecha-graph extract --charged\` lists them with why; \`extract --episode <id>\` re-runs one)" ;;
+esac
+if [ -n "${FAILED_STEPS[*]-}" ]; then
+    STALE="${STALE:+$STALE; }failed: $(IFS=,; echo "${FAILED_STEPS[*]}" | sed 's/,/, /g')"
+fi
 
 if [ -n "$STALE" ]; then
     log "ALERTS: $STALE"

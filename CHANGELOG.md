@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mecha-graph extract --charged`, and why each episode was charged
+  (`extract_state.failure`, migration V026).** An episode charged as its own
+  failure — marked attempted so one bad input cannot wedge every night —
+  now records the reason, and `--charged` lists them (uid, date, reason),
+  running no model; `extract --episode <id>` re-runs one. The nightly's
+  ALERTS line counts tonight's charges and points here. Marks written before
+  V026 carry no reason and are not listed.
 - **The TUI can close tasks through mecha, when you opt in.** With
   `[board] close_through = "mecha"` (or a path to it) in
   `~/.mecha-graph/config.toml`, closing a task (`d`, `x`) or reopening one runs
@@ -21,6 +28,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **LLM calls against a llama-server router** (mecha's :8080 from
+  2026-09-27): `served_model` read the router's placeholder `/props` alias
+  (`llama-server`) as the served model and sent it on every request, which the
+  router refuses — the 2026-09-27 nightly lost 100 extractions (marked
+  attempted, so not retried) and 30 summaries. On a router the served model is
+  now the one resident in `/models`, and a configured fallback the router does
+  not list makes `connect` refuse before the first request, so a batch is never
+  burned.
+- **`extract` no longer marks an episode attempted for the server's failure.**
+  The poison-episode mark exists so one bad episode cannot wedge every night,
+  and it was applied to every failure — so a refusing or absent server aged
+  out a whole batch. Who a failure belongs to is now settled by asking: after
+  a failed episode, `ChatClient::canary` sends the server the same request —
+  same model, system prompt and schema — with an empty input. If that fails
+  too, the run stops with an error and marks nothing, every episode staying
+  pending; if it answers, the failure was the episode's and it is marked. No
+  answer at all (a timeout, or a 5xx or dropped connection that outlasts ~50 s
+  of retries — a router answers 503 while it loads a model) gets one more try
+  first, because a server that recovered looks the same as a failing
+  episode. A server still loading at `connect` is waited for rather than
+  refused or spawned over. `summarize` asks the same
+  question and stops with an error instead of waiting out every node against
+  a hung server. `extract --episode` is settled the same way. `connect` also
+  refuses when a server that passed its health check does not answer
+  `/props` (a probe now waits 10 s, not 1.5).
 - **A multiword denylist term split across a line break is caught.** grep
   reads one line at a time, and prose here is hard-wrapped at ~75 columns in
   docs, comments and commit messages, so a two-word term with its words on

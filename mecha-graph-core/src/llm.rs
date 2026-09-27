@@ -84,6 +84,10 @@ pub const DEFAULT_MODEL: &str = "qwen3.6-35b-a3b";
 /// episode into a dropped one. mecha's own provider allows 900 s.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
+/// What the canary asks about: nothing, so that whatever fails on it is the
+/// request's and not an input's.
+const CANARY_INPUT: &str = "(This input is empty. There is nothing in it.)";
+
 /// Must sit **comfortably above** the server's `--reasoning-budget` (4096),
 /// or the thinking block consumes the whole allowance and the turn comes back
 /// with an empty `content`. That is not a hypothetical: at `max_tokens` 1024
@@ -95,6 +99,11 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// How long to wait for a server we started to answer `/health`. Loading ~20 GB
 /// of weights took 14 s warm on this box; cold off a slow disk is minutes.
 const SPAWN_HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long to wait for a server that is already there, and loading, to
+/// finish — the same allowance as one we started, because it is the same
+/// load. Waited out rather than spawned over: the port is taken.
+const LOAD_WAIT: Duration = SPAWN_HEALTH_TIMEOUT;
 
 /// Where the completions go, and who owns the process behind them.
 pub enum Backend {
@@ -119,10 +128,52 @@ impl Backend {
     /// Probe first, spawn only if told how. See the module note for why the
     /// order and the gate are both load-bearing.
     pub fn resolve(base_url: &str, model: &str) -> Result<Self> {
-        if health_ok(base_url) {
-            return Ok(Backend::Shared {
+        Self::resolve_within(base_url, model, LOAD_WAIT)
+    }
+
+    fn resolve_within(base_url: &str, model: &str, load_wait: Duration) -> Result<Self> {
+        let shared = || {
+            Ok(Backend::Shared {
                 base_url: base_url.to_string(),
-            });
+            })
+        };
+        match health(base_url) {
+            Health::Ready => return shared(),
+            // Someone is there, mid-load: a server starting, or one swapping
+            // its model (503 "Loading model"). Neither is "nothing is
+            // answering" — reading it that way refused the night with a false
+            // cause, or spawned a second server onto a taken port (found on
+            // review of #22). Wait for the load; never spawn over it.
+            Health::Loading => {
+                let deadline = Instant::now() + load_wait;
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    match health(base_url) {
+                        Health::Ready => return shared(),
+                        // A stall mid-load is still a load in progress.
+                        Health::Loading | Health::Unknown(_) if Instant::now() < deadline => {}
+                        Health::Loading | Health::Unknown(_) => {
+                            return Err(Error::Other(format!(
+                                "llama-server at {base_url} is still loading after {}s",
+                                load_wait.as_secs()
+                            )))
+                        }
+                        Health::Absent => {
+                            return Err(Error::Other(format!(
+                                "llama-server at {base_url} was loading, then stopped answering"
+                            )))
+                        }
+                    }
+                }
+            }
+            Health::Unknown(why) => {
+                return Err(Error::Other(format!(
+                    "{base_url}/health gave no clean answer ({why}). Something may be \
+                     listening there, busy, so mecha-graph neither uses it nor starts a \
+                     second server over it; nothing was marked attempted."
+                )))
+            }
+            Health::Absent => {}
         }
 
         let cfg = crate::integrations::load_config()?.llm;
@@ -185,7 +236,7 @@ impl Backend {
 
         let deadline = Instant::now() + SPAWN_HEALTH_TIMEOUT;
         while Instant::now() < deadline {
-            if health_ok(base_url) {
+            if health(base_url) == Health::Ready {
                 return Ok(backend);
             }
             if let Backend::Managed { child, .. } = &mut backend {
@@ -217,6 +268,28 @@ impl Drop for Backend {
     }
 }
 
+/// What a server says about itself: the model it is serving, if that can be
+/// told, and — on a router, whose `model` field *selects* — every id it will
+/// accept, so a configured fallback can be checked before any request uses it.
+#[derive(Debug, Default)]
+struct Served {
+    /// Whether `/props` answered at all. A server `Backend::resolve` already
+    /// found answering whose `/props` does not is unknown, and unknown is not
+    /// "not a router": `connect` refuses rather than send an unchecked name.
+    props_read: bool,
+    /// Why `/props` gave nothing, when it did not: the refusal names it,
+    /// because a stall on a busy server and a server with no `/props` call
+    /// for different fixes (found on review of #22).
+    props_error: Option<String>,
+    resident: Option<String>,
+    /// `Some` on a router: `Some(ids)` from a `/models` it read, `Some(None)`
+    /// when that list could not be read.
+    router_ids: Option<Option<Vec<String>>>,
+    /// Why a router's `/models` gave nothing, for the same reason as
+    /// `props_error`: busy and absent call for different fixes.
+    models_error: Option<String>,
+}
+
 /// What the server actually has loaded, from its own `/props`.
 ///
 /// Asked rather than asserted, because the shared server belongs to mecha and
@@ -226,25 +299,144 @@ impl Drop for Backend {
 /// `qwen3.6-35b-a3b` while the box actually serves gemma4 would put a false
 /// value in `extract_state.model`, which is the one column that answers "what
 /// produced this fact" and the one PROMPT_VERSION re-extraction keys off.
-fn served_model(base_url: &str) -> Option<String> {
-    let resp = ureq::get(&format!("{base_url}/props"))
-        .timeout(Duration::from_millis(1500))
-        .call()
-        .ok()?;
-    let body: serde_json::Value = resp.into_json().ok()?;
-    body.get("model_alias")
+///
+/// **Behind a llama-server router the bare `/props` is a placeholder**
+/// (`role: "router"`, `model_alias: "llama-server"`), and the request's
+/// `model` field *selects* rather than being ignored. Reading that placeholder
+/// as the served model sent `"model": "llama-server"` on every request, which
+/// the router refuses — 2026-09-27, the night mecha's :8080 became a router:
+/// 100 extractions and 30 summaries failed, and the extractions were marked
+/// attempted. So on a router the answer is the one model resident there, read
+/// from `/models`; `None` — use the configured model, **on a router only if it
+/// lists that name** (`connect` refuses otherwise) — when that cannot be told
+/// (nothing loaded, two loaded, or a list this does not fully read).
+fn probe(base_url: &str) -> Served {
+    // Ten seconds, not 1.5: a shared server's queue can hold a probe as it
+    // holds a request, and a probe that times out is now a refusal.
+    let fetch = |path: &str| -> std::result::Result<serde_json::Value, String> {
+        ureq::get(&format!("{base_url}{path}"))
+            .timeout(Duration::from_secs(10))
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| format!("unreadable body: {e}"))
+    };
+    let props = match fetch("/props") {
+        Ok(p) => p,
+        Err(why) => {
+            return Served {
+                props_error: Some(why),
+                ..Default::default()
+            }
+        }
+    };
+    let router = props.get("role").and_then(|r| r.as_str()) == Some("router");
+    let (models, models_error) = match router.then(|| fetch("/models")) {
+        Some(Ok(m)) => (Some(m), None),
+        Some(Err(why)) => (None, Some(why)),
+        None => (None, None),
+    };
+    Served {
+        props_read: true,
+        props_error: None,
+        resident: served_from(&props, models.as_ref()),
+        router_ids: router.then(|| router_ids(models.as_ref())),
+        models_error,
+    }
+}
+
+/// Every model id a router lists — the names a request may carry — or `None`
+/// when there is no list to read (not the same as an empty one).
+fn router_ids(models: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let data = models?.get("data")?.as_array()?;
+    Some(
+        data.iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The pure half of [`probe`]: a single-model server's `model_alias`,
+/// or a router's one resident model.
+fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) -> Option<String> {
+    if props.get("role").and_then(|r| r.as_str()) == Some("router") {
+        // Only from a list whose every status is known: "nothing resident" or
+        // "this one" is a claim a list this does not understand cannot back.
+        // Same rule as mecha's provider::router::readable.
+        const KNOWN: [&str; 5] = ["unloaded", "loading", "loaded", "sleeping", "downloading"];
+        // `sleeping` counts as resident, as in mecha's `RouterModel::is_resident`:
+        // a sleeping model is still selectable by name, so beside a loaded one
+        // "which" is ambiguous. Under `--models-max 1` (the router this was
+        // written for) two can never be resident at once, so this is the edge
+        // case it looks like, not the steady state.
+        let data = models?.get("data")?.as_array()?;
+        let status = |m: &serde_json::Value| {
+            m.get("status")
+                .and_then(|s| s.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if data.is_empty() || data.iter().any(|m| !KNOWN.contains(&status(m).as_str())) {
+            return None;
+        }
+        let mut resident = data
+            .iter()
+            .filter(|m| matches!(status(m).as_str(), "loaded" | "loading" | "sleeping"));
+        return match (resident.next(), resident.next()) {
+            (Some(one), None) => one.get("id").and_then(|i| i.as_str()).map(str::to_string),
+            _ => None,
+        };
+    }
+    props
+        .get("model_alias")
         .and_then(|m| m.as_str())
-        .filter(|m| !m.is_empty())
+        // The router's placeholder, refused by name as well as by `role`:
+        // should a router ever answer without the role, the worst case is "use
+        // the configured model", never "name the placeholder on every request".
+        .filter(|m| !m.is_empty() && *m != "llama-server")
         .map(str::to_string)
 }
 
-fn health_ok(base_url: &str) -> bool {
+/// What `/health` says about the server behind a URL.
+#[derive(Debug, PartialEq, Eq)]
+enum Health {
+    /// 2xx: up, with its model loaded.
+    Ready,
+    /// 503: llama-server is there and loading a model.
+    Loading,
+    /// Nothing listening (connection refused), or something that is not
+    /// llama-server answering (a 404 from ollama): no server here to share.
+    Absent,
+    /// No clean answer — a timeout, a reset, a read that failed. Something
+    /// may be listening, busy, so this is neither "share it" nor "start one":
+    /// starting one is a second copy of the model at a URL that answers
+    /// (found on review of #22).
+    Unknown(String),
+}
+
+fn health(base_url: &str) -> Health {
     // /health rather than / on purpose: it is llama-server's, so an ollama
     // listening on the same port answers 404 and is correctly not adopted.
-    ureq::get(&format!("{base_url}/health"))
-        .timeout(Duration::from_millis(1500))
+    // The probe's 10 s, for the probe's reason: a shared server's queue can
+    // hold /health too, and a stall here does not refuse — it falls through
+    // to spawning a second copy of the model (found on review).
+    match ureq::get(&format!("{base_url}/health"))
+        .timeout(Duration::from_secs(10))
         .call()
-        .is_ok()
+    {
+        Ok(_) => Health::Ready,
+        Err(ureq::Error::Status(503, _)) => Health::Loading,
+        // 404: something that is not llama-server (ollama answers /health
+        // so), never adopted. Any other status is something listening and
+        // failing — a 500, a proxy's 502 — which is not "nothing here".
+        Err(ureq::Error::Status(404, _)) => Health::Absent,
+        Err(ureq::Error::Status(code, _)) => Health::Unknown(format!("HTTP {code}")),
+        Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
+            Health::Absent
+        }
+        Err(e) => Health::Unknown(e.to_string()),
+    }
 }
 
 fn port_of(base_url: &str) -> Option<u16> {
@@ -263,7 +455,44 @@ pub struct ChatClient {
     /// off was an unbounded-reasoning bug in ollama, not a cost of thinking.
     /// Exposed rather than hardcoded so the A/B can be re-run.
     pub think: bool,
+    /// Waits between retries of a request the server did not answer (a 5xx,
+    /// a refused or reset connection). A router answers 503 while it loads a
+    /// model, and a load takes 30–40 s from disk, so the default spans ~50 s.
+    retry_delays: Vec<Duration>,
+    /// How long [`ChatClient::canary`] waits: the request's own bound. The
+    /// canary is the caller's whole prompt with an empty input, reasoning and
+    /// all, so a shorter fixed ceiling could time it out where the request
+    /// would have answered — and a canary that fails stops the run with
+    /// nothing marked, at the same episode every night (found on review of
+    /// #22). One that cannot answer an empty input in the time a real one is
+    /// allowed is a server not answering.
+    canary_timeout: Duration,
+    /// How often a request answered 503 ("loading") asks again, and for how
+    /// long in all ([`LOAD_WAIT`] outside tests).
+    load_poll: Duration,
+    load_wait: Duration,
     backend: Backend,
+}
+
+#[cfg(test)]
+impl ChatClient {
+    /// A client aimed at `base_url` with no probing — for tests that need a
+    /// server's answer (or its absence) to reach `post`.
+    pub(crate) fn at(base_url: &str) -> ChatClient {
+        ChatClient {
+            model: "test-model".into(),
+            timeout: Duration::from_secs(5),
+            max_tokens: 64,
+            think: false,
+            retry_delays: Vec::new(),
+            canary_timeout: Duration::from_secs(1),
+            load_poll: Duration::from_millis(20),
+            load_wait: Duration::from_secs(5),
+            backend: Backend::Shared {
+                base_url: base_url.to_string(),
+            },
+        }
+    }
 }
 
 impl ChatClient {
@@ -293,7 +522,23 @@ impl ChatClient {
         // A warning is the honest middle: the swap is visible, the provenance
         // is truthful, and `extract_state.model` + PROMPT_VERSION already give
         // you the tools to find and re-extract whatever a given model produced.
-        let model = match served_model(backend.base_url()) {
+        let served = probe(backend.base_url());
+        if !served.props_read {
+            return Err(Error::Other(format!(
+                "mecha-graph: {} answered its health check but not /props ({}), so what \
+                 it serves — and, on a router, what it will accept — is unknown. Refusing \
+                 before any request, so nothing is marked attempted. A timeout is a busy \
+                 server, and tomorrow's run retries; a 404 is a server without \
+                 llama-server's /props (vLLM, a proxy), which is not supported as the \
+                 chat endpoint.",
+                backend.base_url(),
+                served
+                    .props_error
+                    .as_deref()
+                    .unwrap_or("no reason recorded")
+            )));
+        }
+        let model = match served.resident {
             Some(served) => {
                 if cfg.model.is_some() && served != wanted {
                     eprintln!(
@@ -304,19 +549,54 @@ impl ChatClient {
                 }
                 served
             }
-            None => wanted,
+            // On a router the name *selects*, so falling back is safe only to
+            // a name it lists. Anything else would be refused on every request
+            // — and extract marks each refused episode attempted, so a batch
+            // would be burned, as on 2026-09-27. Refused here, before the
+            // first request, every episode stays retryable (found on review).
+            None => {
+                if let Some(ids) = &served.router_ids {
+                    let listed = ids.as_ref().is_some_and(|l| l.iter().any(|i| i == &wanted));
+                    if !listed {
+                        let what = match ids {
+                            None => format!(
+                                "its /models could not be read ({})",
+                                served
+                                    .models_error
+                                    .as_deref()
+                                    .unwrap_or("a list this client does not fully read")
+                            ),
+                            Some(l) if l.is_empty() => "it lists no models".to_string(),
+                            Some(l) => format!("it lists: {}", l.join(", ")),
+                        };
+                        return Err(Error::Other(format!(
+                            "mecha-graph: the llama-server router at {} has no single resident \
+                             model to use and does not list '{wanted}' — {what}. Set [llm] model \
+                             (or EXTRACT_MODEL) to a listed name, or load one (`mecha model use \
+                             …`). Refusing before any request, so nothing is marked attempted.",
+                            backend.base_url()
+                        )));
+                    }
+                }
+                wanted
+            }
         };
 
+        let timeout = Duration::from_secs(
+            std::env::var("MECHA_GRAPH_CHAT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_TIMEOUT_SECS),
+        );
         Ok(ChatClient {
             model,
-            timeout: Duration::from_secs(
-                std::env::var("MECHA_GRAPH_CHAT_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_TIMEOUT_SECS),
-            ),
+            timeout,
             max_tokens: DEFAULT_MAX_TOKENS,
             think: true,
+            retry_delays: [5, 15, 30].map(Duration::from_secs).to_vec(),
+            canary_timeout: timeout,
+            load_poll: Duration::from_secs(5),
+            load_wait: LOAD_WAIT,
             backend,
         })
     }
@@ -332,7 +612,7 @@ impl ChatClient {
     /// One JSON-mode completion, shape unconstrained beyond "is an object".
     /// For callers whose output shape is a single obvious field.
     pub fn complete_json(&self, system: &str, user: &str) -> Result<serde_json::Value> {
-        self.post(system, user, serde_json::json!({ "type": "json_object" }))
+        self.post(system, user, Self::json_object_format())
     }
 
     /// One completion whose output is constrained by `schema` at the sampler.
@@ -345,14 +625,73 @@ impl ChatClient {
         name: &str,
         schema: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.post(
+        self.post(system, user, Self::schema_format(name, schema))
+    }
+
+    /// [`ChatClient::complete_schema`] without the backoff between retries:
+    /// for a request made *because* the canary just answered, where waiting
+    /// out a server recovery pays for a condition already ruled out (found
+    /// on review of #22: ~100 s of sleep per episode on a server that 5xx's
+    /// one input).
+    pub fn complete_schema_once(
+        &self,
+        system: &str,
+        user: &str,
+        name: &str,
+        schema: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post_within(
             system,
             user,
-            serde_json::json!({
-                "type": "json_schema",
-                "json_schema": { "name": name, "strict": true, "schema": schema },
-            }),
+            Self::schema_format(name, schema),
+            self.timeout,
+            &[],
         )
+    }
+
+    /// The `response_format` [`ChatClient::complete_json`] sends.
+    pub fn json_object_format() -> serde_json::Value {
+        serde_json::json!({ "type": "json_object" })
+    }
+
+    /// The `response_format` [`ChatClient::complete_schema`] sends.
+    pub fn schema_format(name: &str, schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": name, "strict": true, "schema": schema },
+        })
+    }
+
+    /// Does the server answer *this* request — same model, same system
+    /// prompt, same `response_format` — with nothing in it? One completion of
+    /// an empty input under a short timeout.
+    ///
+    /// This is how a failed input is charged: an input that fails while the
+    /// canary answers is the input's; one that fails with the canary is the
+    /// server's or the request's. Asked, never read off the error — comparing
+    /// error strings cannot tell a slow input from a stalled link, or three
+    /// episodes that each time out from a server refusing them all, because
+    /// the messages are built from values constant across a batch (found on
+    /// review of #22).
+    ///
+    /// The caller's system prompt and format, not a stand-in, because both
+    /// are built from graph data: an extraction schema whose predicate enum
+    /// the server refuses would 400 every episode while a two-field literal
+    /// answered, and the canary would sign off a whole batch as poison (found
+    /// on review of #22). Any JSON answer passes; the content is not graded.
+    ///
+    /// Sent once, with no retries: it is a liveness check, so its bound is
+    /// `canary_timeout` and nothing more, and failing it stops the run with
+    /// nothing marked — the side to err on.
+    pub fn canary(&self, system: &str, response_format: serde_json::Value) -> Result<()> {
+        self.post_within(
+            system,
+            CANARY_INPUT,
+            response_format,
+            self.canary_timeout,
+            &[],
+        )
+        .map(|_| ())
     }
 
     fn post(
@@ -360,6 +699,23 @@ impl ChatClient {
         system: &str,
         user: &str,
         response_format: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post_within(
+            system,
+            user,
+            response_format,
+            self.timeout,
+            &self.retry_delays,
+        )
+    }
+
+    fn post_within(
+        &self,
+        system: &str,
+        user: &str,
+        response_format: serde_json::Value,
+        timeout: Duration,
+        retry_delays: &[Duration],
     ) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -378,29 +734,80 @@ impl ChatClient {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
         }
 
-        let resp = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
-            .timeout(self.timeout)
-            .send_json(body)
-            .map_err(|e| match e {
+        // Three outcomes, and who they belong to decides what callers do:
+        // - an answer that refuses (4xx) is `Other` — the input's or the
+        //   request's, which only `canary` can tell apart;
+        // - no answer within `timeout` is `Timeout`: a slow input or a
+        //   stalled link, which the error alone cannot tell apart either;
+        // - no answer at all (a 5xx, a refused or reset connection) is the
+        //   server's. It is retried over `retry_delays` — a router answers 503
+        //   while it loads a model — and only a sustained one is `Transport`.
+        let mut attempt = 0;
+        let mut loading_since: Option<Instant> = None;
+        let resp = loop {
+            let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
+                .timeout(timeout)
+                .send_json(body.clone());
+            let err = match sent {
+                Ok(r) => break r,
                 // A refusal here arrives as a real status with a JSON body
                 // naming the bad field. Swallowing it into "request failed"
                 // is how a one-line flag mistake costs an evening.
-                ureq::Error::Status(code, r) => {
+                Err(ureq::Error::Status(code, r)) => {
                     let detail = r.into_string().unwrap_or_default();
-                    Error::Other(format!(
+                    let msg = format!(
                         "llama-server {code}: {}",
                         detail.chars().take(400).collect::<String>()
+                    );
+                    if code < 500 {
+                        return Err(Error::Other(msg));
+                    }
+                    // 503 is a router loading a model on demand (30–40 s cold)
+                    // — the same load `Backend::resolve` waits LOAD_WAIT for.
+                    // Waited out on its own clock, for every request and the
+                    // canary alike: counted against retry_delays (~50 s), a
+                    // cold load read as a server not answering and stopped
+                    // the night having done nothing (found on review of #22).
+                    if code == 503 {
+                        let since = *loading_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() < self.load_wait {
+                            std::thread::sleep(self.load_poll);
+                            continue;
+                        }
+                        return Err(Error::Transport(format!(
+                            "{msg} — still loading after {}s",
+                            self.load_wait.as_secs()
+                        )));
+                    }
+                    Error::Transport(msg)
+                }
+                Err(other) => {
+                    let text = other.to_string();
+                    if text.contains("timed out") {
+                        return Err(Error::Timeout(format!(
+                            "no answer from llama-server within {}s (timed out)",
+                            timeout.as_secs()
+                        )));
+                    }
+                    Error::Transport(format!(
+                        "llama-server at {} unreachable: {text}",
+                        self.base_url()
                     ))
                 }
-                other => Error::Other(format!(
-                    "llama-server at {} unreachable: {other}",
-                    self.base_url()
-                )),
-            })?;
+            };
+            match retry_delays.get(attempt) {
+                Some(wait) => {
+                    attempt += 1;
+                    eprintln!("mecha-graph: {err} — retrying in {}s", wait.as_secs());
+                    std::thread::sleep(*wait);
+                }
+                None => return Err(err),
+            }
+        };
 
         let payload: serde_json::Value = resp
             .into_json()
-            .map_err(|e| Error::Other(format!("bad llama-server response: {e}")))?;
+            .map_err(|e| Error::Transport(format!("bad llama-server response: {e}")))?;
 
         let choice = payload
             .pointer("/choices/0")
@@ -423,17 +830,23 @@ impl ChatClient {
             // The named failure. HTTP 200, no content, and — before this
             // guard — an episode marked attempted as though the model had
             // simply found nothing.
-            if reasoning_len > 0 || finish == "length" {
-                return Err(Error::Other(format!(
+            // Only a stop at the length limit witnesses that the allowance
+            // ran out; reasoning that ended and then said nothing is the
+            // model's answer to this input, not the server's setup.
+            if finish == "length" {
+                return Err(Error::Server(format!(
                     "empty completion after {reasoning_len} chars of reasoning \
-                     (finish_reason={finish}): the server did not honour \
-                     chat_template_kwargs.enable_thinking=false. Check that \
-                     llama-server runs with --jinja (a chatml override silently \
-                     ignores it)."
+                     (finish_reason={finish}): the reasoning used the whole \
+                     {max} token allowance, which is the server's setup, not the \
+                     input — its --reasoning-budget must sit well below {max}, \
+                     and with thinking off (think=false) it must run --jinja or \
+                     enable_thinking=false is silently ignored.",
+                    max = self.max_tokens
                 )));
             }
             return Err(Error::Other(format!(
-                "empty completion from {} (finish_reason={finish})",
+                "empty completion from {} after {reasoning_len} chars of reasoning \
+                 (finish_reason={finish})",
                 self.model
             )));
         }
@@ -460,9 +873,359 @@ fn strip_code_fence(s: &str) -> &str {
     }
 }
 
+/// Stub HTTP servers for tests that need a model server's answer — or its
+/// absence — to reach `post`. One copy, used by `llm` and `extract` tests.
+#[cfg(test)]
+pub(crate) mod test_http {
+    use std::io::{Read, Write};
+
+    /// Read one whole HTTP request — headers, then `Content-Length` bytes —
+    /// so a stub never answers (and closes) mid-upload, which a client sees
+    /// as a reset: a no-answer error the test did not mean to produce.
+    fn read_request(s: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&buf[head_end..]).into_owned()
+    }
+
+    /// A reply `stub` never sends: it reads the request and holds the
+    /// connection open, so the client times out.
+    pub(crate) const HANG: u16 = 0;
+
+    /// A 200 carrying `content` as the model's answer.
+    pub(crate) fn answer(content: &str) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({"choices": [{"message": {"content": content}, "finish_reason": "stop"}]})
+                .to_string(),
+        )
+    }
+
+    /// Answers each request with the next canned status and body, in order
+    /// ([`HANG`] holds that one unanswered).
+    pub(crate) fn stub(replies: Vec<(u16, String)>) -> String {
+        stub_recording(replies).0
+    }
+
+    /// [`stub`], also keeping each request's body, in order.
+    pub(crate) fn stub_recording(
+        replies: Vec<(u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (code, body) in replies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut s);
+                log.lock().unwrap().push(request);
+                if code == HANG {
+                    // Leaked, not dropped: a closed socket is a reset, the
+                    // no-answer case, where this reply means "no answer yet".
+                    std::mem::forget(s);
+                    continue;
+                }
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    /// Accepts and drops every connection without answering — the no-answer
+    /// case, on a port it keeps (a freed port can be taken by a parallel
+    /// test's stub and answer, which made this flaky).
+    pub(crate) fn dead_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                drop(s);
+            }
+        });
+        url
+    }
+
+    /// Accepts, reads, and never answers — the timeout case.
+    pub(crate) fn hung_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming().flatten() {
+                let mut s = s;
+                read_request(&mut s);
+                held.push(s);
+            }
+        });
+        url
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_http::{answer, dead_server, hung_server, stub};
     use super::*;
+
+    /// A router's bare `/props` is never the answer — the night it was, every
+    /// request named "llama-server" and the router refused them all.
+    #[test]
+    fn a_router_is_asked_for_its_resident_model_not_its_placeholder() {
+        let placeholder = serde_json::json!({"role": "router", "model_alias": "llama-server"});
+        let listing = |pairs: &[(&str, &str)]| serde_json::json!({"data": pairs.iter().map(|(id, v)| serde_json::json!({"id": id, "status": {"value": v}})).collect::<Vec<_>>()});
+        let one = listing(&[
+            ("qwen3.6-35b-a3b", "unloaded"),
+            ("qwen3.6-35b-a3b-uncensored", "loaded"),
+        ]);
+        assert_eq!(
+            served_from(&placeholder, Some(&one)).as_deref(),
+            Some("qwen3.6-35b-a3b-uncensored")
+        );
+        // No list, nothing resident, two resident, an unknown status: no
+        // answer, so the configured model is used — never "llama-server".
+        assert_eq!(served_from(&placeholder, None), None);
+        assert_eq!(
+            served_from(&placeholder, Some(&listing(&[("a", "unloaded")]))),
+            None
+        );
+        assert_eq!(
+            served_from(
+                &placeholder,
+                Some(&listing(&[("a", "loaded"), ("b", "loading")]))
+            ),
+            None
+        );
+        assert_eq!(
+            served_from(&placeholder, Some(&listing(&[("a", "resident")]))),
+            None
+        );
+        assert_eq!(
+            served_from(&placeholder, Some(&serde_json::json!({"data": []}))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_loaded_and_a_sleeping_model_are_two_resident_and_no_answer() {
+        let placeholder = serde_json::json!({"role": "router"});
+        let list = serde_json::json!({"data": [
+            {"id": "a", "status": {"value": "loaded"}},
+            {"id": "b", "status": {"value": "sleeping"}}]});
+        assert_eq!(served_from(&placeholder, Some(&list)), None);
+    }
+
+    #[test]
+    fn a_routers_ids_are_what_a_fallback_is_checked_against() {
+        let list = serde_json::json!({"data": [
+            {"id": "qwen3.6-35b-a3b", "status": {"value": "unloaded"}},
+            {"id": "gemma-4-26b-a4b", "status": {"value": "unloaded"}}]});
+        assert_eq!(
+            router_ids(Some(&list)),
+            Some(vec![
+                "qwen3.6-35b-a3b".to_string(),
+                "gemma-4-26b-a4b".to_string()
+            ])
+        );
+        assert_eq!(router_ids(None), None, "no list is not an empty list");
+        assert_eq!(
+            router_ids(Some(&serde_json::json!({"data": []}))),
+            Some(vec![])
+        );
+    }
+
+    /// A 5xx and no answer at all are the server's; a 4xx is an answer; a
+    /// timeout is its own class, because the error cannot say whose it is.
+    #[test]
+    fn who_a_failure_belongs_to_decides_its_error() {
+        let schema = serde_json::json!({"type": "object"});
+        // A 500, not a 503: a 503 is a load in progress, waited out
+        // (`a_load_in_progress_is_waited_out_even_without_retries`).
+        let url = stub(vec![
+            (500, r#"{"error":{"message":"internal error"}}"#.into()),
+            (400, r#"{"error":{"message":"bad request"}}"#.into()),
+        ]);
+        let c = ChatClient::at(&url);
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema.clone()),
+            Err(Error::Transport(_))
+        ));
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema.clone()),
+            Err(Error::Other(_))
+        ));
+        let c = ChatClient::at(&dead_server());
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema.clone()),
+            Err(Error::Transport(_))
+        ));
+        let mut c = ChatClient::at(&hung_server());
+        c.timeout = Duration::from_secs(1);
+        match c.complete_schema("s", "u", "x", schema) {
+            Err(Error::Timeout(m)) => assert!(m.contains("timed out"), "{m}"),
+            other => panic!("a timeout is neither Other nor Transport: {other:?}"),
+        }
+    }
+
+    /// The canary and the request made after it answered are sent once: the
+    /// backoff is for a server recovering, which the canary rules out (found
+    /// on review of #22: ~100 s of sleep per episode otherwise). The 200
+    /// queued behind each 503 is never reached.
+    #[test]
+    fn the_canary_and_the_request_after_it_do_not_back_off() {
+        let busy = (
+            500,
+            r#"{"error":{"message":"failed to tokenize"}}"#.to_string(),
+        );
+        let ok = answer(r#"{"a":1}"#);
+        let mut c = ChatClient::at(&stub(vec![busy.clone(), ok.clone()]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        assert!(matches!(
+            c.canary("s", ChatClient::json_object_format()),
+            Err(Error::Transport(_))
+        ));
+        let mut c = ChatClient::at(&stub(vec![busy.clone(), ok.clone()]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        let once = c.complete_schema_once("s", "u", "x", serde_json::json!({"type": "object"}));
+        assert!(matches!(once, Err(Error::Transport(_))), "{once:?}");
+        // The ordinary request still waits the load out.
+        let mut c = ChatClient::at(&stub(vec![busy, ok]));
+        c.retry_delays = vec![Duration::from_millis(50)];
+        assert!(c
+            .complete_schema("s", "u", "x", serde_json::json!({"type": "object"}))
+            .is_ok());
+    }
+
+    /// A 503 is a load in progress, waited out for every request — the canary
+    /// and the post-canary retry too, which take no ordinary retries — so a
+    /// cold on-demand load is not read as a server that does not answer
+    /// (found on review of #22).
+    #[test]
+    fn a_load_in_progress_is_waited_out_even_without_retries() {
+        let loading = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let c = ChatClient::at(&stub(vec![loading.clone(), loading.clone(), answer("{}")]));
+        assert!(c.canary("s", ChatClient::json_object_format()).is_ok());
+        let c = ChatClient::at(&stub(vec![loading.clone(), answer(r#"{"a":1}"#)]));
+        assert!(c
+            .complete_schema_once("s", "u", "x", serde_json::json!({"type": "object"}))
+            .is_ok());
+        // Past the allowance it is the server's, as before.
+        let mut c = ChatClient::at(&stub(vec![loading.clone(); 50]));
+        c.load_wait = Duration::from_millis(100);
+        assert!(matches!(
+            c.canary("s", ChatClient::json_object_format()),
+            Err(Error::Transport(m)) if m.contains("still loading")
+        ));
+    }
+
+    /// A router loading a model answers 503 first; the retry is the warm-up.
+    #[test]
+    fn a_503_while_a_model_loads_is_retried_into_an_answer() {
+        let ok = r#"{"choices":[{"message":{"content":"{\"a\":1}"},"finish_reason":"stop"}]}"#;
+        let url = stub(vec![
+            (503, r#"{"error":{"message":"Loading model"}}"#.into()),
+            (200, ok.into()),
+        ]);
+        let mut c = ChatClient::at(&url);
+        c.retry_delays = vec![Duration::from_millis(50)];
+        let got = c.complete_schema("s", "u", "x", serde_json::json!({"type": "object"}));
+        assert!(got.is_ok(), "{got:?}");
+    }
+
+    /// A 503 from `/health` is a server loading, not an absent one: waited
+    /// for and then shared, never refused as "nothing is answering" or
+    /// spawned over (found on review of #22). A 404 is still not adopted.
+    #[test]
+    fn a_loading_server_is_waited_for_not_spawned_over() {
+        let loading = (503, r#"{"error":{"message":"Loading model"}}"#.to_string());
+        let url = stub(vec![loading.clone(), loading.clone(), (200, "{}".into())]);
+        assert_eq!(health(&url), Health::Loading);
+        let got = Backend::resolve_within(&url, "m", Duration::from_secs(30));
+        assert!(matches!(got, Ok(Backend::Shared { .. })), "{:?}", got.err());
+
+        let url = stub(vec![loading.clone(), loading.clone(), loading]);
+        let got = Backend::resolve_within(&url, "m", Duration::from_millis(300));
+        let Err(Error::Other(m)) = got else {
+            panic!("a load that does not finish is an error, not a spawn")
+        };
+        assert!(m.contains("still loading"), "{m}");
+
+        let url = stub(vec![(404, "{}".into())]);
+        assert_eq!(health(&url), Health::Absent);
+
+        // A reset is no clean answer: refused, never spawned over.
+        let url = dead_server();
+        assert!(
+            matches!(health(&url), Health::Unknown(_)),
+            "{:?}",
+            health(&url)
+        );
+        let Err(Error::Other(m)) = Backend::resolve_within(&url, "m", Duration::from_secs(1))
+        else {
+            panic!("an unknown health is a refusal")
+        };
+        assert!(m.contains("neither uses it nor starts"), "{m}");
+    }
+
+    /// The canary passes on any JSON answer, and fails on a refusal and on
+    /// silence — each the way the request it stands for would have.
+    #[test]
+    fn the_canary_fails_where_the_request_would() {
+        let fmt = || ChatClient::json_object_format();
+        let c = ChatClient::at(&stub(vec![answer(r#"{"anything":[]}"#)]));
+        assert!(c.canary("s", fmt()).is_ok());
+        let refused = r#"{"error":{"message":"model 'llama-server' not found"}}"#;
+        let c = ChatClient::at(&stub(vec![(400, refused.into())]));
+        assert!(c.canary("s", fmt()).is_err());
+        let c = ChatClient::at(&hung_server());
+        assert!(matches!(c.canary("s", fmt()), Err(Error::Timeout(_))));
+        let c = ChatClient::at(&stub(vec![answer("not json")]));
+        assert!(c.canary("s", fmt()).is_err(), "an answer that is not JSON");
+    }
+
+    #[test]
+    fn a_single_model_server_answers_with_its_alias() {
+        let props = serde_json::json!({"model_alias": "qwen3.6-35b-a3b"});
+        assert_eq!(
+            served_from(&props, None).as_deref(),
+            Some("qwen3.6-35b-a3b")
+        );
+        assert_eq!(
+            served_from(&serde_json::json!({"model_alias": ""}), None),
+            None
+        );
+        // The router's placeholder is refused even without its role.
+        assert_eq!(
+            served_from(&serde_json::json!({"model_alias": "llama-server"}), None),
+            None
+        );
+    }
 
     #[test]
     fn plain_json_is_untouched() {

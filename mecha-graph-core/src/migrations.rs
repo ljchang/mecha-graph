@@ -137,6 +137,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "cooccurrence_alarm_first_observed",
         sql: V025_COOCCURRENCE_ALARM_FIRST_OBSERVED,
     },
+    Migration {
+        version: 26,
+        name: "extract_state_failure",
+        sql: V026_EXTRACT_STATE_FAILURE,
+    },
 ];
 
 /// Semantic rejection memory (review-on-use §5): the embedded index of
@@ -1195,4 +1200,15 @@ CREATE TABLE IF NOT EXISTS cooccurrence_alarm (
 /// and a sweep against a copy of the live store did not.
 const V025_COOCCURRENCE_ALARM_FIRST_OBSERVED: &str = r#"
 ALTER TABLE cooccurrence_alarm ADD COLUMN first_observed_co INTEGER;
+"#;
+
+/// Why an episode was charged as its own failure (`extract::mark_attempted`),
+/// or NULL for one that extracted. Without it a charged episode was a row
+/// indistinguishable from a clean empty extraction, and the only record of
+/// which ones they were lived in a nightly log deleted at 30 days while the
+/// mark lasts until `PROMPT_VERSION` moves (found on review of #22). NULL on
+/// rows written before this migration means *unknown*, not clean: the
+/// 2026-09-27 batch was marked before it existed.
+const V026_EXTRACT_STATE_FAILURE: &str = r#"
+ALTER TABLE extract_state ADD COLUMN failure TEXT;
 "#;

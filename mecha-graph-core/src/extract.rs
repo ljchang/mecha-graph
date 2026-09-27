@@ -354,19 +354,37 @@ pub fn extract_pending(
     };
 
     for (episode_id, _uid, body, occurred_at) in rows {
-        extract_episode(
+        let episode = Pending {
+            id: episode_id,
+            body: &body,
+            occurred_at: &occurred_at,
+        };
+        if let Err(e) = extract_settled(
             conn,
             chat,
             &system,
             &schema,
-            episode_id,
-            &body,
-            &occurred_at,
+            &episode,
             &mut committed,
             &mut report,
-        )?;
+        ) {
+            // Say what was done before stopping: what this batch staged is
+            // committed, and a log reading only "failed" would understate it
+            // (as summarize already guards; found on review of #22).
+            // **scripts/nightly.sh parses this line** for its ALERTS count —
+            // reword it and change the sed there with it, or charges read as
+            // a clean night.
+            eprintln!(
+                "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
+                 {} fact and {} commitment candidate(s) staged before the stop",
+                report.episodes,
+                report.errors,
+                report.fact_candidates,
+                report.commitment_candidates
+            );
+            return Err(e);
+        }
     }
-
     Ok(report)
 }
 
@@ -404,34 +422,137 @@ pub fn reextract_episode(
         ..Default::default()
     };
     let mut committed = commitment_block_set(conn)?;
-    extract_episode(
+    let episode = Pending {
+        id: episode_id,
+        body: &body,
+        occurred_at: &occurred_at,
+    };
+    // Settled as a batch's episode is: a targeted re-run while the server is
+    // down must not mark the episode it was run to recover.
+    extract_settled(
         conn,
         chat,
         &system,
         &schema,
-        episode_id,
-        &body,
-        &occurred_at,
+        &episode,
         &mut committed,
         &mut report,
     )?;
     Ok(report)
 }
 
+/// One episode a run is about to extract.
+struct Pending<'a> {
+    id: i64,
+    body: &'a str,
+    occurred_at: &'a str,
+}
+
+/// Extract one episode, and settle who a failure belongs to by asking the
+/// server rather than reading the error.
+///
+/// - A failure the server also fails the canary on is the server's or the
+///   request's (`400 model 'llama-server' not found` on every request,
+///   2026-09-27): the run stops with `Err`, this episode and every later one
+///   unmarked and pending.
+/// - A failure while the canary answers is the episode's (poison input):
+///   marked attempted, so one bad episode cannot wedge every night —
+///   however many bad episodes sit together, and however alike their
+///   errors read.
+/// - No answer — a timeout, or a 5xx or dropped connection that outlasted
+///   the client's retries — gets one more try once the canary answers,
+///   because a link or server that failed mid-request and has since
+///   recovered looks the same as an input that fails; charging the episode
+///   for it would lose it on one blip. A 5xx can be the input's own
+///   (llama.cpp 500s on a prompt it cannot tokenize or fit), so it is
+///   settled by the canary too, never by its status alone — or that one
+///   episode would stop every night at the same place (found on review
+///   of #22).
+fn extract_settled(
+    conn: &Connection,
+    chat: &ChatClient,
+    system: &str,
+    schema: &serde_json::Value,
+    episode: &Pending,
+    committed: &mut std::collections::HashSet<String>,
+    report: &mut ExtractReport,
+) -> Result<()> {
+    report.episodes += 1;
+    let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report, true)?;
+    if let Some(e @ (Error::Timeout(_) | Error::Transport(_))) = &failed {
+        server_answers(chat, system, schema, episode.id, e)?;
+        eprintln!(
+            "extract: episode {}: the server answers the same request with an empty input, \
+             so the episode gets one more try",
+            episode.id
+        );
+        // No backoff: the canary just showed the server answering.
+        failed = extract_episode(
+            conn, chat, system, schema, episode, committed, report, false,
+        )?;
+    }
+    if let Some(e) = failed {
+        // A fault the answer names as the server's setup stops the run —
+        // every later long episode would fail the same way — but this one
+        // episode is charged, with why: left unmarked it would stop the run
+        // at the same place every night and nothing older would ever be
+        // reached (found on review of #22). One per night at most, listed by
+        // `extract --charged`, re-run with `--episode` once the server is fixed.
+        if matches!(e, Error::Server(_)) {
+            report.errors += 1;
+            mark_attempted(conn, episode.id, &chat.model, &e)?;
+            return Err(e);
+        }
+        server_answers(chat, system, schema, episode.id, &e)?;
+        report.errors += 1;
+        mark_attempted(conn, episode.id, &chat.model, &e)?;
+    }
+    Ok(())
+}
+
+/// `Ok` when the server answers the canary — this run's own system prompt
+/// and schema, with an empty input; the stopping error when not.
+fn server_answers(
+    chat: &ChatClient,
+    system: &str,
+    schema: &serde_json::Value,
+    episode_id: i64,
+    failure: &Error,
+) -> Result<()> {
+    chat.canary(
+        system,
+        ChatClient::schema_format("extraction", schema.clone()),
+    )
+    .map_err(|canary| {
+        Error::Other(format!(
+            "extract: episode {episode_id} failed ({failure}) and the same request with an \
+                 empty input then failed too ({canary}) — the server or the request is at \
+                 fault, not the episode, so the run stops with it and every later episode \
+                 unmarked and pending"
+        ))
+    })
+}
+
+/// One extraction attempt. `Ok(Some(e))` is a request that failed — a failed
+/// answer, or none at all — for [`extract_settled`] to settle; `Err` is a
+/// local error (the database).
 #[allow(clippy::too_many_arguments)]
 fn extract_episode(
     conn: &Connection,
     chat: &ChatClient,
     system: &str,
     schema: &serde_json::Value,
-    episode_id: i64,
-    body: &str,
-    occurred_at: &str,
+    episode: &Pending,
     committed: &mut std::collections::HashSet<String>,
     report: &mut ExtractReport,
-) -> Result<()> {
+    backoff: bool,
+) -> Result<Option<Error>> {
+    let &Pending {
+        id: episode_id,
+        body,
+        occurred_at,
+    } = episode;
     {
-        report.episodes += 1;
         let body_trunc: String = body.chars().take(6000).collect();
         // Entities the deterministic alias scan already linked: anchoring
         // the model to canonical names is what keeps subjects resolvable —
@@ -455,22 +576,20 @@ fn extract_episode(
         let user =
             format!("Episode date: {occurred_at}\n{hints}\n{body_trunc}\n\n{CLOSING_IMPERATIVE}");
 
-        let parsed: Extraction = match chat
-            .complete_schema(system, &user, "extraction", schema.clone())
+        let answer = if backoff {
+            chat.complete_schema(system, &user, "extraction", schema.clone())
+        } else {
+            chat.complete_schema_once(system, &user, "extraction", schema.clone())
+        };
+        let parsed: Extraction = match answer
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         {
             Ok(p) => p,
+            // A failed answer, or none: the episode's or the request's. Not
+            // marked here — `extract_settled` asks the server which.
             Err(e) => {
-                report.errors += 1;
                 eprintln!("extract: episode {episode_id}: {e}");
-                // Mark attempted so one poison episode doesn't wedge the batch
-                // forever; bump PROMPT_VERSION to force retries.
-                conn.execute(
-                    "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
-                     VALUES (?1, ?2, ?3, 0)",
-                    params![episode_id, chat.model, PROMPT_VERSION],
-                )?;
-                return Ok(());
+                return Ok(Some(e));
             }
         };
 
@@ -585,12 +704,57 @@ fn extract_episode(
         }
 
         conn.execute(
-            "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO extract_state
+                 (episode_id, model, prompt_version, candidates_created, failure)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
             params![episode_id, chat.model, PROMPT_VERSION, created],
         )?;
     }
+    Ok(None)
+}
+
+/// Record an episode as tried and charged with its own failure, so one
+/// poison episode cannot wedge every batch; bumping PROMPT_VERSION retries
+/// them all, and [`charged_episodes`] lists them with why.
+fn mark_attempted(conn: &Connection, episode_id: i64, model: &str, failure: &Error) -> Result<()> {
+    let why: String = failure.to_string().chars().take(500).collect();
+    conn.execute(
+        "INSERT OR REPLACE INTO extract_state
+             (episode_id, model, prompt_version, candidates_created, failure)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![episode_id, model, PROMPT_VERSION, why],
+    )?;
     Ok(())
+}
+
+/// Episodes marked attempted at the current prompt version with nothing
+/// extracted and no recorded reason: marks from before V026, which cannot say
+/// whether the episode was charged or simply held nothing. Unknown, not clean.
+pub fn unexplained_marks(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM extract_state
+         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1",
+        params![PROMPT_VERSION],
+        |r| r.get(0),
+    )?)
+}
+
+/// Episodes charged as their own failure at the current prompt version:
+/// `(uid, occurred_at, failure)`, newest first — what `extract --episode`
+/// re-runs one at a time.
+pub fn charged_episodes(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.uid, e.occurred_at, s.failure FROM extract_state s
+         JOIN episode e ON e.id = s.episode_id
+         WHERE s.failure IS NOT NULL AND s.prompt_version >= ?1
+         ORDER BY e.occurred_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![PROMPT_VERSION], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
 }
 
 /// Accept a commitment candidate: materialize Task node + task_detail +
@@ -779,7 +943,13 @@ fn uuid_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::db::open_memory;
+    use crate::llm::test_http::{answer, dead_server, hung_server, stub, HANG};
+
+    fn stub_all(code: u16, body: &str, n: usize) -> String {
+        stub((0..n).map(|_| (code, body.to_string())).collect())
+    }
     use crate::graph::{get_or_create_person, upsert_node, Node};
 
     #[test]
@@ -1000,5 +1170,229 @@ mod tests {
         };
         let id = fact::propose_fact(&conn, &proposed, "llm", None).unwrap();
         assert!(accept_commitment(&conn, id).is_err());
+    }
+
+    /// A server that does not answer stops the batch and marks nothing, so
+    /// every episode stays pending. Marking them is how 2026-09-27 aged out a
+    /// whole batch; a closed port is the no-answer case.
+    #[test]
+    fn an_unanswered_request_stops_the_batch_and_marks_no_episode() {
+        // (The canary goes unanswered too, which is what stops it.)
+        let conn = open_memory().unwrap();
+        crate::episode::upsert_episode(&conn, &plain_episode("note", "a", "2026-01-05 10:00:00"))
+            .unwrap();
+        crate::episode::upsert_episode(&conn, &plain_episode("note", "b", "2026-01-06 10:00:00"))
+            .unwrap();
+        let chat = crate::llm::ChatClient::at(&dead_server());
+        let got = extract_pending(&conn, &chat, 10, None, None);
+        assert!(got.is_err(), "{got:?}");
+        let marked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marked, 0, "no episode may be marked attempted");
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
+    }
+
+    fn episodes(conn: &Connection, n: usize) {
+        for i in 0..n {
+            let at = format!("2026-01-{:02} 10:00:00", i + 1);
+            crate::episode::upsert_episode(conn, &plain_episode("note", &format!("e{i}"), &at))
+                .unwrap();
+        }
+    }
+
+    fn marked(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    const REFUSED: &str = r#"{"error":{"code":400,"message":"model 'llama-server' not found"}}"#;
+    const CANARY_OK: &str = r#"{"ok":true}"#;
+    const NOTHING: &str = r#"{"entities":[],"facts":[],"commitments":[]}"#;
+
+    /// The 2026-09-27 shape — every request refused, the canary with them —
+    /// stops the run at the first episode and marks none, whether a batch or
+    /// a targeted re-run (the one run to recover a lost episode).
+    #[test]
+    fn a_failure_the_canary_shares_stops_the_run_unmarked() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 5);
+        let chat = crate::llm::ChatClient::at(&stub_all(400, REFUSED, 10));
+        assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
+        assert_eq!(marked(&conn), 0);
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 5);
+
+        let chat = crate::llm::ChatClient::at(&stub_all(400, REFUSED, 10));
+        assert!(reextract_episode(&conn, &chat, "1").is_err());
+        assert_eq!(marked(&conn), 0);
+    }
+
+    /// Failures while the canary answers are the episodes' own, and are
+    /// marked however many sit together and however alike they read — the
+    /// error text is built from values constant across a batch, so "alike"
+    /// could not tell three bad episodes from a refused request, and held
+    /// them pending forever (found on review of #22).
+    #[test]
+    fn failures_while_the_canary_answers_are_the_episodes_and_are_marked() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let bad = (
+            400,
+            r#"{"error":{"message":"the prompt is too long"}}"#.to_string(),
+        );
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            bad.clone(),
+            answer(CANARY_OK),
+            bad.clone(),
+            answer(CANARY_OK),
+            bad,
+            answer(CANARY_OK),
+        ]));
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!(marked(&conn), 3);
+        assert_eq!((report.episodes, report.errors), (3, 3));
+        // A charge is recorded with its reason, so it can be found and re-run
+        // after the log that printed it is gone (found on review of #22).
+        let charged = charged_episodes(&conn).unwrap();
+        assert_eq!(charged.len(), 3);
+        assert!(
+            charged.iter().all(|(_, _, why)| why.contains("too long")),
+            "{charged:?}"
+        );
+    }
+
+    /// A timeout followed by an answering canary is retried once: a link that
+    /// stalled and recovered must not cost the episode. Two timeouts with the
+    /// server answering between them are the episode's, and it is marked.
+    #[test]
+    fn a_timeout_gets_one_more_try_once_the_canary_answers() {
+        let hang = (HANG, String::new());
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let mut chat = crate::llm::ChatClient::at(&stub(vec![
+            hang.clone(),
+            answer(CANARY_OK),
+            answer(NOTHING),
+        ]));
+        chat.timeout = std::time::Duration::from_secs(1);
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!(
+            (report.episodes, report.errors),
+            (1, 0),
+            "the retry succeeded"
+        );
+        assert!(
+            charged_episodes(&conn).unwrap().is_empty(),
+            "an extraction is not a charge"
+        );
+
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let mut chat = crate::llm::ChatClient::at(&stub(vec![
+            hang.clone(),
+            answer(CANARY_OK),
+            hang,
+            answer(CANARY_OK),
+        ]));
+        chat.timeout = std::time::Duration::from_secs(1);
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!((report.episodes, report.errors), (1, 1));
+        assert_eq!(marked(&conn), 1);
+    }
+
+    /// A hung server times out the episode and then the canary: the run
+    /// stops with every episode pending.
+    #[test]
+    fn a_hung_server_stops_the_run_unmarked() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let mut chat = crate::llm::ChatClient::at(&hung_server());
+        chat.timeout = std::time::Duration::from_secs(1);
+        assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
+        assert_eq!(marked(&conn), 0);
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 3);
+    }
+
+    /// The canary is the failed request itself with an empty input — the
+    /// same system prompt and the same schema, both built from graph data —
+    /// so a refusal the schema causes is one the canary shares (found on
+    /// review of #22: a two-field literal answered while every episode 400d).
+    #[test]
+    fn the_canary_is_the_failed_request_with_an_empty_input() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 1);
+        let (url, seen) = crate::llm::test_http::stub_recording(vec![
+            (400, r#"{"error":{"message":"bad episode"}}"#.into()),
+            answer(NOTHING),
+        ]);
+        let chat = crate::llm::ChatClient::at(&url);
+        extract_pending(&conn, &chat, 10, None, None).unwrap();
+        let seen = seen.lock().unwrap();
+        let body = |i: usize| serde_json::from_str::<serde_json::Value>(&seen[i]).unwrap();
+        let (episode, canary) = (body(0), body(1));
+        assert_eq!(
+            episode["messages"][0], canary["messages"][0],
+            "the same system prompt"
+        );
+        assert_eq!(
+            episode["response_format"], canary["response_format"],
+            "the same schema"
+        );
+        assert_ne!(
+            episode["messages"][1], canary["messages"][1],
+            "an empty input"
+        );
+    }
+
+    /// A 5xx is settled by the canary like any failure: one that recovered
+    /// gets the episode another try; one the server keeps giving only on
+    /// this episode is the episode's, and it is marked rather than stopping
+    /// every night at the same place (found on review of #22).
+    #[test]
+    fn a_5xx_the_server_does_not_share_is_the_episodes() {
+        let e500 = (
+            500,
+            r#"{"error":{"message":"failed to tokenize"}}"#.to_string(),
+        );
+        let conn = open_memory().unwrap();
+        episodes(&conn, 2);
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            e500.clone(),
+            answer(NOTHING),
+            e500,
+            answer(NOTHING),
+            answer(NOTHING),
+        ]));
+        let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
+        assert_eq!((report.episodes, report.errors), (2, 1));
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 0);
+    }
+
+    /// Reasoning that ate the whole allowance names the server's setup: the
+    /// run stops (the canary's empty input would have answered, and every
+    /// long episode been charged — found on review of #22), charging only the
+    /// episode that showed it, with why, so it cannot stop every night at the
+    /// same place either.
+    #[test]
+    fn reasoning_that_eats_the_allowance_stops_the_run_and_charges_one() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let exhausted = serde_json::json!({"choices": [{
+            "message": {"content": "", "reasoning_content": "thinking ".repeat(50)},
+            "finish_reason": "length"
+        }]})
+        .to_string();
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            (200, exhausted),
+            answer(NOTHING),
+            answer(NOTHING),
+            answer(NOTHING),
+        ]));
+        let got = extract_pending(&conn, &chat, 10, None, None);
+        assert!(matches!(got, Err(Error::Server(_))), "{got:?}");
+        assert_eq!(marked(&conn), 1, "the one that showed it, and no other");
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
+        let charged = charged_episodes(&conn).unwrap();
+        assert!(charged[0].2.contains("reasoning"), "{charged:?}");
     }
 }
