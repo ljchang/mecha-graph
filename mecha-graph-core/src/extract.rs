@@ -705,8 +705,8 @@ fn extract_episode(
 
         conn.execute(
             "INSERT OR REPLACE INTO extract_state
-                 (episode_id, model, prompt_version, candidates_created, failure)
-             VALUES (?1, ?2, ?3, ?4, NULL)",
+                 (episode_id, model, prompt_version, candidates_created, failure, reason_recorded)
+             VALUES (?1, ?2, ?3, ?4, NULL, 1)",
             params![episode_id, chat.model, PROMPT_VERSION, created],
         )?;
     }
@@ -720,20 +720,24 @@ fn mark_attempted(conn: &Connection, episode_id: i64, model: &str, failure: &Err
     let why: String = failure.to_string().chars().take(500).collect();
     conn.execute(
         "INSERT OR REPLACE INTO extract_state
-             (episode_id, model, prompt_version, candidates_created, failure)
-         VALUES (?1, ?2, ?3, 0, ?4)",
+             (episode_id, model, prompt_version, candidates_created, failure, reason_recorded)
+         VALUES (?1, ?2, ?3, 0, ?4, 1)",
         params![episode_id, model, PROMPT_VERSION, why],
     )?;
     Ok(())
 }
 
 /// Episodes marked attempted at the current prompt version with nothing
-/// extracted and no recorded reason: marks from before V026, which cannot say
-/// whether the episode was charged or simply held nothing. Unknown, not clean.
+/// extracted and no recorded reason, from writers that did not record one
+/// (`reason_recorded = 0`, V027): those cannot say whether the episode was
+/// charged or simply held nothing. Unknown, not clean. Read off the row, not
+/// inferred from a sibling table that does not survive a copy (found on
+/// review of mecha-graph#23).
 pub fn unexplained_marks(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM extract_state
-         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1",
+         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1
+           AND reason_recorded = 0",
         params![PROMPT_VERSION],
         |r| r.get(0),
     )?)
@@ -1281,6 +1285,12 @@ mod tests {
             (1, 0),
             "the retry succeeded"
         );
+        // The success path records that it had no reason to record.
+        assert_eq!(
+            unexplained_marks(&conn).unwrap(),
+            0,
+            "a clean extraction is not unknown"
+        );
         assert!(
             charged_episodes(&conn).unwrap().is_empty(),
             "an extraction is not a charge"
@@ -1394,5 +1404,66 @@ mod tests {
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
         let charged = charged_episodes(&conn).unwrap();
         assert!(charged[0].2.contains("reasoning"), "{charged:?}");
+    }
+
+    /// Only rows whose writer recorded no reason are unexplained: a clean
+    /// extraction and a charge both record, a row from before does not (found
+    /// on review of #22 and mecha-graph#23 — the count grew with every clean
+    /// night, then reverted on every copy).
+    #[test]
+    fn unexplained_marks_are_only_rows_that_recorded_no_reason() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 2);
+        // A mark from before V027: reason_recorded takes its default, 0.
+        conn.execute(
+            "INSERT INTO extract_state (episode_id, model, prompt_version, candidates_created)
+             VALUES (1, 'm', ?1, 0)",
+            params![PROMPT_VERSION],
+        )
+        .unwrap();
+        mark_attempted(&conn, 2, "m", &Error::Other("bad".into())).unwrap();
+        assert_eq!(unexplained_marks(&conn).unwrap(), 1);
+        assert_eq!(charged_episodes(&conn).unwrap().len(), 1);
+    }
+
+    /// V027's backfill, executed: rows a V026 build wrote are marked
+    /// recorded, a charge by its reason and a clean row by its time, and a
+    /// row from before V026 stays unknown (found on review of mecha-graph#23:
+    /// no test reached the UPDATE, since a fresh store's table is empty when
+    /// V027 runs).
+    #[test]
+    fn the_v027_backfill_marks_what_a_v026_build_wrote_and_nothing_older() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        // Back to "V026 applied at a known time, V027 not yet".
+        conn.execute_batch(
+            "ALTER TABLE extract_state DROP COLUMN reason_recorded;
+             DELETE FROM _migrations WHERE version = 27;
+             UPDATE _migrations SET applied_at = '2026-09-27 00:00:00' WHERE version = 26;",
+        )
+        .unwrap();
+        for (id, failure, at) in [
+            (1, None, "2026-09-01 00:00:00"),        // before V026: unknown
+            (2, None, "2026-09-27 12:00:00"),        // clean, after V026: recorded
+            (3, Some("bad"), "2026-09-01 00:00:00"), // a charge: recorded by its reason
+        ] {
+            conn.execute(
+                "INSERT INTO extract_state
+                     (episode_id, model, prompt_version, candidates_created, failure, extracted_at)
+                 VALUES (?1, 'm', ?2, 0, ?3, ?4)",
+                params![id, PROMPT_VERSION, failure, at],
+            )
+            .unwrap();
+        }
+        crate::migrations::run_migrations(&conn).unwrap();
+        let recorded: Vec<i64> = conn
+            .prepare("SELECT reason_recorded FROM extract_state ORDER BY episode_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(recorded, vec![0, 1, 1]);
+        assert_eq!(unexplained_marks(&conn).unwrap(), 1);
     }
 }
