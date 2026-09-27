@@ -217,6 +217,15 @@ impl Drop for Backend {
     }
 }
 
+/// What a server says about itself: the model it is serving, if that can be
+/// told, and — on a router, whose `model` field *selects* — every id it will
+/// accept, so a configured fallback can be checked before any request uses it.
+#[derive(Debug, Default)]
+struct Served {
+    resident: Option<String>,
+    router_ids: Option<Vec<String>>,
+}
+
 /// What the server actually has loaded, from its own `/props`.
 ///
 /// Asked rather than asserted, because the shared server belongs to mecha and
@@ -234,9 +243,10 @@ impl Drop for Backend {
 /// the router refuses — 2026-09-27, the night mecha's :8080 became a router:
 /// 100 extractions and 30 summaries failed, and the extractions were marked
 /// attempted. So on a router the answer is the one model resident there, read
-/// from `/models`; `None` — use the configured model — when that cannot be
-/// told (nothing loaded, two loaded, or a list this does not fully read).
-fn served_model(base_url: &str) -> Option<String> {
+/// from `/models`; `None` — use the configured model, **on a router only if it
+/// lists that name** (`connect` refuses otherwise) — when that cannot be told
+/// (nothing loaded, two loaded, or a list this does not fully read).
+fn probe(base_url: &str) -> Served {
     let get = |path: &str| -> Option<serde_json::Value> {
         ureq::get(&format!("{base_url}{path}"))
             .timeout(Duration::from_millis(1500))
@@ -245,13 +255,29 @@ fn served_model(base_url: &str) -> Option<String> {
             .into_json()
             .ok()
     };
-    let props = get("/props")?;
-    let models = if props.get("role").and_then(|r| r.as_str()) == Some("router") {
-        Some(get("/models")?)
-    } else {
-        None
+    let Some(props) = get("/props") else {
+        return Served::default();
     };
-    served_from(&props, models.as_ref())
+    let router = props.get("role").and_then(|r| r.as_str()) == Some("router");
+    let models = if router { get("/models") } else { None };
+    Served {
+        resident: served_from(&props, models.as_ref()),
+        // A router whose /models did not answer accepts no id we can name.
+        router_ids: router.then(|| router_ids(models.as_ref())),
+    }
+}
+
+/// Every model id a router lists — the names a request may carry.
+fn router_ids(models: Option<&serde_json::Value>) -> Vec<String> {
+    models
+        .and_then(|m| m.get("data"))
+        .and_then(|d| d.as_array())
+        .map(|d| {
+            d.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The pure half of [`served_model`]: a single-model server's `model_alias`,
@@ -262,6 +288,11 @@ fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) ->
         // "this one" is a claim a list this does not understand cannot back.
         // Same rule as mecha's provider::router::readable.
         const KNOWN: [&str; 5] = ["unloaded", "loading", "loaded", "sleeping", "downloading"];
+        // `sleeping` counts as resident, as in mecha's `RouterModel::is_resident`:
+        // a sleeping model is still selectable by name, so beside a loaded one
+        // "which" is ambiguous. Under `--models-max 1` (the router this was
+        // written for) two can never be resident at once, so this is the edge
+        // case it looks like, not the steady state.
         let data = models?.get("data")?.as_array()?;
         let status = |m: &serde_json::Value| {
             m.get("status")
@@ -343,19 +374,41 @@ impl ChatClient {
         // A warning is the honest middle: the swap is visible, the provenance
         // is truthful, and `extract_state.model` + PROMPT_VERSION already give
         // you the tools to find and re-extract whatever a given model produced.
-        let model = match served_model(backend.base_url()) {
-            Some(served) => {
-                if cfg.model.is_some() && served != wanted {
-                    eprintln!(
-                        "mecha-graph: [llm] model is '{wanted}' but {} serves '{served}' — \
+        let served = probe(backend.base_url());
+        let model =
+            match served.resident {
+                Some(served) => {
+                    if cfg.model.is_some() && served != wanted {
+                        eprintln!(
+                            "mecha-graph: [llm] model is '{wanted}' but {} serves '{served}' — \
                          using '{served}' and recording it as the extractor.",
-                        backend.base_url()
-                    );
+                            backend.base_url()
+                        );
+                    }
+                    served
                 }
-                served
-            }
-            None => wanted,
-        };
+                // On a router the name *selects*, so falling back is safe only to
+                // a name it lists. Anything else would be refused on every request
+                // — and extract marks each refused episode attempted, so a batch
+                // would be burned, as on 2026-09-27. Refused here, before the
+                // first request, every episode stays retryable (found on review).
+                None => {
+                    if let Some(ids) = &served.router_ids {
+                        if !ids.iter().any(|i| i == &wanted) {
+                            return Err(Error::Other(format!(
+                            "mecha-graph: the llama-server router at {} does not serve '{wanted}' \
+                             and has no single resident model to use instead; it lists: {}. \
+                             Set [llm] model (or EXTRACT_MODEL) to one of those, or load one \
+                             (`mecha model use …`). Refusing before any request, so nothing is \
+                             marked attempted.",
+                            backend.base_url(),
+                            if ids.is_empty() { "(nothing)".to_string() } else { ids.join(", ") }
+                        )));
+                        }
+                    }
+                    wanted
+                }
+            };
 
         Ok(ChatClient {
             model,
@@ -549,6 +602,30 @@ mod tests {
         assert_eq!(
             served_from(&placeholder, Some(&serde_json::json!({"data": []}))),
             None
+        );
+    }
+
+    #[test]
+    fn a_loaded_and_a_sleeping_model_are_two_resident_and_no_answer() {
+        let placeholder = serde_json::json!({"role": "router"});
+        let list = serde_json::json!({"data": [
+            {"id": "a", "status": {"value": "loaded"}},
+            {"id": "b", "status": {"value": "sleeping"}}]});
+        assert_eq!(served_from(&placeholder, Some(&list)), None);
+    }
+
+    #[test]
+    fn a_routers_ids_are_what_a_fallback_is_checked_against() {
+        let list = serde_json::json!({"data": [
+            {"id": "qwen3.6-35b-a3b", "status": {"value": "unloaded"}},
+            {"id": "gemma-4-26b-a4b", "status": {"value": "unloaded"}}]});
+        assert_eq!(
+            router_ids(Some(&list)),
+            vec!["qwen3.6-35b-a3b", "gemma-4-26b-a4b"]
+        );
+        assert!(
+            router_ids(None).is_empty(),
+            "no list: no name is known to be accepted"
         );
     }
 

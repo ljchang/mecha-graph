@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **LLM calls against a llama-server router** (mecha's :8080 from
+  2026-09-27): `served_model` read the router's placeholder `/props` alias
+  (`llama-server`) as the served model and sent it on every request, which the
+  router refuses — the 2026-09-27 nightly lost 100 extractions (marked
+  attempted, so not retried) and 30 summaries. On a router the served model is
+  now the one resident in `/models`, and a configured fallback the router does
+  not list makes `connect` refuse before the first request, so a batch is never
+  burned.
+
 - **A multiword denylist term split across a line break is caught.** grep
   reads one line at a time, and prose here is hard-wrapped at ~75 columns in
   docs, comments and commit messages, so a two-word term with its words on

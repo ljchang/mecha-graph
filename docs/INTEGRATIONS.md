@@ -123,12 +123,20 @@ isolated.
   by loading a second 20 GB copy — silently, at 03:30, for the rest of the
   night. Nothing ever spawns at a URL that already answers, and a managed
   server is killed when the process exits.
-- **The served model is discovered, not asserted.** llama-server ignores a
-  request's `model` field, so `GET /props` → `model_alias` is what gets
-  recorded in `extract_state.model`. A mismatch against an explicitly pinned
-  `[llm] model` warns rather than refuses: a nightly that dies the first time
-  you try a different model in the TUI would make the graph's health depend on
-  remembering to edit a second config.
+- **The served model is discovered, not asserted.** A single-model
+  llama-server ignores a request's `model` field, so `GET /props` →
+  `model_alias` is what gets recorded in `extract_state.model`. A mismatch
+  against an explicitly pinned `[llm] model` warns rather than refuses: a
+  nightly that dies the first time you try a different model in the TUI would
+  make the graph's health depend on remembering to edit a second config.
+- **A llama-server router is the exception** (mecha's :8080 since
+  2026-09-27). Its bare `/props` is a placeholder (`role: "router"`,
+  `model_alias: "llama-server"`) and the request's `model` field *selects*.
+  So the served model is the one resident in `GET /models` (from a list whose
+  every status is known); when that cannot be told, the configured model is
+  used only if the router lists it, and otherwise `connect` refuses before the
+  first request. Reading the placeholder as the model cost 100 extractions and
+  30 summaries on 2026-09-27 — refused requests that extract marked attempted.
 - **Embedding config**: `[llm] embed_model`, `embed_dims`, `embed_max_chars`.
   `embed::ensure_vec_dims` reconciles the `vec0` tables to `embed_dims` by
   rebuilding them — destructive by necessity, since vectors of a different
