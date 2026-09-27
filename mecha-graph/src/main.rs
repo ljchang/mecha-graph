@@ -485,6 +485,11 @@ enum Command {
         /// evidence-only gap. Ignores --limit/--source.
         #[arg(long)]
         episode: Option<String>,
+        /// List the episodes charged as their own failure at the current
+        /// prompt version, with why — the ids `--episode` re-runs. Runs no
+        /// model.
+        #[arg(long, conflicts_with = "episode")]
+        charged: bool,
     },
     /// Undo the most recent TUI episode delete/edit (also Ctrl-Z in the TUI)
     Undo,
@@ -4076,7 +4081,17 @@ reject: it was never true (retracted; the class learns)"
             }
         }
 
-        Command::Extract { limit, model, source, exclude_source, episode } => {
+        Command::Extract { charged: true, .. } => {
+            let charged = mecha_graph_core::extract::charged_episodes(&conn)?;
+            if charged.is_empty() {
+                println!("no episode is charged as its own failure at this prompt version");
+            }
+            for (uid, at, why) in charged {
+                println!("{uid}\t{at}\t{why}");
+            }
+        }
+
+        Command::Extract { limit, model, source, exclude_source, episode, .. } => {
             let chat = mecha_graph_core::llm::ChatClient::connect(&model)?;
             let report = if let Some(ep) = episode {
                 mecha_graph_core::extract::reextract_episode(&conn, &chat, &ep)?

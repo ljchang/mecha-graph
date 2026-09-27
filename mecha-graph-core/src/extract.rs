@@ -491,7 +491,7 @@ fn extract_settled(
     if let Some(e) = failed {
         server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
-        mark_attempted(conn, episode.id, &chat.model)?;
+        mark_attempted(conn, episode.id, &chat.model, &e)?;
     }
     Ok(())
 }
@@ -690,23 +690,45 @@ fn extract_episode(
         }
 
         conn.execute(
-            "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO extract_state
+                 (episode_id, model, prompt_version, candidates_created, failure)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
             params![episode_id, chat.model, PROMPT_VERSION, created],
         )?;
     }
     Ok(None)
 }
 
-/// Record an episode as tried and yielding nothing, so one poison episode
-/// cannot wedge every batch; bumping PROMPT_VERSION retries them all.
-fn mark_attempted(conn: &Connection, episode_id: i64, model: &str) -> Result<()> {
+/// Record an episode as tried and charged with its own failure, so one
+/// poison episode cannot wedge every batch; bumping PROMPT_VERSION retries
+/// them all, and [`charged_episodes`] lists them with why.
+fn mark_attempted(conn: &Connection, episode_id: i64, model: &str, failure: &Error) -> Result<()> {
+    let why: String = failure.to_string().chars().take(500).collect();
     conn.execute(
-        "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
-         VALUES (?1, ?2, ?3, 0)",
-        params![episode_id, model, PROMPT_VERSION],
+        "INSERT OR REPLACE INTO extract_state
+             (episode_id, model, prompt_version, candidates_created, failure)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![episode_id, model, PROMPT_VERSION, why],
     )?;
     Ok(())
+}
+
+/// Episodes charged as their own failure at the current prompt version:
+/// `(uid, occurred_at, failure)`, newest first — what `extract --episode`
+/// re-runs one at a time.
+pub fn charged_episodes(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.uid, e.occurred_at, s.failure FROM extract_state s
+         JOIN episode e ON e.id = s.episode_id
+         WHERE s.failure IS NOT NULL AND s.prompt_version >= ?1
+         ORDER BY e.occurred_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![PROMPT_VERSION], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
 }
 
 /// Accept a commitment candidate: materialize Task node + task_detail +
@@ -1203,6 +1225,14 @@ mod tests {
         let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
         assert_eq!(marked(&conn), 3);
         assert_eq!((report.episodes, report.errors), (3, 3));
+        // A charge is recorded with its reason, so it can be found and re-run
+        // after the log that printed it is gone (found on review of #22).
+        let charged = charged_episodes(&conn).unwrap();
+        assert_eq!(charged.len(), 3);
+        assert!(
+            charged.iter().all(|(_, _, why)| why.contains("too long")),
+            "{charged:?}"
+        );
     }
 
     /// A timeout followed by an answering canary is retried once: a link that
@@ -1224,6 +1254,10 @@ mod tests {
             (report.episodes, report.errors),
             (1, 0),
             "the retry succeeded"
+        );
+        assert!(
+            charged_episodes(&conn).unwrap().is_empty(),
+            "an extraction is not a charge"
         );
 
         let conn = open_memory().unwrap();

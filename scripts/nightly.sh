@@ -235,8 +235,12 @@ if [ "$GPU_UTIL" -le "$GPU_BUSY_THRESHOLD" ]; then
     # charges many is 2026-09-27's loss by a route the canary cannot see. So
     # tonight's count goes in the one line people scan, read from tonight's
     # report line only (found on review of #22).
+    # Either line: a run that charged some and then stopped prints only its
+    # `extract: stopping —` line, and must not read like one that never ran.
     EXTRACT_CHARGED="$(tail -n +"$EXTRACT_FROM" "$LOG" \
-        | sed -n 's/^extracted \([0-9]*\) episodes.*(\([0-9]*\) errors)$/\2 of \1/p' | tail -n 1)"
+        | sed -n -e 's/^extracted \([0-9]*\) episodes.*(\([0-9]*\) errors)$/\2 of \1/p' \
+                 -e 's/^extract: stopping — \([0-9]*\) episode(s) tried, \([0-9]*\) charged.*/\2 of \1/p' \
+        | tail -n 1)"
     # Auto-triage the fresh candidates: duplicates die, contradictions get
     # flagged, and (opt-in) clean novel facts accept themselves. --triage
     # adds the lanes calibrated on the owner's verdicts (precheck.rs):
@@ -312,7 +316,7 @@ case "$NIGHTLY_ENV_STATUS" in
 esac
 case "${EXTRACT_CHARGED:-}" in
     "" | "0 of "*) ;;
-    *) STALE="${STALE:+$STALE; }extract charged $EXTRACT_CHARGED episode(s) as their own failure (marked attempted; \`extract --episode <id>\` re-runs one)" ;;
+    *) STALE="${STALE:+$STALE; }extract charged $EXTRACT_CHARGED episode(s) as their own failure (\`mecha-graph extract --charged\` lists them with why; \`extract --episode <id>\` re-runs one)" ;;
 esac
 if [ -n "${FAILED_STEPS[*]-}" ]; then
     STALE="${STALE:+$STALE; }failed: $(IFS=,; echo "${FAILED_STEPS[*]}" | sed 's/,/, /g')"
