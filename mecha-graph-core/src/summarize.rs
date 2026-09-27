@@ -169,23 +169,33 @@ pub fn refresh_summaries(
             // nothing, and a hung server would hold the nightly for hours.
             // Stop, and fail the command so the nightly logs and alerts it.
             // If it answers, the failure was this node's; record it and go on.
+            // A fault the answer names as the server's own setup stops it
+            // without asking: every later node would fail the same way.
             Err(e) => {
-                if let Err(canary) = chat.canary(SYSTEM_PROMPT, ChatClient::json_object_format()) {
+                let stop = match &e {
+                    Error::Server(_) => Some(format!("summarize: {id}: {e}")),
+                    _ => chat
+                        .canary(SYSTEM_PROMPT, ChatClient::json_object_format())
+                        .err()
+                        .map(|canary| {
+                            format!(
+                                "summarize: {id} failed ({e}) and a trivial request then \
+                                 failed too ({canary}) — the server is not answering"
+                            )
+                        }),
+                };
+                if let Some(why) = stop {
                     // Say what was done before stopping: the summaries written
                     // so far are committed, and the log must not understate them.
                     eprintln!(
-                        "summarize: stopping — {} refreshed, {} failed before the server \
-                         stopped answering",
+                        "summarize: stopping — {} refreshed, {} failed before the stop",
                         report.refreshed,
                         report.errors.len()
                     );
                     for e in &report.errors {
                         eprintln!("summarize: {e}");
                     }
-                    return Err(Error::Other(format!(
-                        "summarize: {id} failed ({e}) and a trivial request then failed too \
-                         ({canary}) — the server is not answering"
-                    )));
+                    return Err(Error::Other(why));
                 }
                 report.errors.push(format!("{id}: {e}"));
             }

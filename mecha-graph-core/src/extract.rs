@@ -476,6 +476,10 @@ fn extract_settled(
 ) -> Result<()> {
     report.episodes += 1;
     let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report, true)?;
+    // A fault the answer itself names as the server's is never the episode's.
+    if let Some(e @ Error::Server(_)) = failed {
+        return Err(e);
+    }
     if let Some(e @ (Error::Timeout(_) | Error::Transport(_))) = &failed {
         server_answers(chat, system, schema, episode.id, e)?;
         eprintln!(
@@ -489,6 +493,9 @@ fn extract_settled(
         )?;
     }
     if let Some(e) = failed {
+        if matches!(e, Error::Server(_)) {
+            return Err(e);
+        }
         server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
         mark_attempted(conn, episode.id, &chat.model, &e)?;
@@ -1340,5 +1347,30 @@ mod tests {
         let report = extract_pending(&conn, &chat, 10, None, None).unwrap();
         assert_eq!((report.episodes, report.errors), (2, 1));
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 0);
+    }
+
+    /// Reasoning that ate the whole allowance names the server's setup, not
+    /// the episode: the run stops with nothing marked, even though the
+    /// canary's empty input would have answered (found on review of #22 —
+    /// every long episode was charged as poison by that route).
+    #[test]
+    fn reasoning_that_eats_the_allowance_stops_the_run_unmarked() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let exhausted = serde_json::json!({"choices": [{
+            "message": {"content": "", "reasoning_content": "thinking ".repeat(50)},
+            "finish_reason": "length"
+        }]})
+        .to_string();
+        let chat = crate::llm::ChatClient::at(&stub(vec![
+            (200, exhausted),
+            answer(NOTHING),
+            answer(NOTHING),
+            answer(NOTHING),
+        ]));
+        let got = extract_pending(&conn, &chat, 10, None, None);
+        assert!(matches!(got, Err(Error::Server(_))), "{got:?}");
+        assert_eq!(marked(&conn), 0);
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 3);
     }
 }

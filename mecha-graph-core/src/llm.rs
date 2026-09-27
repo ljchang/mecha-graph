@@ -801,12 +801,14 @@ impl ChatClient {
             // guard — an episode marked attempted as though the model had
             // simply found nothing.
             if reasoning_len > 0 || finish == "length" {
-                return Err(Error::Other(format!(
+                return Err(Error::Server(format!(
                     "empty completion after {reasoning_len} chars of reasoning \
-                     (finish_reason={finish}): the server did not honour \
-                     chat_template_kwargs.enable_thinking=false. Check that \
-                     llama-server runs with --jinja (a chatml override silently \
-                     ignores it)."
+                     (finish_reason={finish}): the reasoning used the whole \
+                     {max} token allowance, which is the server's setup, not the \
+                     input — its --reasoning-budget must sit well below {max}, \
+                     and with thinking off (think=false) it must run --jinja or \
+                     enable_thinking=false is silently ignored.",
+                    max = self.max_tokens
                 )));
             }
             return Err(Error::Other(format!(

@@ -28,6 +28,14 @@ pub enum Error {
     /// the input one more try before charging it (found on review of #22).
     #[error("{0}")]
     Timeout(String),
+    /// The server answered, and the answer names a fault of the server's own
+    /// setup — the reasoning ate the whole token allowance, so there is no
+    /// content. Settled by classification, not by the canary: the canary's
+    /// empty input always fits the reasoning budget, so it would answer and
+    /// every long input would be charged as poison (found on review of #22).
+    /// Callers stop and mark nothing.
+    #[error("{0}")]
+    Server(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
