@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now the one resident in `/models`, and a configured fallback the router does
   not list makes `connect` refuse before the first request, so a batch is never
   burned.
+- **`extract` no longer marks an episode attempted when the server gave no
+  answer.** A 5xx (a router answers 503 while it swaps a model), a timeout or
+  a refused connection is `Error::Transport`: the batch stops and nothing is
+  marked, so every episode stays pending. The poison-episode mark is kept for
+  answers that are the episode's doing — a 4xx, unparseable output, an empty
+  completion. `connect` also refuses when a server that passed its health
+  check does not answer `/props` (a probe now waits 10 s, not 1.5).
 
 - **A multiword denylist term split across a line break is caught.** grep
   reads one line at a time, and prose here is hard-wrapped at ~75 columns in

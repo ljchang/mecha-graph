@@ -222,8 +222,14 @@ impl Drop for Backend {
 /// accept, so a configured fallback can be checked before any request uses it.
 #[derive(Debug, Default)]
 struct Served {
+    /// Whether `/props` answered at all. A server `Backend::resolve` already
+    /// found answering whose `/props` does not is unknown, and unknown is not
+    /// "not a router": `connect` refuses rather than send an unchecked name.
+    props_read: bool,
     resident: Option<String>,
-    router_ids: Option<Vec<String>>,
+    /// `Some` on a router: `Some(ids)` from a `/models` it read, `Some(None)`
+    /// when that list could not be read.
+    router_ids: Option<Option<Vec<String>>>,
 }
 
 /// What the server actually has loaded, from its own `/props`.
@@ -247,9 +253,11 @@ struct Served {
 /// lists that name** (`connect` refuses otherwise) — when that cannot be told
 /// (nothing loaded, two loaded, or a list this does not fully read).
 fn probe(base_url: &str) -> Served {
+    // Ten seconds, not 1.5: a shared server's queue can hold a probe as it
+    // holds a request, and a probe that times out is now a refusal.
     let get = |path: &str| -> Option<serde_json::Value> {
         ureq::get(&format!("{base_url}{path}"))
-            .timeout(Duration::from_millis(1500))
+            .timeout(Duration::from_secs(10))
             .call()
             .ok()?
             .into_json()
@@ -261,26 +269,24 @@ fn probe(base_url: &str) -> Served {
     let router = props.get("role").and_then(|r| r.as_str()) == Some("router");
     let models = if router { get("/models") } else { None };
     Served {
+        props_read: true,
         resident: served_from(&props, models.as_ref()),
-        // A router whose /models did not answer accepts no id we can name.
         router_ids: router.then(|| router_ids(models.as_ref())),
     }
 }
 
-/// Every model id a router lists — the names a request may carry.
-fn router_ids(models: Option<&serde_json::Value>) -> Vec<String> {
-    models
-        .and_then(|m| m.get("data"))
-        .and_then(|d| d.as_array())
-        .map(|d| {
-            d.iter()
-                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Every model id a router lists — the names a request may carry — or `None`
+/// when there is no list to read (not the same as an empty one).
+fn router_ids(models: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let data = models?.get("data")?.as_array()?;
+    Some(
+        data.iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect(),
+    )
 }
 
-/// The pure half of [`served_model`]: a single-model server's `model_alias`,
+/// The pure half of [`probe`]: a single-model server's `model_alias`,
 /// or a router's one resident model.
 fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) -> Option<String> {
     if props.get("role").and_then(|r| r.as_str()) == Some("router") {
@@ -315,7 +321,10 @@ fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) ->
     props
         .get("model_alias")
         .and_then(|m| m.as_str())
-        .filter(|m| !m.is_empty())
+        // The router's placeholder, refused by name as well as by `role`:
+        // should a router ever answer without the role, the worst case is "use
+        // the configured model", never "name the placeholder on every request".
+        .filter(|m| !m.is_empty() && *m != "llama-server")
         .map(str::to_string)
 }
 
@@ -347,6 +356,23 @@ pub struct ChatClient {
     backend: Backend,
 }
 
+#[cfg(test)]
+impl ChatClient {
+    /// A client aimed at `base_url` with no probing — for tests that need a
+    /// server's answer (or its absence) to reach `post`.
+    pub(crate) fn at(base_url: &str) -> ChatClient {
+        ChatClient {
+            model: "test-model".into(),
+            timeout: Duration::from_secs(5),
+            max_tokens: 64,
+            think: false,
+            backend: Backend::Shared {
+                base_url: base_url.to_string(),
+            },
+        }
+    }
+}
+
 impl ChatClient {
     /// Resolve a backend and connect. Fails loudly when there is no server and
     /// no configured way to start one — never silently degrades to a second
@@ -375,40 +401,51 @@ impl ChatClient {
         // is truthful, and `extract_state.model` + PROMPT_VERSION already give
         // you the tools to find and re-extract whatever a given model produced.
         let served = probe(backend.base_url());
-        let model =
-            match served.resident {
-                Some(served) => {
-                    if cfg.model.is_some() && served != wanted {
-                        eprintln!(
-                            "mecha-graph: [llm] model is '{wanted}' but {} serves '{served}' — \
+        if !served.props_read {
+            return Err(Error::Other(format!(
+                "mecha-graph: {} answered its health check but not /props, so what it \
+                 serves — and, on a router, what it will accept — is unknown. Refusing \
+                 before any request, so nothing is marked attempted.",
+                backend.base_url()
+            )));
+        }
+        let model = match served.resident {
+            Some(served) => {
+                if cfg.model.is_some() && served != wanted {
+                    eprintln!(
+                        "mecha-graph: [llm] model is '{wanted}' but {} serves '{served}' — \
                          using '{served}' and recording it as the extractor.",
+                        backend.base_url()
+                    );
+                }
+                served
+            }
+            // On a router the name *selects*, so falling back is safe only to
+            // a name it lists. Anything else would be refused on every request
+            // — and extract marks each refused episode attempted, so a batch
+            // would be burned, as on 2026-09-27. Refused here, before the
+            // first request, every episode stays retryable (found on review).
+            None => {
+                if let Some(ids) = &served.router_ids {
+                    let listed = ids.as_ref().is_some_and(|l| l.iter().any(|i| i == &wanted));
+                    if !listed {
+                        let what = match ids {
+                            None => "its /models could not be read".to_string(),
+                            Some(l) if l.is_empty() => "it lists no models".to_string(),
+                            Some(l) => format!("it lists: {}", l.join(", ")),
+                        };
+                        return Err(Error::Other(format!(
+                            "mecha-graph: the llama-server router at {} has no single resident \
+                             model to use and does not list '{wanted}' — {what}. Set [llm] model \
+                             (or EXTRACT_MODEL) to a listed name, or load one (`mecha model use \
+                             …`). Refusing before any request, so nothing is marked attempted.",
                             backend.base_url()
-                        );
-                    }
-                    served
-                }
-                // On a router the name *selects*, so falling back is safe only to
-                // a name it lists. Anything else would be refused on every request
-                // — and extract marks each refused episode attempted, so a batch
-                // would be burned, as on 2026-09-27. Refused here, before the
-                // first request, every episode stays retryable (found on review).
-                None => {
-                    if let Some(ids) = &served.router_ids {
-                        if !ids.iter().any(|i| i == &wanted) {
-                            return Err(Error::Other(format!(
-                            "mecha-graph: the llama-server router at {} does not serve '{wanted}' \
-                             and has no single resident model to use instead; it lists: {}. \
-                             Set [llm] model (or EXTRACT_MODEL) to one of those, or load one \
-                             (`mecha model use …`). Refusing before any request, so nothing is \
-                             marked attempted.",
-                            backend.base_url(),
-                            if ids.is_empty() { "(nothing)".to_string() } else { ids.join(", ") }
                         )));
-                        }
                     }
-                    wanted
                 }
-            };
+                wanted
+            }
+        };
 
         Ok(ChatClient {
             model,
@@ -488,14 +525,23 @@ impl ChatClient {
                 // A refusal here arrives as a real status with a JSON body
                 // naming the bad field. Swallowing it into "request failed"
                 // is how a one-line flag mistake costs an evening.
+                //
+                // A 4xx is an answer (the request, and so possibly the
+                // episode, was refused); a 5xx or no answer at all is the
+                // server's, and is `Transport` so no caller blames the input.
                 ureq::Error::Status(code, r) => {
                     let detail = r.into_string().unwrap_or_default();
-                    Error::Other(format!(
+                    let msg = format!(
                         "llama-server {code}: {}",
                         detail.chars().take(400).collect::<String>()
-                    ))
+                    );
+                    if code >= 500 {
+                        Error::Transport(msg)
+                    } else {
+                        Error::Other(msg)
+                    }
                 }
-                other => Error::Other(format!(
+                other => Error::Transport(format!(
                     "llama-server at {} unreachable: {other}",
                     self.base_url()
                 )),
@@ -503,7 +549,7 @@ impl ChatClient {
 
         let payload: serde_json::Value = resp
             .into_json()
-            .map_err(|e| Error::Other(format!("bad llama-server response: {e}")))?;
+            .map_err(|e| Error::Transport(format!("bad llama-server response: {e}")))?;
 
         let choice = payload
             .pointer("/choices/0")
@@ -621,12 +667,64 @@ mod tests {
             {"id": "gemma-4-26b-a4b", "status": {"value": "unloaded"}}]});
         assert_eq!(
             router_ids(Some(&list)),
-            vec!["qwen3.6-35b-a3b", "gemma-4-26b-a4b"]
+            Some(vec![
+                "qwen3.6-35b-a3b".to_string(),
+                "gemma-4-26b-a4b".to_string()
+            ])
         );
-        assert!(
-            router_ids(None).is_empty(),
-            "no list: no name is known to be accepted"
+        assert_eq!(router_ids(None), None, "no list is not an empty list");
+        assert_eq!(
+            router_ids(Some(&serde_json::json!({"data": []}))),
+            Some(vec![])
         );
+    }
+
+    /// A stub answering each connection with one canned status and body.
+    fn stub(replies: Vec<(u16, &'static str)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (code, body) in replies {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// A 5xx and no answer at all are the server's; a 4xx is an answer.
+    /// extract marks only the latter against an episode.
+    #[test]
+    fn a_server_that_did_not_answer_is_transport_and_a_refusal_is_not() {
+        let schema = serde_json::json!({"type": "object"});
+        let url = stub(vec![
+            (503, r#"{"error":{"message":"Loading model"}}"#),
+            (400, r#"{"error":{"message":"bad request"}}"#),
+        ]);
+        let c = ChatClient::at(&url);
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema.clone()),
+            Err(Error::Transport(_))
+        ));
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema.clone()),
+            Err(Error::Other(_))
+        ));
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let c = ChatClient::at(&format!("http://127.0.0.1:{port}"));
+        assert!(matches!(
+            c.complete_schema("s", "u", "x", schema),
+            Err(Error::Transport(_))
+        ));
     }
 
     #[test]
@@ -638,6 +736,11 @@ mod tests {
         );
         assert_eq!(
             served_from(&serde_json::json!({"model_alias": ""}), None),
+            None
+        );
+        // The router's placeholder is refused even without its role.
+        assert_eq!(
+            served_from(&serde_json::json!({"model_alias": "llama-server"}), None),
             None
         );
     }

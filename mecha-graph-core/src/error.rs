@@ -14,6 +14,13 @@ pub enum Error {
     Parse(String),
     #[error("{0}")]
     Other(String),
+    /// The model server gave no usable answer — unreachable, timed out, a 5xx
+    /// (a router answers 503 while it swaps a model in), or a body that could
+    /// not be read. Not an outcome of the input: a caller that marks inputs
+    /// as tried (extract's poison-episode rule) must not mark on this one, or
+    /// an infrastructure blip ages out every episode behind it (2026-09-27).
+    #[error("{0}")]
+    Transport(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

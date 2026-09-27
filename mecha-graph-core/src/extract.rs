@@ -460,6 +460,16 @@ fn extract_episode(
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         {
             Ok(p) => p,
+            // No answer from the server is not the episode's doing: stop the
+            // batch and mark nothing, so this and every later episode stay
+            // pending for the next run. Marking them is how one restart (or a
+            // router's 503 while it swaps a model) aged out a whole batch.
+            Err(e @ Error::Transport(_)) => {
+                eprintln!(
+                    "extract: episode {episode_id}: {e} — stopping the batch; nothing marked"
+                );
+                return Err(e);
+            }
             Err(e) => {
                 report.errors += 1;
                 eprintln!("extract: episode {episode_id}: {e}");
@@ -1000,5 +1010,28 @@ mod tests {
         };
         let id = fact::propose_fact(&conn, &proposed, "llm", None).unwrap();
         assert!(accept_commitment(&conn, id).is_err());
+    }
+
+    /// A server that does not answer stops the batch and marks nothing, so
+    /// every episode stays pending. Marking them is how 2026-09-27 aged out a
+    /// whole batch; a closed port is the no-answer case.
+    #[test]
+    fn an_unanswered_request_stops_the_batch_and_marks_no_episode() {
+        let conn = open_memory().unwrap();
+        crate::episode::upsert_episode(&conn, &plain_episode("note", "a", "2026-01-05 10:00:00"))
+            .unwrap();
+        crate::episode::upsert_episode(&conn, &plain_episode("note", "b", "2026-01-06 10:00:00"))
+            .unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let chat = crate::llm::ChatClient::at(&format!("http://127.0.0.1:{port}"));
+        let got = extract_pending(&conn, &chat, 10, None, None);
+        assert!(matches!(got, Err(Error::Transport(_))), "{got:?}");
+        let marked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marked, 0, "no episode may be marked attempted");
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
     }
 }
