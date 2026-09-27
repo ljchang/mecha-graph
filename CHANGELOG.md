@@ -53,7 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a hung server. `extract --episode` is settled the same way. `connect` also
   refuses when a server that passed its health check does not answer
   `/props` (a probe now waits 10 s, not 1.5).
-
 - **A multiword denylist term split across a line break is caught.** grep
   reads one line at a time, and prose here is hard-wrapped at ~75 columns in
   docs, comments and commit messages, so a two-word term with its words on

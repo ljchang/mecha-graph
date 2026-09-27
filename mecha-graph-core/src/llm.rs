@@ -84,12 +84,6 @@ pub const DEFAULT_MODEL: &str = "qwen3.6-35b-a3b";
 /// episode into a dropped one. mecha's own provider allows 900 s.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
-/// The canary's own ceiling (`ChatClient::canary`). Room for a router's cold
-/// load (33–39 s measured) and a queue behind other tenants, far short of a
-/// real request's 900 s. Erring short costs a stopped batch — every episode
-/// still pending — never a lost one.
-const CANARY_TIMEOUT_SECS: u64 = 180;
-
 /// What the canary asks about: nothing, so that whatever fails on it is the
 /// request's and not an input's.
 const CANARY_INPUT: &str = "(This input is empty. There is nothing in it.)";
@@ -465,8 +459,13 @@ pub struct ChatClient {
     /// a refused or reset connection). A router answers 503 while it loads a
     /// model, and a load takes 30–40 s from disk, so the default spans ~50 s.
     retry_delays: Vec<Duration>,
-    /// How long [`ChatClient::canary`] waits. Short, because the canary is
-    /// trivial: a server that cannot answer it in this long is not answering.
+    /// How long [`ChatClient::canary`] waits: the request's own bound. The
+    /// canary is the caller's whole prompt with an empty input, reasoning and
+    /// all, so a shorter fixed ceiling could time it out where the request
+    /// would have answered — and a canary that fails stops the run with
+    /// nothing marked, at the same episode every night (found on review of
+    /// #22). One that cannot answer an empty input in the time a real one is
+    /// allowed is a server not answering.
     canary_timeout: Duration,
     backend: Backend,
 }
@@ -577,18 +576,19 @@ impl ChatClient {
             }
         };
 
+        let timeout = Duration::from_secs(
+            std::env::var("MECHA_GRAPH_CHAT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_TIMEOUT_SECS),
+        );
         Ok(ChatClient {
             model,
-            timeout: Duration::from_secs(
-                std::env::var("MECHA_GRAPH_CHAT_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_TIMEOUT_SECS),
-            ),
+            timeout,
             max_tokens: DEFAULT_MAX_TOKENS,
             think: true,
             retry_delays: [5, 15, 30].map(Duration::from_secs).to_vec(),
-            canary_timeout: Duration::from_secs(CANARY_TIMEOUT_SECS),
+            canary_timeout: timeout,
             backend,
         })
     }
@@ -804,7 +804,10 @@ impl ChatClient {
             // The named failure. HTTP 200, no content, and — before this
             // guard — an episode marked attempted as though the model had
             // simply found nothing.
-            if reasoning_len > 0 || finish == "length" {
+            // Only a stop at the length limit witnesses that the allowance
+            // ran out; reasoning that ended and then said nothing is the
+            // model's answer to this input, not the server's setup.
+            if finish == "length" {
                 return Err(Error::Server(format!(
                     "empty completion after {reasoning_len} chars of reasoning \
                      (finish_reason={finish}): the reasoning used the whole \
@@ -816,7 +819,8 @@ impl ChatClient {
                 )));
             }
             return Err(Error::Other(format!(
-                "empty completion from {} (finish_reason={finish})",
+                "empty completion from {} after {reasoning_len} chars of reasoning \
+                 (finish_reason={finish})",
                 self.model
             )));
         }
