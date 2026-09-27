@@ -112,7 +112,11 @@ isolated.
   - embeddings — `MECHA_GRAPH_EMBED_URL` or `[llm] embed_url`,
     default `http://127.0.0.1:8081`
 - **Shared by default, never duplicated.** `Backend::resolve` probes
-  `{base_url}/health`; if anything answers, it is used as-is. Installed beside
+  `{base_url}/health`; if anything answers, it is used as-is. Installed beside — as long
+  as it is llama-server: `connect` refuses a server that answers `/health` but
+  not `/props`, because on a router what it serves cannot otherwise be told. A
+  bare OpenAI-compatible endpoint (vLLM, a proxy) is not supported as the chat
+  endpoint
   mecha that is mecha's own server, holding the model once. There is
   deliberately no code that looks for mecha or reads its config —
   mecha-graph-core knows nothing about any agent (lib.rs rule 1), and a user

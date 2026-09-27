@@ -166,7 +166,20 @@ pub fn refresh_summaries(
             // No answer from the server: every later node would wait out the
             // same timeout (900 s each) for the same nothing. Stop, and fail
             // the command so the nightly logs and alerts it (found on review).
-            Err(e @ Error::Transport(_)) => return Err(e),
+            Err(e @ Error::Transport(_)) => {
+                // Say what was done before stopping: the summaries written so
+                // far are committed, and the log must not understate them.
+                eprintln!(
+                    "summarize: stopping — {} refreshed, {} failed before the server stopped \
+                     answering",
+                    report.refreshed,
+                    report.errors.len()
+                );
+                for e in &report.errors {
+                    eprintln!("summarize: {e}");
+                }
+                return Err(e);
+            }
             Err(e) => report.errors.push(format!("{id}: {e}")),
         }
     }

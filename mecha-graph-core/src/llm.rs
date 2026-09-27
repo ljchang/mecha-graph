@@ -356,6 +356,10 @@ pub struct ChatClient {
     /// off was an unbounded-reasoning bug in ollama, not a cost of thinking.
     /// Exposed rather than hardcoded so the A/B can be re-run.
     pub think: bool,
+    /// Waits between retries of a request the server did not answer (a 5xx,
+    /// a refused or reset connection). A router answers 503 while it loads a
+    /// model, and a load takes 30–40 s from disk, so the default spans ~50 s.
+    retry_delays: Vec<Duration>,
     backend: Backend,
 }
 
@@ -369,6 +373,7 @@ impl ChatClient {
             timeout: Duration::from_secs(5),
             max_tokens: 64,
             think: false,
+            retry_delays: Vec::new(),
             backend: Backend::Shared {
                 base_url: base_url.to_string(),
             },
@@ -462,6 +467,7 @@ impl ChatClient {
             ),
             max_tokens: DEFAULT_MAX_TOKENS,
             think: true,
+            retry_delays: [5, 15, 30].map(Duration::from_secs).to_vec(),
             backend,
         })
     }
@@ -523,34 +529,60 @@ impl ChatClient {
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
         }
 
-        let resp = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
-            .timeout(self.timeout)
-            .send_json(body)
-            .map_err(|e| match e {
+        // Three outcomes, and who they belong to decides what callers do:
+        // - an answer that refuses (4xx) is `Other` — possibly the input's;
+        // - no answer in `self.timeout` is `Other` too: a server that is up
+        //   and working through a long input is telling us about the input
+        //   (a very long episode), and blaming the server would stop every
+        //   night at the same episode;
+        // - no answer at all (a 5xx, a refused or reset connection) is the
+        //   server's. It is retried over `retry_delays` — a router answers 503
+        //   while it loads a model — and only a sustained one is `Transport`.
+        let mut attempt = 0;
+        let resp = loop {
+            let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
+                .timeout(self.timeout)
+                .send_json(body.clone());
+            let err = match sent {
+                Ok(r) => break r,
                 // A refusal here arrives as a real status with a JSON body
                 // naming the bad field. Swallowing it into "request failed"
                 // is how a one-line flag mistake costs an evening.
-                //
-                // A 4xx is an answer (the request, and so possibly the
-                // episode, was refused); a 5xx or no answer at all is the
-                // server's, and is `Transport` so no caller blames the input.
-                ureq::Error::Status(code, r) => {
+                Err(ureq::Error::Status(code, r)) => {
                     let detail = r.into_string().unwrap_or_default();
                     let msg = format!(
                         "llama-server {code}: {}",
                         detail.chars().take(400).collect::<String>()
                     );
-                    if code >= 500 {
-                        Error::Transport(msg)
-                    } else {
-                        Error::Other(msg)
+                    if code < 500 {
+                        return Err(Error::Other(msg));
                     }
+                    Error::Transport(msg)
                 }
-                other => Error::Transport(format!(
-                    "llama-server at {} unreachable: {other}",
-                    self.base_url()
-                )),
-            })?;
+                Err(other) => {
+                    let text = other.to_string();
+                    if text.contains("timed out") {
+                        return Err(Error::Other(format!(
+                            "no answer from llama-server within {}s (timed out) — a server \
+                             that is up and still working is slow on this input",
+                            self.timeout.as_secs()
+                        )));
+                    }
+                    Error::Transport(format!(
+                        "llama-server at {} unreachable: {text}",
+                        self.base_url()
+                    ))
+                }
+            };
+            match self.retry_delays.get(attempt) {
+                Some(wait) => {
+                    attempt += 1;
+                    eprintln!("mecha-graph: {err} — retrying in {}s", wait.as_secs());
+                    std::thread::sleep(*wait);
+                }
+                None => return Err(err),
+            }
+        };
 
         let payload: serde_json::Value = resp
             .into_json()
@@ -614,15 +646,16 @@ fn strip_code_fence(s: &str) -> &str {
     }
 }
 
+/// Stub HTTP servers for tests that need a model server's answer — or its
+/// absence — to reach `post`. One copy, used by `llm` and `extract` tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_http {
+    use std::io::{Read, Write};
 
     /// Read one whole HTTP request — headers, then `Content-Length` bytes —
     /// so a stub never answers (and closes) mid-upload, which a client sees
     /// as a reset: a no-answer error the test did not mean to produce.
     fn read_request(s: &mut std::net::TcpStream) {
-        use std::io::Read;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let head_end = loop {
@@ -648,10 +681,30 @@ mod tests {
         }
     }
 
-    /// A server that accepts and drops every connection without answering —
-    /// the no-answer case, on a port it keeps (a freed port can be taken by a
-    /// parallel test's stub and answer, which made this flaky).
-    fn dead_server() -> String {
+    /// Answers each request with the next canned status and body, in order.
+    pub(crate) fn stub(replies: Vec<(u16, String)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (code, body) in replies {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                read_request(&mut s);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// Accepts and drops every connection without answering — the no-answer
+    /// case, on a port it keeps (a freed port can be taken by a parallel
+    /// test's stub and answer, which made this flaky).
+    pub(crate) fn dead_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
@@ -661,6 +714,27 @@ mod tests {
         });
         url
     }
+
+    /// Accepts, reads, and never answers — the timeout case.
+    pub(crate) fn hung_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for s in listener.incoming().flatten() {
+                let mut s = s;
+                read_request(&mut s);
+                held.push(s);
+            }
+        });
+        url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_http::{dead_server, hung_server, stub};
+    use super::*;
 
     /// A router's bare `/props` is never the answer — the night it was, every
     /// request named "llama-server" and the router refused them all.
@@ -728,33 +802,15 @@ mod tests {
         );
     }
 
-    /// A stub answering each connection with one canned status and body.
-    fn stub(replies: Vec<(u16, &'static str)>) -> String {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for (code, body) in replies {
-                let (mut s, _) = listener.accept().unwrap();
-                read_request(&mut s);
-                let _ = write!(
-                    s,
-                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        url
-    }
-
     /// A 5xx and no answer at all are the server's; a 4xx is an answer.
-    /// extract marks only the latter against an episode.
+    /// A 5xx and no answer at all are the server's; a 4xx is an answer; a
+    /// timeout is the input's (the server is up and slow on it).
     #[test]
-    fn a_server_that_did_not_answer_is_transport_and_a_refusal_is_not() {
+    fn who_a_failure_belongs_to_decides_its_error() {
         let schema = serde_json::json!({"type": "object"});
         let url = stub(vec![
-            (503, r#"{"error":{"message":"Loading model"}}"#),
-            (400, r#"{"error":{"message":"bad request"}}"#),
+            (503, r#"{"error":{"message":"Loading model"}}"#.into()),
+            (400, r#"{"error":{"message":"bad request"}}"#.into()),
         ]);
         let c = ChatClient::at(&url);
         assert!(matches!(
@@ -767,9 +823,29 @@ mod tests {
         ));
         let c = ChatClient::at(&dead_server());
         assert!(matches!(
-            c.complete_schema("s", "u", "x", schema),
+            c.complete_schema("s", "u", "x", schema.clone()),
             Err(Error::Transport(_))
         ));
+        let mut c = ChatClient::at(&hung_server());
+        c.timeout = Duration::from_secs(1);
+        match c.complete_schema("s", "u", "x", schema) {
+            Err(Error::Other(m)) => assert!(m.contains("timed out"), "{m}"),
+            other => panic!("a timeout is the input's, not Transport: {other:?}"),
+        }
+    }
+
+    /// A router loading a model answers 503 first; the retry is the warm-up.
+    #[test]
+    fn a_503_while_a_model_loads_is_retried_into_an_answer() {
+        let ok = r#"{"choices":[{"message":{"content":"{\"a\":1}"},"finish_reason":"stop"}]}"#;
+        let url = stub(vec![
+            (503, r#"{"error":{"message":"Loading model"}}"#.into()),
+            (200, ok.into()),
+        ]);
+        let mut c = ChatClient::at(&url);
+        c.retry_delays = vec![Duration::from_millis(50)];
+        let got = c.complete_schema("s", "u", "x", serde_json::json!({"type": "object"}));
+        assert!(got.is_ok(), "{got:?}");
     }
 
     #[test]
