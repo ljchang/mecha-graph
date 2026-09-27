@@ -331,8 +331,11 @@ fn served_from(props: &serde_json::Value, models: Option<&serde_json::Value>) ->
 fn health_ok(base_url: &str) -> bool {
     // /health rather than / on purpose: it is llama-server's, so an ollama
     // listening on the same port answers 404 and is correctly not adopted.
+    // The probe's 10 s, for the probe's reason: a shared server's queue can
+    // hold /health too, and a stall here does not refuse — it falls through
+    // to spawning a second copy of the model (found on review).
     ureq::get(&format!("{base_url}/health"))
-        .timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_secs(10))
         .call()
         .is_ok()
 }
@@ -405,7 +408,9 @@ impl ChatClient {
             return Err(Error::Other(format!(
                 "mecha-graph: {} answered its health check but not /props, so what it \
                  serves — and, on a router, what it will accept — is unknown. Refusing \
-                 before any request, so nothing is marked attempted.",
+                 before any request, so nothing is marked attempted. This client needs \
+                 llama-server's /props: an OpenAI-compatible server without it (vLLM, a \
+                 proxy) is not supported as the chat endpoint.",
                 backend.base_url()
             )));
         }
@@ -613,6 +618,50 @@ fn strip_code_fence(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// Read one whole HTTP request — headers, then `Content-Length` bytes —
+    /// so a stub never answers (and closes) mid-upload, which a client sees
+    /// as a reset: a no-answer error the test did not mean to produce.
+    fn read_request(s: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// A server that accepts and drops every connection without answering —
+    /// the no-answer case, on a port it keeps (a freed port can be taken by a
+    /// parallel test's stub and answer, which made this flaky).
+    fn dead_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                drop(s);
+            }
+        });
+        url
+    }
+
     /// A router's bare `/props` is never the answer — the night it was, every
     /// request named "llama-server" and the router refused them all.
     #[test]
@@ -681,14 +730,13 @@ mod tests {
 
     /// A stub answering each connection with one canned status and body.
     fn stub(replies: Vec<(u16, &'static str)>) -> String {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
             for (code, body) in replies {
                 let (mut s, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 8192];
-                let _ = s.read(&mut buf);
+                read_request(&mut s);
                 let _ = write!(
                     s,
                     "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -717,10 +765,7 @@ mod tests {
             c.complete_schema("s", "u", "x", schema.clone()),
             Err(Error::Other(_))
         ));
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let c = ChatClient::at(&format!("http://127.0.0.1:{port}"));
+        let c = ChatClient::at(&dead_server());
         assert!(matches!(
             c.complete_schema("s", "u", "x", schema),
             Err(Error::Transport(_))

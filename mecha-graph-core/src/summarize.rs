@@ -12,7 +12,7 @@
 //! kg_entity), so private content must not launder into them.
 
 use crate::context;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::llm::ChatClient;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -163,6 +163,10 @@ pub fn refresh_summaries(
         match summarize_node(conn, chat, &id) {
             Ok(true) => report.refreshed += 1,
             Ok(false) => {}
+            // No answer from the server: every later node would wait out the
+            // same timeout (900 s each) for the same nothing. Stop, and fail
+            // the command so the nightly logs and alerts it (found on review).
+            Err(e @ Error::Transport(_)) => return Err(e),
             Err(e) => report.errors.push(format!("{id}: {e}")),
         }
     }

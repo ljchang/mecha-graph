@@ -95,7 +95,18 @@ SUMMARIZE_LIMIT="${SUMMARIZE_LIMIT:-30}"
 GPU_BUSY_THRESHOLD="${GPU_BUSY_THRESHOLD:-30}"
 
 log() { echo "[$(date '+%F %T')] $*" >>"$LOG"; }
-run() { log "\$ $*"; "$@" >>"$LOG" 2>&1 || log "FAILED (exit $?): $*"; }
+# Every failed step is also collected for the header's ALERTS line: a step
+# that refuses (fail-closed) does nothing, and "nothing" must not read as a
+# clean night in the one line people scan (found on review, 2026-09-27).
+FAILED_STEPS=()
+run() {
+    log "\$ $*"
+    "$@" >>"$LOG" 2>&1 || {
+        local rc=$?
+        log "FAILED (exit $rc): $*"
+        FAILED_STEPS+=("$(basename "$1")${2:+ $2}")
+    }
+}
 case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) log "ALERT: $NIGHTLY_ENV is $NIGHTLY_ENV_STATUS — skipped; precheck toggles forced OFF" ;;
@@ -291,6 +302,9 @@ case "$NIGHTLY_ENV_STATUS" in
     ok | absent) ;;
     *) STALE="${STALE:+$STALE; }nightly.env $NIGHTLY_ENV_STATUS (precheck toggles forced off)" ;;
 esac
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+    STALE="${STALE:+$STALE; }failed: $(IFS=,; echo "${FAILED_STEPS[*]}" | sed 's/,/, /g')"
+fi
 
 if [ -n "$STALE" ]; then
     log "ALERTS: $STALE"

@@ -353,8 +353,9 @@ pub fn extract_pending(
         ..Default::default()
     };
 
+    let mut held: Vec<i64> = Vec::new();
     for (episode_id, _uid, body, occurred_at) in rows {
-        extract_episode(
+        let extracted = extract_episode(
             conn,
             chat,
             &system,
@@ -365,6 +366,26 @@ pub fn extract_pending(
             &mut committed,
             &mut report,
         )?;
+        if extracted {
+            // A success between failures: those were the episodes' own.
+            for id in held.drain(..) {
+                mark_attempted(conn, id, &chat.model)?;
+            }
+        } else {
+            held.push(episode_id);
+            if held.len() >= STOP_AFTER_CONSECUTIVE_FAILURES {
+                return Err(Error::Other(format!(
+                    "extract: {} episodes in a row failed — a repeated failure is the \
+                     request's, not the episodes' — so the batch stops and none is marked; \
+                     they stay pending (the errors above say why)",
+                    held.len()
+                )));
+            }
+        }
+    }
+    // Fewer than the threshold at the end: treated as poison, as before.
+    for id in held {
+        mark_attempted(conn, id, &chat.model)?;
     }
 
     Ok(report)
@@ -404,7 +425,7 @@ pub fn reextract_episode(
         ..Default::default()
     };
     let mut committed = commitment_block_set(conn)?;
-    extract_episode(
+    let extracted = extract_episode(
         conn,
         chat,
         &system,
@@ -415,6 +436,10 @@ pub fn reextract_episode(
         &mut committed,
         &mut report,
     )?;
+    // A targeted re-run that fails is marked, as a batch's lone failure is.
+    if !extracted {
+        mark_attempted(conn, episode_id, &chat.model)?;
+    }
     Ok(report)
 }
 
@@ -429,7 +454,7 @@ fn extract_episode(
     occurred_at: &str,
     committed: &mut std::collections::HashSet<String>,
     report: &mut ExtractReport,
-) -> Result<()> {
+) -> Result<bool> {
     {
         report.episodes += 1;
         let body_trunc: String = body.chars().take(6000).collect();
@@ -470,17 +495,13 @@ fn extract_episode(
                 );
                 return Err(e);
             }
+            // An answer that failed: possibly the episode's (poison input),
+            // possibly the request's. Not marked here — the caller marks it
+            // once it knows which (see `extract_pending`).
             Err(e) => {
                 report.errors += 1;
                 eprintln!("extract: episode {episode_id}: {e}");
-                // Mark attempted so one poison episode doesn't wedge the batch
-                // forever; bump PROMPT_VERSION to force retries.
-                conn.execute(
-                    "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
-                     VALUES (?1, ?2, ?3, 0)",
-                    params![episode_id, chat.model, PROMPT_VERSION],
-                )?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -600,8 +621,29 @@ fn extract_episode(
             params![episode_id, chat.model, PROMPT_VERSION, created],
         )?;
     }
+    Ok(true)
+}
+
+/// Record an episode as tried and yielding nothing, so one poison episode
+/// cannot wedge every batch; bumping PROMPT_VERSION retries them all.
+fn mark_attempted(conn: &Connection, episode_id: i64, model: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO extract_state (episode_id, model, prompt_version, candidates_created)
+         VALUES (?1, ?2, ?3, 0)",
+        params![episode_id, model, PROMPT_VERSION],
+    )?;
     Ok(())
 }
+
+/// Consecutive failures after which a batch stops, marking none of them.
+///
+/// The poison-episode rule only has to survive ONE bad episode. A failure
+/// that repeats episode after episode is the request's, not the episodes' —
+/// a model name the server refuses (`400 model 'X' not found`, 2026-09-27), a
+/// flag a newer server rejects — and marking each would age out the batch.
+/// So a failure is held until a later episode succeeds (then it was the
+/// episode's, and is marked); this many in a row stops the run unmarked.
+const STOP_AFTER_CONSECUTIVE_FAILURES: usize = 3;
 
 /// Accept a commitment candidate: materialize Task node + task_detail +
 /// waiting_on/originated_in facts (§6's payoff graph shape).
@@ -789,6 +831,50 @@ fn uuid_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read one whole HTTP request — headers, then `Content-Length` bytes —
+    /// so a stub never answers (and closes) mid-upload, which a client sees
+    /// as a reset: a no-answer error the test did not mean to produce.
+    fn read_request(s: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// A server that accepts and drops every connection without answering —
+    /// the no-answer case, on a port it keeps (a freed port can be taken by a
+    /// parallel test's stub and answer, which made this flaky).
+    fn dead_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                drop(s);
+            }
+        });
+        url
+    }
     use crate::db::open_memory;
     use crate::graph::{get_or_create_person, upsert_node, Node};
 
@@ -1022,10 +1108,7 @@ mod tests {
             .unwrap();
         crate::episode::upsert_episode(&conn, &plain_episode("note", "b", "2026-01-06 10:00:00"))
             .unwrap();
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let chat = crate::llm::ChatClient::at(&format!("http://127.0.0.1:{port}"));
+        let chat = crate::llm::ChatClient::at(&dead_server());
         let got = extract_pending(&conn, &chat, 10, None, None);
         assert!(matches!(got, Err(Error::Transport(_))), "{got:?}");
         let marked: i64 = conn
@@ -1033,5 +1116,61 @@ mod tests {
             .unwrap();
         assert_eq!(marked, 0, "no episode may be marked attempted");
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
+    }
+
+    /// A stub model server answering every request with one status and body.
+    fn stub_all(code: u16, body: &'static str, n: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                read_request(&mut s);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// The 2026-09-27 shape — every request refused alike — stops the batch
+    /// after three and marks none; a short run of failures is still marked,
+    /// so one poison episode cannot wedge every night.
+    #[test]
+    fn a_failure_repeated_across_episodes_stops_the_batch_unmarked() {
+        let refused = r#"{"error":{"code":400,"message":"model 'llama-server' not found"}}"#;
+        let conn = open_memory().unwrap();
+        for (i, uid) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            let at = format!("2026-01-0{} 10:00:00", i + 1);
+            crate::episode::upsert_episode(&conn, &plain_episode("note", uid, &at)).unwrap();
+        }
+        let chat = crate::llm::ChatClient::at(&stub_all(400, refused, 10));
+        assert!(extract_pending(&conn, &chat, 10, None, None).is_err());
+        let marked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marked, 0);
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 5);
+
+        let conn = open_memory().unwrap();
+        for (i, uid) in ["a", "b"].iter().enumerate() {
+            let at = format!("2026-01-0{} 10:00:00", i + 1);
+            crate::episode::upsert_episode(&conn, &plain_episode("note", uid, &at)).unwrap();
+        }
+        let chat = crate::llm::ChatClient::at(&stub_all(400, refused, 10));
+        assert!(extract_pending(&conn, &chat, 10, None, None).is_ok());
+        let marked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extract_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            marked, 2,
+            "fewer than the threshold: marked as poison, as before"
+        );
     }
 }
