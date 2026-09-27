@@ -433,7 +433,11 @@ fn health(base_url: &str) -> Health {
     {
         Ok(_) => Health::Ready,
         Err(ureq::Error::Status(503, _)) => Health::Loading,
-        Err(ureq::Error::Status(..)) => Health::Absent,
+        // 404: something that is not llama-server (ollama answers /health
+        // so), never adopted. Any other status is something listening and
+        // failing — a 500, a proxy's 502 — which is not "nothing here".
+        Err(ureq::Error::Status(404, _)) => Health::Absent,
+        Err(ureq::Error::Status(code, _)) => Health::Unknown(format!("HTTP {code}")),
         Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
             Health::Absent
         }

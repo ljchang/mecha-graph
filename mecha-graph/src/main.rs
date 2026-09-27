@@ -4089,6 +4089,11 @@ reject: it was never true (retracted; the class learns)"
             for (uid, at, why) in charged {
                 println!("{uid}\t{at}\t{why}");
             }
+            // Unknown is not clean: a mark from before V026 carries no reason.
+            eprintln!(
+                "(episodes marked attempted before this build recorded no reason and are not \
+                 listed — including the 2026-09-27 batch)"
+            );
         }
 
         Command::Extract { limit, model, source, exclude_source, episode, .. } => {

@@ -476,10 +476,6 @@ fn extract_settled(
 ) -> Result<()> {
     report.episodes += 1;
     let mut failed = extract_episode(conn, chat, system, schema, episode, committed, report, true)?;
-    // A fault the answer itself names as the server's is never the episode's.
-    if let Some(e @ Error::Server(_)) = failed {
-        return Err(e);
-    }
     if let Some(e @ (Error::Timeout(_) | Error::Transport(_))) = &failed {
         server_answers(chat, system, schema, episode.id, e)?;
         eprintln!(
@@ -493,7 +489,15 @@ fn extract_settled(
         )?;
     }
     if let Some(e) = failed {
+        // A fault the answer names as the server's setup stops the run —
+        // every later long episode would fail the same way — but this one
+        // episode is charged, with why: left unmarked it would stop the run
+        // at the same place every night and nothing older would ever be
+        // reached (found on review of #22). One per night at most, listed by
+        // `extract --charged`, re-run with `--episode` once the server is fixed.
         if matches!(e, Error::Server(_)) {
+            report.errors += 1;
+            mark_attempted(conn, episode.id, &chat.model, &e)?;
             return Err(e);
         }
         server_answers(chat, system, schema, episode.id, &e)?;
@@ -1349,12 +1353,13 @@ mod tests {
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 0);
     }
 
-    /// Reasoning that ate the whole allowance names the server's setup, not
-    /// the episode: the run stops with nothing marked, even though the
-    /// canary's empty input would have answered (found on review of #22 —
-    /// every long episode was charged as poison by that route).
+    /// Reasoning that ate the whole allowance names the server's setup: the
+    /// run stops (the canary's empty input would have answered, and every
+    /// long episode been charged — found on review of #22), charging only the
+    /// episode that showed it, with why, so it cannot stop every night at the
+    /// same place either.
     #[test]
-    fn reasoning_that_eats_the_allowance_stops_the_run_unmarked() {
+    fn reasoning_that_eats_the_allowance_stops_the_run_and_charges_one() {
         let conn = open_memory().unwrap();
         episodes(&conn, 3);
         let exhausted = serde_json::json!({"choices": [{
@@ -1370,7 +1375,9 @@ mod tests {
         ]));
         let got = extract_pending(&conn, &chat, 10, None, None);
         assert!(matches!(got, Err(Error::Server(_))), "{got:?}");
-        assert_eq!(marked(&conn), 0);
-        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 3);
+        assert_eq!(marked(&conn), 1, "the one that showed it, and no other");
+        assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
+        let charged = charged_episodes(&conn).unwrap();
+        assert!(charged[0].2.contains("reasoning"), "{charged:?}");
     }
 }
