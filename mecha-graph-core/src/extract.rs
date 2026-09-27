@@ -728,12 +728,21 @@ fn mark_attempted(conn: &Connection, episode_id: i64, model: &str, failure: &Err
 }
 
 /// Episodes marked attempted at the current prompt version with nothing
-/// extracted and no recorded reason: marks from before V026, which cannot say
+/// extracted and no recorded reason, **written before V026**: those cannot say
 /// whether the episode was charged or simply held nothing. Unknown, not clean.
+///
+/// Bounded by when V026 was applied, not by the NULL alone: after it, a charge
+/// always writes its reason, so a NULL row written since is a clean
+/// extraction that proposed nothing — counting those grew the "unknown" figure
+/// every night and buried the marks it exists to surface (found on review of
+/// #22). `extracted_at` and `_migrations.applied_at` are both
+/// `datetime('now')`, so they compare as text; a row written in V026's own
+/// second is after it.
 pub fn unexplained_marks(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM extract_state
-         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1",
+         WHERE failure IS NULL AND candidates_created = 0 AND prompt_version >= ?1
+           AND extracted_at < (SELECT applied_at FROM _migrations WHERE version = 26)",
         params![PROMPT_VERSION],
         |r| r.get(0),
     )?)
@@ -1394,5 +1403,29 @@ mod tests {
         assert_eq!(pending_episodes(&conn, 10, None, None).unwrap().len(), 2);
         let charged = charged_episodes(&conn).unwrap();
         assert!(charged[0].2.contains("reasoning"), "{charged:?}");
+    }
+
+    /// Only marks from before V026 are unexplained: a NULL reason written
+    /// since is a clean extraction that proposed nothing, never a charge
+    /// (found on review of #22 — the count grew with every clean night).
+    #[test]
+    fn unexplained_marks_are_only_those_from_before_v026() {
+        let conn = open_memory().unwrap();
+        episodes(&conn, 3);
+        let row = |id: i64, at: Option<&str>| {
+            conn.execute(
+                "INSERT OR REPLACE INTO extract_state
+                     (episode_id, model, prompt_version, candidates_created, failure, extracted_at)
+                 VALUES (?1, 'm', ?2, 0, NULL, COALESCE(?3, datetime('now')))",
+                params![id, PROMPT_VERSION, at],
+            )
+            .unwrap();
+        };
+        row(1, Some("2020-01-01 00:00:00")); // before V026: unknown
+        row(2, None); // a clean empty extraction today
+        let charge = Error::Other("bad".into());
+        mark_attempted(&conn, 3, "m", &charge).unwrap(); // a charge, with its reason
+        assert_eq!(unexplained_marks(&conn).unwrap(), 1);
+        assert_eq!(charged_episodes(&conn).unwrap().len(), 1);
     }
 }
