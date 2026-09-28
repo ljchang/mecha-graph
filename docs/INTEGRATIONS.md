@@ -118,10 +118,31 @@ isolated.
   `/props`, because on a router what it serves cannot otherwise be told, so a
   bare OpenAI-compatible endpoint (vLLM, a proxy) is not supported as the chat
   endpoint. Installed beside mecha that is mecha's own server, holding the
-  model once. There is
-  deliberately no code that looks for mecha or reads its config —
-  mecha-graph-core knows nothing about any agent (lib.rs rule 1), and a user
-  running their own llama-server gets the shared path for the same reason.
+  model once. The client deliberately has no code that looks for mecha or
+  reads its config. mecha-graph-core knows nothing about any agent (lib.rs
+  rule 1), and a user running their own llama-server gets the shared path
+  for the same reason. The one place mecha's files are touched is the
+  binary's opt-in holds directory (below), which `nightly.sh` names only
+  where mecha made it.
+- **Behind a router, the client follows the loaded model.** Every request
+  names whatever model the router has loaded at that moment, not the one
+  loaded when the run began. A request that lands mid-swap waits up to 15 s
+  for the router to settle. So a long run goes on with the model the owner
+  picked, instead of loading its own back, and each episode is recorded
+  under the model that extracted it.
+- **`[llm] holds_dir`: holding a shared router per episode.** With
+  `holds_dir = "~/.mecha/holds"` in `~/.mecha-graph/config.toml`, `extract`
+  takes a hold there for each episode, in the file protocol a model switch
+  waits on (`mecha-graph/src/holds.rs`). A switch then lets the episode in
+  flight finish, and an episode doesn't start while one is pending.
+  - It's a config key, not an environment variable, so every run honours it,
+    not only the nightly (ARCHITECTURE.md's rule for an opt-in on mecha).
+  - Unset, nothing is held. Set, it never degrades: a directory that isn't
+    there, or a config that can't be read, stops extraction with an error
+    instead of running unheld.
+  - A switch still pending after 30 minutes, or a switch file that can't be
+    read for 10, stops extraction for the night with an error. The episodes
+    stay pending.
 - **Starting a server is opt-in, gated on `[llm] model_path`.** A machine that
   has not named a GGUF cannot start one, which is the whole safety property:
   probe-and-spawn on its own would answer a transient outage of mecha's server

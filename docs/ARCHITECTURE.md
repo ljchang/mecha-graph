@@ -216,8 +216,9 @@ their own `kg_` prefix, so a consumer registers them unprefixed); mecha's own ev
 against mecha-graph itself. Settled 2026-08-12; the reasoning is worth keeping
 because it will be re-litigated.
 
-**One opt-in runtime dependency, and only the TUI holds it** (ruled
-2026-09-25, mecha's `APPRAISAL-WIRING-DESIGN.md` row 1c, option A3). A task
+**Two opt-in runtime dependencies: the TUI's closures and extraction's
+holds** (the first ruled 2026-09-25, mecha's `APPRAISAL-WIRING-DESIGN.md`
+row 1c, option A3; the second added 2026-09-28, below). A task
 moved to `done` or `dropped`, or reopened, is a verdict mecha records on its
 closure record and appraises; the TUI's status keys used to write it
 straight here, where mecha never saw it. With `[board] close_through =
@@ -248,6 +249,24 @@ landed here. What the opt-in changes, and what it does not:
   opt-in carried in the environment would be lost by the next shell that
   did not export it, and silently reverting to the direct write is the
   failure the opt-in exists to prevent.
+
+**Extraction's holds** (2026-09-28, the owner's choice after a nightly
+extraction undid a model switch). With `[llm] holds_dir =
+"~/.mecha/holds"`, `extract` holds mecha's router one episode at a time,
+in the file protocol mecha's `hold.rs` defines (`src/holds.rs`, pinned by
+`the_files_are_the_ones_mecha_reads`). A switch then waits for the
+episode in flight. The same rules as the TUI's opt-in:
+
+- **Without it, nothing is different.** Nothing is held. Every request
+  still follows the router's loaded model (`ChatClient::follow_settled`),
+  which is agent-agnostic and needs no opt-in.
+- **With it, the guard never degrades.** A missing directory or an
+  unreadable config stops extraction with an error.
+- **Still no compile-time dependency**, and `mecha-graph-core` knows only
+  a gate (`extract_pending_gated`). The protocol lives in the binary.
+- **A config key, not an environment variable**, for the reason above. The
+  first draft was an environment variable, and a hand-run `extract` went
+  unheld (found on review of #24).
 
 ### Why separate
 

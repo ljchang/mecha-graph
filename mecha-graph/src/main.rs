@@ -1,6 +1,7 @@
 //! `mecha-graph` CLI.
 
 mod closure;
+mod holds;
 mod render;
 mod tui;
 
@@ -4111,12 +4112,32 @@ reject: it was never true (retracted; the class learns)"
             } else {
                 let sources: Vec<&str> = source.iter().map(|s| s.as_str()).collect();
                 let excluded: Vec<&str> = exclude_source.iter().map(|s| s.as_str()).collect();
-                mecha_graph_core::extract::extract_pending(
+                // Each episode holds a shared router, when a holds directory
+                // is named, so a model switch waits for the episode in
+                // flight rather than cutting it off (holds.rs).
+                mecha_graph_core::extract::extract_pending_gated(
                     &conn,
                     &chat,
                     limit,
                     (!sources.is_empty()).then_some(&sources[..]),
                     (!excluded.is_empty()).then_some(&excluded[..]),
+                    // `[llm] holds_dir`, read per episode: a config edited
+                    // mid-run is honoured, and a configured directory that
+                    // is missing stops the run rather than going unheld.
+                    &mut || -> mecha_graph_core::Result<Box<dyn std::any::Any>> {
+                        let hold_err = |e: String| {
+                            mecha_graph_core::Error::Other(format!(
+                                "mecha-graph: could not hold the router: {e}"
+                            ))
+                        };
+                        match holds::Holds::from_config(chat.base_url()).map_err(hold_err)? {
+                            Some(h) => h
+                                .enter("mecha-graph extract")
+                                .map(|held| Box::new(held) as Box<dyn std::any::Any>)
+                                .map_err(|e| hold_err(e.to_string())),
+                            None => Ok(Box::new(())),
+                        }
+                    },
                 )?
             };
             // **scripts/nightly.sh parses this line** for its ALERTS count.

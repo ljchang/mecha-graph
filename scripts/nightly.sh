@@ -84,6 +84,11 @@ PRECHECK_AUTO_ACCEPT="$PRECHECK_AUTO_ACCEPT_RESOLVED"
 PRECHECK_TRIAGE="$PRECHECK_TRIAGE_RESOLVED"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
+# Holding mecha's router one episode at a time is `[llm] holds_dir` in
+# ~/.mecha-graph/config.toml, not an environment variable set here: an
+# opt-in carried in the environment is lost by any run this script does not
+# start, and a hand-run `extract` went unheld (found on review;
+# docs/INTEGRATIONS.md).
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
 # the deterministic tiers already extracted; LLM-extracting them was the
 # single largest manufacturer of review-queue trivia. Opt back in with

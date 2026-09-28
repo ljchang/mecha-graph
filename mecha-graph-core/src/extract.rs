@@ -342,6 +342,25 @@ pub fn extract_pending(
     sources: Option<&[&str]>,
     exclude_sources: Option<&[&str]>,
 ) -> Result<ExtractReport> {
+    extract_pending_gated(conn, chat, limit, sources, exclude_sources, &mut || {
+        Ok(Box::new(()))
+    })
+}
+
+/// [`extract_pending`], with `gate` called before each episode and what it
+/// returns held until that episode is settled — a lease on a shared server,
+/// say, which the caller knows about and this crate does not. Every request
+/// the client makes follows the server's loaded model (`post_within`), so a
+/// long run goes on with whatever model is loaded rather than the one it
+/// began on, and records each episode under the model that extracted it.
+pub fn extract_pending_gated(
+    conn: &Connection,
+    chat: &ChatClient,
+    limit: usize,
+    sources: Option<&[&str]>,
+    exclude_sources: Option<&[&str]>,
+    gate: &mut dyn FnMut() -> Result<Box<dyn std::any::Any>>,
+) -> Result<ExtractReport> {
     let rows = pending_episodes(conn, limit, sources, exclude_sources)?;
     let mut committed = commitment_block_set(conn)?;
 
@@ -353,7 +372,28 @@ pub fn extract_pending(
         ..Default::default()
     };
 
+    // Say what was done before stopping: what this batch staged is
+    // committed, and a log reading only "failed" would understate it (as
+    // summarize already guards; found on review of #22). Said for a gate
+    // that stops the run too — an unreadable switch file after charged
+    // episodes would otherwise report them nowhere (found on review of #24).
+    // **scripts/nightly.sh parses this line** for its ALERTS count — reword
+    // it and change the sed there with it, or charges read as a clean night.
+    let stopping = |report: &ExtractReport| {
+        eprintln!(
+            "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
+             {} fact and {} commitment candidate(s) staged before the stop",
+            report.episodes, report.errors, report.fact_candidates, report.commitment_candidates
+        );
+    };
     for (episode_id, _uid, body, occurred_at) in rows {
+        let _lease = match gate() {
+            Ok(lease) => lease,
+            Err(e) => {
+                stopping(&report);
+                return Err(e);
+            }
+        };
         let episode = Pending {
             id: episode_id,
             body: &body,
@@ -368,20 +408,7 @@ pub fn extract_pending(
             &mut committed,
             &mut report,
         ) {
-            // Say what was done before stopping: what this batch staged is
-            // committed, and a log reading only "failed" would understate it
-            // (as summarize already guards; found on review of #22).
-            // **scripts/nightly.sh parses this line** for its ALERTS count —
-            // reword it and change the sed there with it, or charges read as
-            // a clean night.
-            eprintln!(
-                "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
-                 {} fact and {} commitment candidate(s) staged before the stop",
-                report.episodes,
-                report.errors,
-                report.fact_candidates,
-                report.commitment_candidates
-            );
+            stopping(&report);
             return Err(e);
         }
     }
@@ -491,6 +518,10 @@ fn extract_settled(
             conn, chat, system, schema, episode, committed, report, false,
         )?;
     }
+    // The model the episode's last attempt went to, read before the canary
+    // below: the canary follows the router, and a charge recorded after it
+    // could name a model that never saw this episode (found on review).
+    let tried = chat.model();
     if let Some(e) = failed {
         // A fault the answer names as the server's setup stops the run —
         // every later long episode would fail the same way — but this one
@@ -500,12 +531,12 @@ fn extract_settled(
         // `extract --charged`, re-run with `--episode` once the server is fixed.
         if matches!(e, Error::Server(_)) {
             report.errors += 1;
-            mark_attempted(conn, episode.id, &chat.model, &e)?;
+            mark_attempted(conn, episode.id, &tried, &e)?;
             return Err(e);
         }
         server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
-        mark_attempted(conn, episode.id, &chat.model, &e)?;
+        mark_attempted(conn, episode.id, &tried, &e)?;
     }
     Ok(())
 }
@@ -707,7 +738,7 @@ fn extract_episode(
             "INSERT OR REPLACE INTO extract_state
                  (episode_id, model, prompt_version, candidates_created, failure, reason_recorded)
              VALUES (?1, ?2, ?3, ?4, NULL, 1)",
-            params![episode_id, chat.model, PROMPT_VERSION, created],
+            params![episode_id, chat.model(), PROMPT_VERSION, created],
         )?;
     }
     Ok(None)
