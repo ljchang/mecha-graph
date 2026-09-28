@@ -3393,8 +3393,16 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 );
                 if report.rederived > 0 {
                     println!(
-                        "  {} derived belief(s) re-derived from the episodes that remain",
-                        report.rederived
+                        "  {} derived belief(s) re-derived from the episodes that remain{}",
+                        report.rederived,
+                        if report.derived_closed > 0 {
+                            format!(
+                                " ({} closed: under the co-occurrence floor now)",
+                                report.derived_closed
+                            )
+                        } else {
+                            String::new()
+                        }
                     );
                 }
             }

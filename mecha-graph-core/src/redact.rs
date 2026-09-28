@@ -110,6 +110,10 @@ pub struct RedactReport {
     /// re-anchored on the contributors that remain (deleted, and counted in
     /// `facts`, when none did).
     pub rederived: usize,
+    /// Of those, the beliefs that fell below the floor the linker needs to
+    /// mint one (`NPMI_MIN_COOCCUR` shared episodes) and were closed in valid
+    /// time — logged as `belief_decayed`, as the nightly decay logs it.
+    pub derived_closed: usize,
     /// Whether a tombstone was written for an identity that matched no
     /// episode (`--tombstone-absent`): the redaction arrived before the
     /// ingest, and the tombstone is what makes that ingest a no-op.
@@ -575,9 +579,51 @@ fn purge_one(
                         }
                     }
                 }
+                // `None` is two answers, kept apart as the decay sweep keeps
+                // them: below the co-occurrence floor, the belief no longer
+                // holds and is closed (and logged); a corpus too small to
+                // compute NPMI over says nothing about the pair, so only the
+                // count is restated and the belief stays open.
                 None => {
-                    if !crate::fact::is_user_verified(conn, *fid)? {
-                        crate::fact::close_valid_time(conn, fuid, None)?;
+                    let co = survivors.len() as i64;
+                    if co < crate::linkers::NPMI_MIN_COOCCUR {
+                        if !crate::fact::is_user_verified(conn, *fid)? {
+                            crate::fact::close_valid_time(conn, fuid, None)?;
+                            let payload = serde_json::json!({
+                                "class": "npmi", "reason": "redacted_contributor",
+                                "shared_now": co,
+                                "npmi_min_cooccur": crate::linkers::NPMI_MIN_COOCCUR,
+                            });
+                            crate::ledger::log_event(
+                                conn,
+                                "belief_decayed",
+                                Some(fuid),
+                                Some(&payload.to_string()),
+                            )?;
+                            rep.derived_closed += 1;
+                        }
+                    } else {
+                        let statement: String = conn.query_row(
+                            "SELECT statement FROM fact WHERE id = ?1",
+                            params![fid],
+                            |r| r.get(0),
+                        )?;
+                        if let Some((_, npmi)) = crate::decay::parse_cooccurrence(&statement) {
+                            if let Some(fresh) =
+                                crate::decay::render_statement(&statement, co, npmi)
+                            {
+                                if fresh != statement {
+                                    conn.execute(
+                                        "UPDATE fact SET statement = ?2 WHERE id = ?1",
+                                        params![fid, fresh],
+                                    )?;
+                                    conn.execute(
+                                        "DELETE FROM vec_fact WHERE fact_id = ?1",
+                                        params![fid],
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1490,6 +1536,35 @@ mod tests {
         );
     }
 
+    /// A candidate's freed rowid taken by a stranger: undo must not attach
+    /// the restored verdicts to it — a `supported` verdict on a claim
+    /// nothing verified widens autonomy.
+    #[test]
+    fn undo_never_attaches_verdicts_to_a_stranger_candidate() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-9");
+        let cid: i64 = conn
+            .query_row("SELECT candidate_id FROM agent_verdict LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        conn.execute(
+            "INSERT INTO fact_candidate (id, payload, proposed_by) VALUES (?1, '{}', 'stranger')",
+            params![cid],
+        )
+        .unwrap();
+        crate::episode::undo_last(&conn).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM agent_verdict WHERE candidate_id = {cid}")
+            ),
+            0,
+            "a restored verdict landed on a stranger candidate"
+        );
+    }
+
     /// An unreadable snapshot is an error, never a purge that reports it taken.
     #[test]
     fn an_unreadable_undo_snapshot_stops_the_redaction() {
@@ -1603,6 +1678,18 @@ mod tests {
         assert!(
             closed.is_some(),
             "a belief under the minting floor stayed open"
+        );
+        assert_eq!(
+            rep.derived_closed, 1,
+            "the close is counted apart from the re-anchor"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM event_log WHERE kind = 'belief_decayed' AND ref = '{uid}'")
+            ),
+            1,
+            "a close the sweep would log must be logged here too"
         );
     }
 

@@ -931,20 +931,35 @@ fn undo_apply(
             restore_rows(conn, "mention", MENTION_COLS, &snap["mentions"])?;
             restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;
             restore_rows(conn, "fact", FACT_COLS, &snap["facts"])?;
-            restore_rows(conn, "fact_candidate", CAND_COLS, &snap["candidates"])?;
-            // Verdicts under fresh ids, and only onto a candidate that came
-            // back (a snapshot from before this field has none to restore).
+            // Facts restored from the snapshot carry their own counters in
+            // the row, so their sightings below must not be counted again.
+            let restored_facts: std::collections::BTreeSet<i64> = snap["facts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f[0].as_i64())
+                .collect();
+            // Candidates one by one, keeping which of them actually landed: a
+            // freed rowid may be held by a stranger now, and a verdict must
+            // never be attached to that one — a restored `supported` verdict
+            // on a claim nothing verified would widen autonomy, not narrow it.
+            let mut restored_candidates = std::collections::BTreeSet::new();
+            for row in snap["candidates"].as_array().into_iter().flatten() {
+                let one = serde_json::Value::Array(vec![row.clone()]);
+                if restore_rows(conn, "fact_candidate", CAND_COLS, &one)? == 1 {
+                    if let Some(cid) = row.get(0).and_then(|v| v.as_i64()) {
+                        restored_candidates.insert(cid);
+                    }
+                }
+            }
+            // Verdicts under fresh ids, and only onto a candidate this undo
+            // restored (a snapshot from before this field has none).
             for row in snap["verdicts"].as_array().into_iter().flatten() {
                 let Some(vals) = row.as_array() else { continue };
                 let Some(cid) = vals.get(1).and_then(|v| v.as_i64()) else {
                     continue;
                 };
-                let parent: bool = conn.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM fact_candidate WHERE id = ?1)",
-                    params![cid],
-                    |r| r.get(0),
-                )?;
-                if parent {
+                if restored_candidates.contains(&cid) {
                     let fresh = serde_json::Value::Array(vec![serde_json::Value::Array(
                         vals[1..].to_vec(),
                     )]);
@@ -991,7 +1006,7 @@ fn undo_apply(
                 }
             }
             for (fid, corroborated) in recount {
-                if corroborated && counted {
+                if corroborated && counted && !restored_facts.contains(&fid) {
                     conn.execute(
                         "UPDATE fact SET observation_count = observation_count + 1 WHERE id = ?1",
                         params![fid],
@@ -1120,6 +1135,10 @@ pub fn discard_last_undo(conn: &Connection) -> Result<Option<String>> {
         )))
     } else {
         conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+        // The pre-edit body is also in the FTS index's old segments (an edit
+        // only appends a delete marker); merge them so it is not
+        // reconstructible from `fts_episode_data`.
+        crate::redact::optimize_fts(conn)?;
         Ok(Some(format!(
             "discarded the undo entry for the edit of episode {short}; the episode keeps its current text"
         )))
