@@ -200,6 +200,21 @@ pub fn redact_source(
     })
 }
 
+/// Purge one undo snapshot of a deleted episode as the privacy path would:
+/// the snapshot, and the telemetry, pointers and alarms the TUI's delete
+/// left for it — they are reachable only through what the snapshot holds.
+/// `undo --discard`'s door: dropping the row alone would strand them where no
+/// later redact can find them.
+pub(crate) fn purge_snapshot(
+    conn: &Connection,
+    uid: &str,
+    identity: (String, String),
+) -> Result<RedactReport> {
+    in_savepoint(conn, "purge_snapshot", || {
+        redact_targets(conn, &[], &[uid.to_string()], vec![identity], Mode::Privacy)
+    })
+}
+
 /// The TUI's purge of one live episode — no undo purge, no FTS optimize
 /// (a merge of the whole index per keystroke is the wrong price for an
 /// undoable delete; the privacy path pays it).
@@ -1554,6 +1569,11 @@ mod tests {
     fn a_refused_undo_can_be_discarded() {
         let conn = open_memory().unwrap();
         let f = fixture(&conn, "bee.conversation", "b-7");
+        // A correction carrying the episode's own sentence: the TUI's delete
+        // leaves it for the snapshot's purge, so a discard must take it.
+        let payload =
+            serde_json::json!({"episode_id": f.id, "wrong": "a discarded sentence"}).to_string();
+        crate::ledger::log_event(&conn, "correction_unresolved", None, Some(&payload)).unwrap();
         assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
         conn.execute(
             "INSERT INTO episode (id, uid, source, source_id, body, occurred_at, content_hash)
@@ -1568,6 +1588,14 @@ mod tests {
             "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'",
         );
         assert!(crate::episode::discard_last_undo(&conn).unwrap().is_some());
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%a discarded sentence%'"
+            ),
+            0,
+            "a discard stranded what only the snapshot could reach"
+        );
         assert_eq!(
             count(
                 &conn,

@@ -808,7 +808,9 @@ fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value
         // and re-derives those facts, so undo has to put them back.
         "observations": dump_rows(conn, &format!(
             "SELECT {OBS_COLS} FROM fact_observation
-             WHERE episode_id = ?1 AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1)"), id)?,
+             WHERE episode_id = ?1
+               AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1
+                                   AND NOT (extractor IS 'npmi' AND object_id IS NOT NULL))"), id)?,
         // Its candidates' verdicts: write-once, the whole basis of each
         // mechanism's precision figure, and cascade-deleted with the
         // candidate — so undo can bring them back only from here.
@@ -1076,23 +1078,47 @@ fn undo_apply(
 /// undo that cannot be applied (its episode id taken since). The deleted
 /// episode stays deleted, and its snapshot, which held its body, goes too.
 pub fn discard_last_undo(conn: &Connection) -> Result<Option<String>> {
-    let row: Option<(i64, Option<String>)> = conn
+    let row: Option<(i64, String, Option<String>, String)> = conn
         .query_row(
-            "SELECT id, ref_uid FROM undo_log ORDER BY id DESC LIMIT 1",
+            "SELECT id, action, ref_uid, snapshot FROM undo_log ORDER BY id DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((log_id, ref_uid)) = row else {
+    let Some((log_id, action, ref_uid, snapshot)) = row else {
         return Ok(None);
     };
-    conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+    let short = ref_uid
+        .as_deref()
+        .map(|u| &u[..8.min(u.len())])
+        .unwrap_or("?")
+        .to_string();
+    // A delete's snapshot is the only road to what the TUI's delete left for
+    // it — telemetry, pointers, alarms — so discarding one purges them as a
+    // privacy redaction would. An edit's episode is live: its telemetry is
+    // its own, and only the snapshot (the old body) goes.
+    if action == "delete" {
+        let snap: serde_json::Value = serde_json::from_str(&snapshot)
+            .map_err(|e| crate::error::Error::Parse(format!("undo snapshot {log_id}: {e}")))?;
+        let identity = (
+            snap["episode"][0][2]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            snap["episode"][0][3]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let uid = ref_uid.clone().unwrap_or_default();
+        crate::redact::purge_snapshot(conn, &uid, identity)?;
+        // Found by uid or identity above; by id, should it have neither.
+        conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+    } else {
+        conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+    }
     Ok(Some(format!(
-        "discarded the undo entry for episode {}",
-        ref_uid
-            .as_deref()
-            .map(|u| &u[..8.min(u.len())])
-            .unwrap_or("?")
+        "discarded the undo entry for episode {short}; what it left behind was purged"
     )))
 }
 
