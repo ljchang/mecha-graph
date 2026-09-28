@@ -96,7 +96,7 @@ default database. See docs/ARCHITECTURE.md, "Boundaries".
 | `task-project <task> [<parent>]` | Re-file a task under a container by name or node id, clear its parent with `""`, or with no parent print where it is filed and every detachment recorded on it. |
 | `backfill-derivation` | Retrofit provenance onto derived facts written before derived-fact provenance existed. |
 | `tombstone` | Deletion tombstones — what re-ingest is blocked from resurrecting; `tombstone rm` lifts one. |
-| `undo` / `undo --discard` | Undo the most recent TUI episode delete/edit (Ctrl-Z inside the TUI). All or nothing; an undo that cannot be applied — the episode's id was taken by a newer episode since — is refused rather than restored onto the wrong one, and `--discard` drops that entry — for a delete, purging what it left behind as a redaction would (the episode stays deleted); for an edit, only the pre-edit snapshot (the episode keeps its current text). |
+| `undo` / `undo --discard [--vacuum]` | Undo the most recent TUI episode delete/edit (Ctrl-Z inside the TUI). All or nothing; an undo that cannot be applied — another episode now holds its id, or its source and source id — is refused rather than restored onto the wrong one, and `--discard` drops that entry — for a delete, purging what it left behind as a redaction would (the episode stays deleted); for an edit, only the pre-edit snapshot (the episode keeps its current text). A discard zeroes freed pages where the build allows and warns where it does not; `--vacuum` then rewrites the file as `redact --vacuum` does, since a later redact finds nothing left to purge and would skip it. |
 | `eval` | Run the gold-set eval against your graph (`eval/synthetic/run.sh` in a checkout is the no-data variant). |
 
 ## Data safety
