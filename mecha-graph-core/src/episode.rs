@@ -677,9 +677,6 @@ pub fn episodes_by_tag(conn: &Connection, tag: &str, limit: i64) -> Result<Vec<E
     Ok(eps)
 }
 
-/// True redaction (§10): purge an episode plus everything derived from it —
-/// mentions, embeddings, FTS rows (via trigger), enrichment, and facts whose
-/// provenance is this episode. The one sanctioned delete in a bi-temporal store.
 /// §10 tiers, weakest → strongest. Cycle order for UI surfaces.
 pub const SENSITIVITY_TIERS: &[&str] = &["public", "personal", "private", "secret"];
 
@@ -790,6 +787,16 @@ const CAND_COLS: &str =
     "id, payload, status, proposed_by, episode_id, confidence, created_at, reviewed_at, reject_reason";
 const MENTION_COLS: &str = "episode_id, node_id, extractor, confidence";
 const ANN_COLS: &str = "id, episode_id, kind, body, created_at";
+/// [`ANN_COLS`] less the id, for restoring under a fresh one.
+const ANN_RESTORE_COLS: &str = "episode_id, kind, body, created_at";
+const OBS_COLS: &str = "id, fact_id, episode_id, observed_at, kind, method, confidence";
+const VERDICT_COLS: &str =
+    "id, candidate_id, mechanism, verdict, basis, model, created_at, outcome";
+/// [`VERDICT_COLS`] less the id, for restoring, on the same rowid rule.
+const VERDICT_RESTORE_COLS: &str =
+    "candidate_id, mechanism, verdict, basis, model, created_at, outcome";
+/// [`OBS_COLS`] less the id, for restoring: a freed rowid may be taken again.
+const OBS_RESTORE_COLS: &str = "fact_id, episode_id, observed_at, kind, method, confidence";
 
 fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
@@ -799,6 +806,19 @@ fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value
         "annotations": dump_rows(conn, &format!("SELECT {ANN_COLS} FROM episode_annotation WHERE episode_id = ?1"), id)?,
         "facts": dump_rows(conn, &format!("SELECT {FACT_COLS} FROM fact WHERE episode_id = ?1"), id)?,
         "candidates": dump_rows(conn, &format!("SELECT {CAND_COLS} FROM fact_candidate WHERE episode_id = ?1"), id)?,
+        // Its sightings of facts it did not found: the purge removes them
+        // and re-derives those facts, so undo has to put them back.
+        "observations": dump_rows(conn, &format!(
+            "SELECT {OBS_COLS} FROM fact_observation
+             WHERE episode_id = ?1
+               AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1
+                                   AND NOT (extractor IS 'npmi' AND object_id IS NOT NULL))"), id)?,
+        // Its candidates' verdicts: write-once, the whole basis of each
+        // mechanism's precision figure, and cascade-deleted with the
+        // candidate — so undo can bring them back only from here.
+        "verdicts": dump_rows(conn, &format!(
+            "SELECT {VERDICT_COLS} FROM agent_verdict
+             WHERE candidate_id IN (SELECT id FROM fact_candidate WHERE episode_id = ?1)"), id)?,
     }))
 }
 
@@ -811,12 +831,14 @@ pub fn redact_episode_undoable(conn: &Connection, uid: &str) -> Result<bool> {
         })
         .optional()?;
     let Some(id) = id else { return Ok(false) };
-    let snapshot = snapshot_episode_json(conn, id)?;
-    conn.execute(
-        "INSERT INTO undo_log (action, ref_uid, snapshot) VALUES ('delete', ?1, ?2)",
-        params![uid, snapshot.to_string()],
-    )?;
-    redact_episode(conn, uid)
+    crate::redact::in_savepoint(conn, "redact_undoable", || {
+        let snapshot = snapshot_episode_json(conn, id)?;
+        conn.execute(
+            "INSERT INTO undo_log (action, ref_uid, snapshot) VALUES ('delete', ?1, ?2)",
+            params![uid, snapshot.to_string()],
+        )?;
+        Ok(crate::redact::redact_uid_undoable(conn, uid)?.redacted > 0)
+    })
 }
 
 /// Snapshot body+raw before an in-place edit, for undo.
@@ -852,7 +874,29 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
     let snap: serde_json::Value = serde_json::from_str(&snapshot)
         .map_err(|e| crate::error::Error::Parse(format!("undo snapshot: {e}")))?;
 
-    match action.as_str() {
+    // All or nothing, as the delete side is: a restore that stopped part-way
+    // would leave the episode half back with its ingest block already lifted,
+    // and the undo entry queued to fail the same way on every later undo.
+    crate::redact::in_savepoint(conn, "undo_last", || {
+        undo_apply(conn, log_id, &action, &snap)
+    })?;
+    Ok(Some(format!(
+        "restored {} of episode {}",
+        if action == "delete" { "delete" } else { "edit" },
+        ref_uid
+            .as_deref()
+            .map(|u| &u[..8.min(u.len())])
+            .unwrap_or("?")
+    )))
+}
+
+fn undo_apply(
+    conn: &Connection,
+    log_id: i64,
+    action: &str,
+    snap: &serde_json::Value,
+) -> Result<()> {
+    match action {
         "delete" => {
             // Undoing the delete lifts its tombstone — re-ingest may resume.
             if let Some(row) = snap["episode"]
@@ -870,12 +914,131 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
                     )?;
                 }
             }
-            restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])?;
+            // The episode row first, and it must land. Its id is a plain
+            // rowid, reused once freed: if a newer episode holds it now, an
+            // ignored insert would restore every child row below onto *that*
+            // episode — this one's transcript and beliefs filed under an
+            // unrelated note. Refused instead; the savepoint undoes the
+            // tombstone lift, and the entry stays for the operator to see.
+            if restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])? == 0 {
+                return Err(crate::error::Error::Other(format!(
+                    "cannot undo: another episode now holds this one's id ({}) or its \
+                     source and source id, so its rows would be restored onto the wrong \
+                     one. `mecha-graph undo --discard` drops this entry; the episode stays \
+                     deleted",
+                    snap["episode"][0][0]
+                )));
+            }
             restore_rows(conn, "episode_raw", "episode_id, content", &snap["raw"])?;
             restore_rows(conn, "mention", MENTION_COLS, &snap["mentions"])?;
-            restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;
-            restore_rows(conn, "fact", FACT_COLS, &snap["facts"])?;
-            restore_rows(conn, "fact_candidate", CAND_COLS, &snap["candidates"])?;
+            // Annotations are the owner's own words and nothing points at
+            // their ids, so each is restored under a fresh one: a freed rowid
+            // taken since cannot drop a hand-typed note.
+            for row in snap["annotations"].as_array().into_iter().flatten() {
+                let Some(vals) = row.as_array() else { continue };
+                let fresh =
+                    serde_json::Value::Array(vec![serde_json::Value::Array(vals[1..].to_vec())]);
+                restore_rows(conn, "episode_annotation", ANN_RESTORE_COLS, &fresh)?;
+            }
+            // Facts keep their ids — sightings and candidates below point at
+            // them — so each must land as itself. One whose id (or uid) is held
+            // by another fact now is refused, as the episode row is: its
+            // sightings would otherwise be restored onto a stranger.
+            for row in snap["facts"].as_array().into_iter().flatten() {
+                let one = serde_json::Value::Array(vec![row.clone()]);
+                if restore_rows(conn, "fact", FACT_COLS, &one)? == 0 {
+                    return Err(crate::error::Error::Other(format!(
+                        "cannot undo: another fact now holds the id ({}) or uid of one this \
+                         episode founded, so its sightings would be restored onto the wrong \
+                         one. `mecha-graph undo --discard` drops this entry; the episode stays \
+                         deleted",
+                        row[0]
+                    )));
+                }
+            }
+            // Facts restored from the snapshot carry their own counters in
+            // the row, so their sightings below must not be counted again.
+            let restored_facts: std::collections::BTreeSet<i64> = snap["facts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f[0].as_i64())
+                .collect();
+            // Candidates one by one, keeping which of them actually landed: a
+            // freed rowid may be held by a stranger now, and a verdict must
+            // never be attached to that one — a restored `supported` verdict
+            // on a claim nothing verified would widen autonomy, not narrow it.
+            let mut restored_candidates = std::collections::BTreeSet::new();
+            for row in snap["candidates"].as_array().into_iter().flatten() {
+                let one = serde_json::Value::Array(vec![row.clone()]);
+                if restore_rows(conn, "fact_candidate", CAND_COLS, &one)? == 1 {
+                    if let Some(cid) = row.get(0).and_then(|v| v.as_i64()) {
+                        restored_candidates.insert(cid);
+                    }
+                }
+            }
+            // Verdicts under fresh ids, and only onto a candidate this undo
+            // restored (a snapshot from before this field has none).
+            for row in snap["verdicts"].as_array().into_iter().flatten() {
+                let Some(vals) = row.as_array() else { continue };
+                let Some(cid) = vals.get(1).and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                if restored_candidates.contains(&cid) {
+                    let fresh = serde_json::Value::Array(vec![serde_json::Value::Array(
+                        vals[1..].to_vec(),
+                    )]);
+                    restore_rows(conn, "agent_verdict", VERDICT_RESTORE_COLS, &fresh)?;
+                }
+            }
+            // Its sightings of other facts, and what they did to those
+            // facts' counters — the purge's rule, run backwards.
+            let counted = snap["episode"][0][2]
+                .as_str()
+                .map(crate::redact::source_counts)
+                .unwrap_or(false);
+            // Row by row, and only what actually lands moves a counter. Each
+            // is re-inserted *without* its old id — a plain rowid is reused
+            // once freed, so replaying it could be silently ignored while the
+            // counter still went up — and a sighting of a fact that is gone
+            // since (redacted with its own episode) is skipped, not a foreign
+            // key failure that would sink the whole undo.
+            let mut recount: Vec<(i64, bool)> = vec![];
+            for row in snap["observations"].as_array().into_iter().flatten() {
+                let Some(vals) = row.as_array() else { continue };
+                let (Some(fid), kind) = (
+                    vals.get(1).and_then(|v| v.as_i64()),
+                    vals.get(4).and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                let parent: bool = conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM fact WHERE id = ?1)",
+                    params![fid],
+                    |r| r.get(0),
+                )?;
+                if !parent {
+                    continue;
+                }
+                let fresh =
+                    serde_json::Value::Array(vec![serde_json::Value::Array(vals[1..].to_vec())]);
+                if restore_rows(conn, "fact_observation", OBS_RESTORE_COLS, &fresh)? == 0 {
+                    continue;
+                }
+                match recount.iter_mut().find(|(f, _)| *f == fid) {
+                    Some((_, c)) => *c |= kind == Some("corroborated"),
+                    None => recount.push((fid, kind == Some("corroborated"))),
+                }
+            }
+            for (fid, corroborated) in recount {
+                if corroborated && counted && !restored_facts.contains(&fid) {
+                    conn.execute(
+                        "UPDATE fact SET observation_count = observation_count + 1 WHERE id = ?1",
+                        params![fid],
+                    )?;
+                }
+                crate::fact::recompute_confidence(conn, fid)?;
+            }
             // The restored facts' observation trail was cascade-deleted;
             // regenerate the founding 'asserted' rows (same shape as the
             // V010 backfill — later corroborations are not reconstructible).
@@ -949,46 +1112,69 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
         _ => {}
     }
     conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
-    Ok(Some(format!(
-        "restored {} of episode {}",
-        if action == "delete" { "delete" } else { "edit" },
-        ref_uid
-            .as_deref()
-            .map(|u| &u[..8.min(u.len())])
-            .unwrap_or("?")
-    )))
+    Ok(())
 }
 
-pub fn redact_episode(conn: &Connection, uid: &str) -> Result<bool> {
-    let row: Option<(i64, String, String)> = conn
+/// Drop the most recent undo entry without applying it — the way past an
+/// undo that cannot be applied (its episode id taken since). The deleted
+/// episode stays deleted, and its snapshot, which held its body, goes too.
+pub fn discard_last_undo(conn: &Connection) -> Result<Option<String>> {
+    let row: Option<(i64, String, Option<String>, String)> = conn
         .query_row(
-            "SELECT id, source, source_id FROM episode WHERE uid = ?1",
-            params![uid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            "SELECT id, action, ref_uid, snapshot FROM undo_log ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((id, source, source_id)) = row else {
-        return Ok(false);
+    let Some((log_id, action, ref_uid, snapshot)) = row else {
+        return Ok(None);
     };
+    let short = ref_uid
+        .as_deref()
+        .map(|u| &u[..8.min(u.len())])
+        .unwrap_or("?")
+        .to_string();
+    // A delete's snapshot is the only road to what the TUI's delete left for
+    // it — telemetry, pointers, alarms — so discarding one purges them as a
+    // privacy redaction would. An edit's episode is live: its telemetry is
+    // its own, and only the snapshot (the old body) goes.
+    if action == "delete" {
+        let snap: serde_json::Value = serde_json::from_str(&snapshot)
+            .map_err(|e| crate::error::Error::Parse(format!("undo snapshot {log_id}: {e}")))?;
+        let identity = (
+            snap["episode"][0][2]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            snap["episode"][0][3]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let uid = ref_uid.clone().unwrap_or_default();
+        crate::redact::purge_snapshot(conn, &uid, identity)?;
+        // Found by uid or identity above; by id, should it have neither.
+        conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+        Ok(Some(format!(
+            "discarded the undo entry for episode {short}; what it left behind was purged"
+        )))
+    } else {
+        conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+        // The pre-edit body is also in the FTS index's old segments (an edit
+        // only appends a delete marker); merge them so it is not
+        // reconstructible from `fts_episode_data`.
+        crate::redact::optimize_fts(conn)?;
+        Ok(Some(format!(
+            "discarded the undo entry for the edit of episode {short}; the episode keeps its current text"
+        )))
+    }
+}
 
-    // Tombstone first: whole-file sources (ICS, reflect, mbox) re-present
-    // every item on every sync and would otherwise resurrect this episode.
-    conn.execute(
-        "INSERT OR IGNORE INTO episode_tombstone (source, source_id) VALUES (?1, ?2)",
-        params![source, source_id],
-    )?;
-
-    conn.execute("DELETE FROM fact WHERE episode_id = ?1", params![id])?;
-    // Candidates extracted FROM this episode carry its content in their
-    // payloads — true delete takes them too, reviewed or not.
-    conn.execute(
-        "DELETE FROM fact_candidate WHERE episode_id = ?1",
-        params![id],
-    )?;
-    conn.execute("DELETE FROM vec_episode WHERE episode_id = ?1", params![id])?;
-    // mention + episode_enrichment cascade; fts_episode handled by trigger.
-    conn.execute("DELETE FROM episode WHERE id = ?1", params![id])?;
-    Ok(true)
+/// True redaction (§10) of one episode by uid — the privacy path. See
+/// [`crate::redact`] for every table it reaches and the few rows it leaves
+/// on purpose; [`crate::redact::redact_uid`] returns the full report.
+pub fn redact_episode(conn: &Connection, uid: &str) -> Result<bool> {
+    Ok(crate::redact::redact_uid(conn, uid)?.redacted > 0)
 }
 
 #[cfg(test)]

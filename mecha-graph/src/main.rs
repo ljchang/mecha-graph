@@ -453,10 +453,29 @@ enum Command {
         #[arg(long, requires = "cascade")]
         across_classes: bool,
     },
-    /// True-delete an episode and everything derived from it
+    /// True-delete an episode and everything derived from it — by uid, or
+    /// every episode with a (source, source_id), e.g. a mecha session:
+    /// `redact --source agent:mecha --source-id <session id>`
     Redact {
         /// Episode uid
-        episode: String,
+        #[arg(required_unless_present = "source", conflicts_with = "source")]
+        episode: Option<String>,
+        /// Redact by provenance instead: the episode source (with --source-id)
+        #[arg(long, requires = "source_id")]
+        source: Option<String>,
+        /// The source's own id for the item (with --source)
+        #[arg(long = "source-id", requires = "source")]
+        source_id: Option<String>,
+        /// Afterwards, checkpoint the WAL and VACUUM so no free page or WAL
+        /// frame keeps the deleted text. Rewrites the whole file: slow on a
+        /// large store, and needs free disk about the size of the database.
+        #[arg(long)]
+        vacuum: bool,
+        /// With --source: when nothing matches, write the tombstone anyway,
+        /// so an ingest still in flight lands as a no-op. For a caller holding
+        /// an exact id — a mistyped one would block a future item for good.
+        #[arg(long = "tombstone-absent", requires = "source")]
+        tombstone_absent: bool,
     },
     /// Run the gold-set eval
     Eval {
@@ -493,7 +512,17 @@ enum Command {
         charged: bool,
     },
     /// Undo the most recent TUI episode delete/edit (also Ctrl-Z in the TUI)
-    Undo,
+    Undo {
+        /// Drop the most recent entry without applying it — for one that
+        /// cannot be applied. Its episode stays deleted.
+        #[arg(long)]
+        discard: bool,
+        /// With --discard: afterwards, checkpoint the WAL and VACUUM, as
+        /// `redact --vacuum` does — a later redact finds nothing left to purge
+        /// and so would skip it.
+        #[arg(long, requires = "discard")]
+        vacuum: bool,
+    },
     /// Deletion tombstones — what re-ingest is blocked from resurrecting
     Tombstone {
         #[command(subcommand)]
@@ -3293,18 +3322,142 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             },
         },
 
-        Command::Redact { episode: uid } => {
-            if episode::redact_episode(&conn, &uid)? {
-                println!("redacted episode {uid} and all derived data (tombstoned — re-ingest will not resurrect it)");
+        Command::Redact {
+            episode: uid,
+            source,
+            source_id,
+            vacuum,
+            tombstone_absent,
+        } => {
+            // Freed pages are zeroed rather than left holding the text. Set
+            // before the purge, because it governs the deletes themselves.
+            let secure_delete = mecha_graph_core::redact::secure_delete_on(&conn)?;
+            let report = match (&uid, &source, &source_id) {
+                (Some(uid), _, _) => mecha_graph_core::redact::redact_uid(&conn, uid)?,
+                (None, Some(s), Some(sid)) => {
+                    mecha_graph_core::redact::redact_source(&conn, s, sid, tombstone_absent)?
+                }
+                // clap requires exactly one form.
+                _ => unreachable!("redact needs a uid or --source with --source-id"),
+            };
+            // Only when something was removed: a rewrite of the whole file
+            // for a match of nothing buys nothing, and needs the free disk.
+            let scrub = if vacuum && (report.redacted > 0 || report.undo_snapshots > 0) {
+                Some(mecha_graph_core::redact::scrub(&conn)?)
             } else {
-                println!("no episode with uid {uid}");
+                None
+            };
+            if want_json(cli_json, cli_text) {
+                let mut out = serde_json::to_value(&report)?;
+                out["v"] = serde_json::json!(1);
+                out["secure_delete"] = serde_json::json!(secure_delete);
+                out["vacuumed"] = serde_json::json!(scrub.as_ref().is_some_and(|s| s.vacuumed));
+                if let Some(s) = &scrub {
+                    out["wal_checkpoint"] = serde_json::json!({
+                        "busy": s.wal_busy, "log": s.wal_log, "checkpointed": s.wal_checkpointed,
+                    });
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            let what = match (&uid, &source, &source_id) {
+                (Some(u), _, _) => format!("uid {u}"),
+                (_, Some(s), Some(sid)) => format!("{s} {sid}"),
+                _ => String::new(),
+            };
+            if report.redacted == 0 {
+                println!("no episode with {what}");
+                // A permanent ingest block written on a match of nothing: the
+                // one outcome a mistyped id must not be able to hide.
+                if report.tombstoned_absent {
+                    if let (Some(s), Some(sid)) = (&source, &source_id) {
+                        println!(
+                            "  tombstone written anyway (--tombstone-absent): {s} {sid} will never be \
+                             ingested. If the id was wrong: mecha-graph tombstone rm {s} {sid}"
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "redacted {} episode(s) for {what} and all derived data (tombstoned — re-ingest will not resurrect it)",
+                    report.redacted
+                );
+                println!(
+                    "  {} fact(s), {} candidate(s), {} sighting(s) of other facts, {} event(s), {} touch(es), {} summary(ies) cleared",
+                    report.facts,
+                    report.candidates,
+                    report.observations,
+                    report.events,
+                    report.touches,
+                    report.summaries_cleared
+                );
+                if report.rederived > 0 {
+                    println!(
+                        "  {} derived belief(s) re-derived from the episodes that remain{}",
+                        report.rederived,
+                        if report.derived_closed > 0 {
+                            format!(
+                                " ({} closed: under the co-occurrence floor now)",
+                                report.derived_closed
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+            }
+            if report.undo_snapshots > 0 {
+                println!("  {} undo snapshot(s) purged", report.undo_snapshots);
+            }
+            if !report.orphaned_nodes.is_empty() {
+                println!(
+                    "  kept, now with no mention and no fact: {}",
+                    report.orphaned_nodes.join(", ")
+                );
+            }
+            match &scrub {
+                Some(s) if s.wal_busy != 0 => println!(
+                    "vacuumed; the WAL could not be truncated (another connection is reading) — its old frames go when it next resets"
+                ),
+                Some(_) => println!("vacuumed and WAL truncated"),
+                None => {}
+            }
+            if !secure_delete {
+                println!("warning: secure_delete did not take on this build — freed pages may keep text until --vacuum");
             }
         }
 
-        Command::Undo => {
-            match mecha_graph_core::episode::undo_last(&conn)? {
+        Command::Undo { discard, vacuum } => {
+            if !discard {
+                match mecha_graph_core::episode::undo_last(&conn)? {
+                    Some(msg) => println!("{msg}"),
+                    None => println!("nothing to undo"),
+                }
+                return Ok(());
+            }
+            // A discard is a privacy purge of a snapshot that holds the body
+            // verbatim: freed pages are zeroed as `redact` zeroes them — and
+            // said when they are not, since a later redact finds nothing left
+            // to purge and so would never scrub.
+            let secure_delete = mecha_graph_core::redact::secure_delete_on(&conn)?;
+            match mecha_graph_core::episode::discard_last_undo(&conn)? {
                 Some(msg) => println!("{msg}"),
-                None => println!("nothing to undo"),
+                None => {
+                    println!("nothing to undo");
+                    return Ok(());
+                }
+            }
+            if vacuum {
+                let s = mecha_graph_core::redact::scrub(&conn)?;
+                if s.wal_busy != 0 {
+                    println!("warning: another reader held the WAL; its old frames survive until it is reset");
+                }
+            } else if !secure_delete {
+                println!(
+                    "warning: secure_delete did not take on this build — freed pages may keep the \
+                     discarded text; run `mecha-graph undo --discard --vacuum` next time, or \
+                     `mecha-graph redact` of another item with --vacuum"
+                );
             }
         }
 
