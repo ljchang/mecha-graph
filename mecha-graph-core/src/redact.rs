@@ -46,7 +46,12 @@
 //! contributor, so this episode may be its anchor while thirty others
 //! support it. It is re-anchored on the contributors that remain, and
 //! deleted only if none do — it quotes node names and counts, never episode
-//! text. Reported as `rederived`.
+//! text. Reported as `rederived`. The TUI's undoable delete re-derives too,
+//! and undo does not put the anchor back — the belief stays re-anchored on
+//! a surviving contributor until the next `link` pass re-anchors it on the
+//! newest, the restored episode included. `entity_proposal` is in the same
+//! class: its evidence is an alias and dates mined across many episodes
+//! (a floor of eight), names and counts rather than any one episode's text.
 //!
 //! **What it deliberately leaves**: the `episode_tombstone` row
 //! (source, source_id — identifiers only, so re-ingest cannot resurrect it);
@@ -355,7 +360,8 @@ fn purge_one(
         // Its founding observation leaves this episode now, so the sightings
         // purge below leaves it alone and the re-derivation re-points it.
         conn.execute(
-            "UPDATE fact_observation SET episode_id = NULL WHERE fact_id = ?1 AND episode_id = ?2",
+            "UPDATE fact_observation SET episode_id = NULL
+             WHERE fact_id = ?1 AND episode_id = ?2 AND kind = 'asserted'",
             params![fid, id],
         )?;
     }
@@ -373,7 +379,8 @@ fn purge_one(
         let mut stmt = conn.prepare(
             "SELECT fact_id, MAX(kind = 'corroborated') FROM fact_observation
              WHERE episode_id = ?1
-               AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1)
+               AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1
+                                   AND NOT (extractor = 'npmi' AND object_id IS NOT NULL))
              GROUP BY fact_id",
         )?;
         let rows = stmt
@@ -632,16 +639,20 @@ fn purge_undo(
             // episode once anchored was re-derived and survives, and its
             // alarm and telemetry are the surviving belief's, not the
             // snapshot's.
-            let mut fact_uids = fact_uids;
-            fact_uids.retain(|u| {
-                !conn
-                    .query_row(
-                        "SELECT EXISTS (SELECT 1 FROM fact WHERE uid = ?1)",
-                        params![u],
-                        |r| r.get::<_, bool>(0),
-                    )
-                    .unwrap_or(false)
-            });
+            // A failed read is an error, never "not live": the savepoint rolls
+            // the redaction back rather than purge a live belief's history.
+            let mut fact_uids_dead = Vec::with_capacity(fact_uids.len());
+            for u in fact_uids {
+                let live: bool = conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM fact WHERE uid = ?1)",
+                    params![u],
+                    |r| r.get(0),
+                )?;
+                if !live {
+                    fact_uids_dead.push(u);
+                }
+            }
+            let fact_uids = fact_uids_dead;
             conn.execute(
                 "DELETE FROM cooccurrence_alarm WHERE fact_uid IN (SELECT value FROM json_each(?1))",
                 params![serde_json::to_string(&fact_uids)?],
@@ -1494,6 +1505,64 @@ mod tests {
             .expect("the belief survives");
         assert_eq!(anchor, eps[1], "re-anchored on the newest survivor");
         assert_eq!(obs, eps[1], "its founding observation follows the anchor");
+    }
+
+    /// A sighting the anchor episode made of its own derived belief goes
+    /// with it — never stranded as anonymous support that confidence counts.
+    #[test]
+    fn a_rederived_belief_keeps_no_sighting_of_the_redacted_anchor() {
+        let conn = open_memory().unwrap();
+        let (uid, eps) = derived_belief(&conn, 3);
+        let fid: i64 = conn
+            .query_row("SELECT id FROM fact WHERE uid = ?1", params![uid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fact_observation (fact_id, episode_id, observed_at, kind, method, confidence)
+             VALUES (?1, ?2, '2026-08-03 12:00:00', 'corroborated', 'llm', 0.6)",
+            params![fid, eps[2]],
+        )
+        .unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-2", false).unwrap();
+        assert_eq!(rep.rederived, 1);
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM fact_observation WHERE fact_id = {fid} AND episode_id IS NULL")
+            ),
+            0,
+            "a sighting from the redacted episode survived as anonymous support"
+        );
+    }
+
+    /// An undo that cannot be applied is refused, and `--discard` is the way
+    /// past it: the entry goes, the episode stays deleted.
+    #[test]
+    fn a_refused_undo_can_be_discarded() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-7");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        conn.execute(
+            "INSERT INTO episode (id, uid, source, source_id, body, occurred_at, content_hash)
+             VALUES (?1, 'newcomer', 'note', 'n-7', 'an unrelated note', '2026-09-28', 'h')",
+            params![f.id],
+        )
+        .unwrap();
+        let err = crate::episode::undo_last(&conn).unwrap_err().to_string();
+        assert!(err.contains("undo --discard"), "{err}");
+        let deletes = count(
+            &conn,
+            "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'",
+        );
+        assert!(crate::episode::discard_last_undo(&conn).unwrap().is_some());
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'"
+            ),
+            deletes - 1
+        );
     }
 
     /// A belief whose only contributor is redacted has nothing left to

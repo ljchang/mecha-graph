@@ -663,8 +663,12 @@ fn event_loop(
             }
             // Ctrl-Z: undo the last TUI episode delete/edit, from anywhere.
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
-                match episode::undo_last(&app.conn)? {
-                    Some(msg) => {
+                // A refused undo is said on the status line, never an exit:
+                // the entry stays on top, so `?` here would quit the TUI on
+                // every Ctrl-Z from then on.
+                match episode::undo_last(&app.conn) {
+                    Err(e) => app.status = format!("undo refused: {e}"),
+                    Ok(Some(msg)) => {
                         app.status = format!("undo: {msg}");
                         if app.screen == Screen::Review {
                             app.reload_review()?;
@@ -673,7 +677,7 @@ fn event_loop(
                             app.search.dirty_since = Some(std::time::Instant::now());
                         }
                     }
-                    None => app.status = "nothing to undo".into(),
+                    Ok(None) => app.status = "nothing to undo".into(),
                 }
                 continue;
             }

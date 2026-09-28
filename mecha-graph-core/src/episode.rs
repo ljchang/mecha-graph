@@ -919,7 +919,8 @@ fn undo_apply(
             if restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])? == 0 {
                 return Err(crate::error::Error::Other(format!(
                     "cannot undo: episode id {} now belongs to another episode, so its \
-                     rows would be restored onto the wrong one",
+                     rows would be restored onto the wrong one. `mecha-graph undo --discard` \
+                     drops this entry; the episode stays deleted",
                     snap["episode"][0][0]
                 )));
             }
@@ -1069,6 +1070,30 @@ fn undo_apply(
     }
     conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
     Ok(())
+}
+
+/// Drop the most recent undo entry without applying it — the way past an
+/// undo that cannot be applied (its episode id taken since). The deleted
+/// episode stays deleted, and its snapshot, which held its body, goes too.
+pub fn discard_last_undo(conn: &Connection) -> Result<Option<String>> {
+    let row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT id, ref_uid FROM undo_log ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((log_id, ref_uid)) = row else {
+        return Ok(None);
+    };
+    conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+    Ok(Some(format!(
+        "discarded the undo entry for episode {}",
+        ref_uid
+            .as_deref()
+            .map(|u| &u[..8.min(u.len())])
+            .unwrap_or("?")
+    )))
 }
 
 /// True redaction (§10) of one episode by uid — the privacy path. See

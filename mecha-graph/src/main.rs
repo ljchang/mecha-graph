@@ -512,7 +512,12 @@ enum Command {
         charged: bool,
     },
     /// Undo the most recent TUI episode delete/edit (also Ctrl-Z in the TUI)
-    Undo,
+    Undo {
+        /// Drop the most recent entry without applying it — for one that
+        /// cannot be applied. Its episode stays deleted.
+        #[arg(long)]
+        discard: bool,
+    },
     /// Deletion tombstones — what re-ingest is blocked from resurrecting
     Tombstone {
         #[command(subcommand)]
@@ -3409,8 +3414,13 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
         }
 
-        Command::Undo => {
-            match mecha_graph_core::episode::undo_last(&conn)? {
+        Command::Undo { discard } => {
+            let done = if discard {
+                mecha_graph_core::episode::discard_last_undo(&conn)?
+            } else {
+                mecha_graph_core::episode::undo_last(&conn)?
+            };
+            match done {
                 Some(msg) => println!("{msg}"),
                 None => println!("nothing to undo"),
             }
