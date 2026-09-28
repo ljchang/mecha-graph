@@ -46,10 +46,11 @@
 //! contributor, so this episode may be its anchor while thirty others
 //! support it. It is re-anchored on the contributors that remain, and
 //! deleted only if none do — it quotes node names and counts, never episode
-//! text. Reported as `rederived`. The TUI's undoable delete re-derives too,
-//! and undo does not put the anchor back — the belief stays re-anchored on
-//! a surviving contributor until the next `link` pass re-anchors it on the
-//! newest, the restored episode included. `entity_proposal` is in the same
+//! text. Reported as `rederived`. The privacy path only: the TUI's undoable
+//! delete takes the belief like any fact the episode founded, so undo
+//! restores it exactly, and the nightly `link` re-mints it from what
+//! survives if the delete stands. A belief already closed keeps its verdict
+//! and is only re-anchored. `entity_proposal` is in the same
 //! class: its evidence is an alias and dates mined across many episodes
 //! (a floor of eight), names and counts rather than any one episode's text.
 //!
@@ -365,13 +366,24 @@ fn purge_one(
     // is re-derived from what survives once this episode's mentions are
     // gone, and deleted only if nothing does. It quotes node names and
     // counts, never episode text, so keeping it keeps nothing of this one.
-    let derived: BTreeSet<i64> = column::<i64>(
-        conn,
-        "SELECT id FROM fact WHERE episode_id = ?1 AND extractor IS 'npmi' AND object_id IS NOT NULL",
-        params![id],
-    )?
-    .into_iter()
-    .collect();
+    //
+    // **The privacy path only.** The TUI's delete is undoable, and undo
+    // restores rows, not re-derivations: a belief re-anchored, re-rendered or
+    // closed there would stay so after Ctrl-Z. There the belief goes like any
+    // fact the episode founded — captured in the snapshot, restored exactly
+    // by undo — and the nightly `link` re-mints it from what survives if the
+    // delete stands.
+    let derived: BTreeSet<i64> = if mode == Mode::Privacy {
+        column::<i64>(
+            conn,
+            "SELECT id FROM fact WHERE episode_id = ?1 AND extractor IS 'npmi' AND object_id IS NOT NULL",
+            params![id],
+        )?
+        .into_iter()
+        .collect()
+    } else {
+        BTreeSet::new()
+    };
     for fid in &derived {
         // Its founding observation leaves this episode now, so the sightings
         // purge below leaves it alone and the re-derivation re-points it.
@@ -524,6 +536,20 @@ fn purge_one(
             fact_uids.push(fuid.clone());
         } else {
             crate::fact::attach_derivation(conn, fuid, &survivors)?;
+            // A belief already closed or retracted (the nightly decay closes
+            // one and leaves its anchor) keeps that verdict: it is only
+            // re-anchored, never re-rendered or closed a second time — which
+            // `close_valid_time` refuses, and a refusal here would roll back
+            // the whole redaction and leave the episode un-redactable.
+            let open: bool = conn.query_row(
+                "SELECT valid_to IS NULL AND invalidated_at IS NULL FROM fact WHERE id = ?1",
+                params![fid],
+                |r| r.get(0),
+            )?;
+            if !open {
+                rep.rederived += 1;
+                continue;
+            }
             // Re-derived means the statistic too, not only the anchor: the
             // statement *is* the derivation ("3 shared episodes, NPMI .."),
             // and one that still counted the redacted episode would assert
@@ -1578,6 +1604,60 @@ mod tests {
             closed.is_some(),
             "a belief under the minting floor stayed open"
         );
+    }
+
+    /// A belief the nightly decay already closed, anchored on the redacted
+    /// episode, keeps its verdict and is only re-anchored — closing it a
+    /// second time is refused, and that refusal once rolled the whole
+    /// redaction back, leaving the episode un-redactable.
+    #[test]
+    fn redacting_the_anchor_of_a_closed_belief_succeeds() {
+        let conn = open_memory().unwrap();
+        let (uid, eps) = derived_belief(&conn, 3);
+        crate::fact::close_valid_time(&conn, &uid, None).unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-2", false)
+            .expect("a closed derived belief sank the redaction");
+        assert_eq!((rep.redacted, rep.rederived), (1, 1));
+        let anchor: i64 = conn
+            .query_row(
+                "SELECT episode_id FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(anchor, eps[1]);
+    }
+
+    /// The TUI's delete is exactly reversible for a derived belief: taken
+    /// with the episode, and back — same anchor, same statement — on undo.
+    #[test]
+    fn an_undone_delete_restores_a_derived_belief_exactly() {
+        let conn = open_memory().unwrap();
+        let (uid, eps) = derived_belief(&conn, 3);
+        let before: (i64, String) = conn
+            .query_row(
+                "SELECT episode_id, statement FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let ep_uid: String = conn
+            .query_row(
+                "SELECT uid FROM episode WHERE id = ?1",
+                params![eps[2]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(redact_episode_undoable(&conn, &ep_uid).unwrap());
+        crate::episode::undo_last(&conn).unwrap();
+        let after: (i64, String) = conn
+            .query_row(
+                "SELECT episode_id, statement FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
     }
 
     /// Re-derived means the statistic too: a belief that still clears the

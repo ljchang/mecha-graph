@@ -3416,6 +3416,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Undo { discard } => {
             let done = if discard {
+                // A discard is a privacy purge of a snapshot that holds the
+                // body verbatim: freed pages are zeroed, as `redact` zeroes them.
+                mecha_graph_core::redact::secure_delete_on(&conn)?;
                 mecha_graph_core::episode::discard_last_undo(&conn)?
             } else {
                 mecha_graph_core::episode::undo_last(&conn)?
