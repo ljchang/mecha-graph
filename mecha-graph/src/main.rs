@@ -3381,6 +3381,12 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                     report.touches,
                     report.summaries_cleared
                 );
+                if report.rederived > 0 {
+                    println!(
+                        "  {} derived belief(s) re-derived from the episodes that remain",
+                        report.rederived
+                    );
+                }
             }
             if report.undo_snapshots > 0 {
                 println!("  {} undo snapshot(s) purged", report.undo_snapshots);

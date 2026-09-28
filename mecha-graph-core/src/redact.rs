@@ -41,6 +41,13 @@
 //!   same item is found too — and the telemetry naming what that snapshot
 //!   held.
 //!
+//! **Derived beliefs are re-derived, not deleted** (owner's ruling,
+//! 2026-09-28): a co-occurrence fact (`extractor = 'npmi'`) cites its newest
+//! contributor, so this episode may be its anchor while thirty others
+//! support it. It is re-anchored on the contributors that remain, and
+//! deleted only if none do — it quotes node names and counts, never episode
+//! text. Reported as `rederived`.
+//!
 //! **What it deliberately leaves**: the `episode_tombstone` row
 //! (source, source_id — identifiers only, so re-ingest cannot resurrect it);
 //! nodes the episode created or named, which carry no episode provenance —
@@ -92,6 +99,10 @@ pub struct RedactReport {
     /// Nodes the episodes touched that now have no mention and no fact —
     /// kept, listed so the owner can decide.
     pub orphaned_nodes: Vec<String>,
+    /// Derived beliefs this episode was the newest contributor to, kept and
+    /// re-anchored on the contributors that remain (deleted, and counted in
+    /// `facts`, when none did).
+    pub rederived: usize,
     /// Whether a tombstone was written for an identity that matched no
     /// episode (`--tombstone-absent`): the redaction arrived before the
     /// ingest, and the tombstone is what makes that ingest a no-op.
@@ -326,6 +337,28 @@ fn purge_one(
             .collect::<std::result::Result<_, _>>()?;
         rows
     };
+    // **A derived belief is re-derived, not deleted** (owner's ruling,
+    // 2026-09-28). A co-occurrence fact is anchored on its *newest*
+    // contributor (`fact::attach_derivation`), so `episode_id = this` means
+    // "cited here", not "founded here": thirty episodes may support it. It
+    // is re-derived from what survives once this episode's mentions are
+    // gone, and deleted only if nothing does. It quotes node names and
+    // counts, never episode text, so keeping it keeps nothing of this one.
+    let derived: BTreeSet<i64> = column::<i64>(
+        conn,
+        "SELECT id FROM fact WHERE episode_id = ?1 AND extractor = 'npmi' AND object_id IS NOT NULL",
+        params![id],
+    )?
+    .into_iter()
+    .collect();
+    for fid in &derived {
+        // Its founding observation leaves this episode now, so the sightings
+        // purge below leaves it alone and the re-derivation re-points it.
+        conn.execute(
+            "UPDATE fact_observation SET episode_id = NULL WHERE fact_id = ?1 AND episode_id = ?2",
+            params![fid, id],
+        )?;
+    }
     for (_, _, subject, object) in &founded {
         touched.insert(subject.clone());
         if let Some(o) = object {
@@ -350,9 +383,14 @@ fn purge_one(
     };
     let counted = source_counts(&t.source);
 
-    // Facts it founded, with everything keyed on them.
-    let fact_uids: Vec<String> = founded.iter().map(|f| f.1.clone()).collect();
-    for (fid, fuid, _, _) in &founded {
+    // Facts it founded, with everything keyed on them — less the derived
+    // beliefs, which are settled once the mentions are gone.
+    let mut fact_uids: Vec<String> = founded
+        .iter()
+        .filter(|f| !derived.contains(&f.0))
+        .map(|f| f.1.clone())
+        .collect();
+    for (fid, fuid, _, _) in founded.iter().filter(|f| !derived.contains(&f.0)) {
         conn.execute("DELETE FROM vec_fact WHERE fact_id = ?1", params![fid])?;
         // The alarm's first sighting is deliberately never overwritten, and
         // undo does not restore it — so the TUI's delete leaves it, or Ctrl-Z
@@ -369,7 +407,9 @@ fn purge_one(
             params![fid],
         )?;
     }
-    rep.facts += conn.execute("DELETE FROM fact WHERE episode_id = ?1", params![id])?;
+    for (fid, _, _, _) in founded.iter().filter(|f| !derived.contains(&f.0)) {
+        rep.facts += conn.execute("DELETE FROM fact WHERE id = ?1", params![fid])?;
+    }
 
     // Its sightings of other facts: the row goes, the belief re-derives.
     rep.observations += conn.execute(
@@ -426,6 +466,31 @@ fn purge_one(
             &format!("DELETE FROM {table} WHERE episode_id = ?1"),
             params![id],
         )?;
+    }
+    // The derived beliefs, now that this episode's mentions are gone: the
+    // contributors that remain re-anchor it, or there are none and it goes
+    // like any fact this episode founded.
+    for (fid, fuid, subject, object) in founded.iter().filter(|f| derived.contains(&f.0)) {
+        let Some(object) = object else { continue };
+        let survivors = crate::linkers::shared_episodes(conn, subject, object)?;
+        if survivors.is_empty() {
+            conn.execute("DELETE FROM vec_fact WHERE fact_id = ?1", params![fid])?;
+            if mode == Mode::Privacy {
+                conn.execute(
+                    "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                    params![fuid],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM fact_observation WHERE fact_id = ?1",
+                params![fid],
+            )?;
+            rep.facts += conn.execute("DELETE FROM fact WHERE id = ?1", params![fid])?;
+            fact_uids.push(fuid.clone());
+        } else {
+            crate::fact::attach_derivation(conn, fuid, &survivors)?;
+            rep.rederived += 1;
+        }
     }
     // Pointers and telemetry only on the privacy path: `undo_last` restores
     // rows the snapshot holds, and neither of these is in it — so the TUI's
@@ -563,6 +628,20 @@ fn purge_undo(
                         .collect()
                 })
                 .unwrap_or_default();
+            // Less the facts still live: a derived belief the snapshot's
+            // episode once anchored was re-derived and survives, and its
+            // alarm and telemetry are the surviving belief's, not the
+            // snapshot's.
+            let mut fact_uids = fact_uids;
+            fact_uids.retain(|u| {
+                !conn
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM fact WHERE uid = ?1)",
+                        params![u],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+            });
             conn.execute(
                 "DELETE FROM cooccurrence_alarm WHERE fact_uid IN (SELECT value FROM json_each(?1))",
                 params![serde_json::to_string(&fact_uids)?],
@@ -1349,6 +1428,88 @@ mod tests {
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM cooccurrence_alarm"),
             alarms
+        );
+    }
+
+    /// A co-occurrence belief across `n` episodes, anchored — as
+    /// `link_npmi` anchors it — on the newest, which is the one returned.
+    fn derived_belief(conn: &Connection, n: usize) -> (String, Vec<i64>) {
+        upsert_node(conn, &Node::new("ada", "person", "Ada")).unwrap();
+        upsert_node(conn, &Node::new("wren", "person", "Wren")).unwrap();
+        let mut eps = Vec::new();
+        for i in 0..n {
+            let mut e = ep(
+                "agent:mecha",
+                &format!("sess-{i}"),
+                &format!("Ada and Wren, talk {i}"),
+            );
+            e.occurred_at = format!("2026-08-0{} 12:00:00", i + 1);
+            let (id, _) = upsert_episode(conn, &e).unwrap();
+            add_mention(conn, id, "ada", "alias", 1.0).unwrap();
+            add_mention(conn, id, "wren", "alias", 1.0).unwrap();
+            eps.push(id);
+        }
+        let uid = crate::fact::assert_fact(
+            conn,
+            "ada",
+            "related_to",
+            Some("wren"),
+            None,
+            &format!("Ada and Wren frequently co-occur ({n} shared episodes, NPMI 0.50)"),
+            None,
+            None,
+            0.5,
+            "npmi",
+        )
+        .unwrap();
+        crate::fact::attach_derivation(conn, &uid, &eps).unwrap();
+        (uid, eps)
+    }
+
+    /// Owner's ruling: a derived belief whose newest contributor is redacted
+    /// is re-derived from the contributors that remain, never deleted with it.
+    #[test]
+    fn a_derived_belief_is_rederived_from_what_survives() {
+        let conn = open_memory().unwrap();
+        let (uid, eps) = derived_belief(&conn, 3);
+        let anchored: i64 = conn
+            .query_row(
+                "SELECT episode_id FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(anchored, eps[2], "anchored on the newest");
+
+        let rep = redact_source(&conn, "agent:mecha", "sess-2", false).unwrap();
+        assert_eq!((rep.redacted, rep.rederived, rep.facts), (1, 1, 0));
+        let (anchor, obs): (i64, i64) = conn
+            .query_row(
+                "SELECT f.episode_id,
+                        (SELECT episode_id FROM fact_observation WHERE fact_id = f.id AND kind = 'asserted')
+                 FROM fact f WHERE f.uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the belief survives");
+        assert_eq!(anchor, eps[1], "re-anchored on the newest survivor");
+        assert_eq!(obs, eps[1], "its founding observation follows the anchor");
+    }
+
+    /// A belief whose only contributor is redacted has nothing left to
+    /// derive from, and goes like any fact the episode founded.
+    #[test]
+    fn a_derived_belief_with_no_survivor_is_deleted() {
+        let conn = open_memory().unwrap();
+        let (uid, _) = derived_belief(&conn, 1);
+        let rep = redact_source(&conn, "agent:mecha", "sess-0", false).unwrap();
+        assert_eq!((rep.rederived, rep.facts), (0, 1));
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM fact WHERE uid = '{uid}'")
+            ),
+            0
         );
     }
 
