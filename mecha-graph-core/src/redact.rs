@@ -351,7 +351,7 @@ fn purge_one(
     // counts, never episode text, so keeping it keeps nothing of this one.
     let derived: BTreeSet<i64> = column::<i64>(
         conn,
-        "SELECT id FROM fact WHERE episode_id = ?1 AND extractor = 'npmi' AND object_id IS NOT NULL",
+        "SELECT id FROM fact WHERE episode_id = ?1 AND extractor IS 'npmi' AND object_id IS NOT NULL",
         params![id],
     )?
     .into_iter()
@@ -380,7 +380,7 @@ fn purge_one(
             "SELECT fact_id, MAX(kind = 'corroborated') FROM fact_observation
              WHERE episode_id = ?1
                AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1
-                                   AND NOT (extractor = 'npmi' AND object_id IS NOT NULL))
+                                   AND NOT (extractor IS 'npmi' AND object_id IS NOT NULL))
              GROUP BY fact_id",
         )?;
         let rows = stmt
@@ -424,6 +424,18 @@ fn purge_one(
         params![id],
     )?;
     for (fid, corroborated) in &sighted {
+        // Only a fact still here: `sighted` and the founded-fact delete are
+        // two predicates over one table, and a divergence between them (a
+        // NULL `extractor` once made one) must not sink the redaction on a
+        // recompute of a row it just deleted.
+        let live: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM fact WHERE id = ?1)",
+            params![fid],
+            |r| r.get(0),
+        )?;
+        if !live {
+            continue;
+        }
         if *corroborated && counted {
             conn.execute(
                 "UPDATE fact SET observation_count = MAX(observation_count - 1, 1) WHERE id = ?1",
@@ -1562,6 +1574,29 @@ mod tests {
                 "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'"
             ),
             deletes - 1
+        );
+    }
+
+    /// A legacy fact with a NULL extractor and a node object is founded, not
+    /// derived — SQL's NULL must not make the two predicates disagree and
+    /// leave the episode impossible to redact.
+    #[test]
+    fn a_fact_with_a_null_extractor_does_not_block_redaction() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-8");
+        conn.execute(
+            "UPDATE fact SET extractor = NULL, object_id = 'org-w' WHERE id = ?1",
+            params![f.own_fact],
+        )
+        .unwrap();
+        let rep = redact_uid(&conn, &f.uid).expect("a NULL extractor sank the redaction");
+        assert_eq!(rep.redacted, 1);
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM fact WHERE id = {}", f.own_fact)
+            ),
+            0
         );
     }
 
