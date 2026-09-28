@@ -920,9 +920,10 @@ fn undo_apply(
             // tombstone lift, and the entry stays for the operator to see.
             if restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])? == 0 {
                 return Err(crate::error::Error::Other(format!(
-                    "cannot undo: episode id {} now belongs to another episode, so its \
-                     rows would be restored onto the wrong one. `mecha-graph undo --discard` \
-                     drops this entry; the episode stays deleted",
+                    "cannot undo: another episode now holds this one's id ({}) or its \
+                     source and source id, so its rows would be restored onto the wrong \
+                     one. `mecha-graph undo --discard` drops this entry; the episode stays \
+                     deleted",
                     snap["episode"][0][0]
                 )));
             }

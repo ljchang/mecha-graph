@@ -517,6 +517,11 @@ enum Command {
         /// cannot be applied. Its episode stays deleted.
         #[arg(long)]
         discard: bool,
+        /// With --discard: afterwards, checkpoint the WAL and VACUUM, as
+        /// `redact --vacuum` does — a later redact finds nothing left to purge
+        /// and so would skip it.
+        #[arg(long, requires = "discard")]
+        vacuum: bool,
     },
     /// Deletion tombstones — what re-ingest is blocked from resurrecting
     Tombstone {
@@ -3414,18 +3419,37 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             }
         }
 
-        Command::Undo { discard } => {
-            let done = if discard {
-                // A discard is a privacy purge of a snapshot that holds the
-                // body verbatim: freed pages are zeroed, as `redact` zeroes them.
-                mecha_graph_core::redact::secure_delete_on(&conn)?;
-                mecha_graph_core::episode::discard_last_undo(&conn)?
-            } else {
-                mecha_graph_core::episode::undo_last(&conn)?
-            };
-            match done {
+        Command::Undo { discard, vacuum } => {
+            if !discard {
+                match mecha_graph_core::episode::undo_last(&conn)? {
+                    Some(msg) => println!("{msg}"),
+                    None => println!("nothing to undo"),
+                }
+                return Ok(());
+            }
+            // A discard is a privacy purge of a snapshot that holds the body
+            // verbatim: freed pages are zeroed as `redact` zeroes them — and
+            // said when they are not, since a later redact finds nothing left
+            // to purge and so would never scrub.
+            let secure_delete = mecha_graph_core::redact::secure_delete_on(&conn)?;
+            match mecha_graph_core::episode::discard_last_undo(&conn)? {
                 Some(msg) => println!("{msg}"),
-                None => println!("nothing to undo"),
+                None => {
+                    println!("nothing to undo");
+                    return Ok(());
+                }
+            }
+            if vacuum {
+                let s = mecha_graph_core::redact::scrub(&conn)?;
+                if s.wal_busy != 0 {
+                    println!("warning: another reader held the WAL; its old frames survive until it is reset");
+                }
+            } else if !secure_delete {
+                println!(
+                    "warning: secure_delete did not take on this build — freed pages may keep the \
+                     discarded text; run `mecha-graph undo --discard --vacuum` next time, or \
+                     `mecha-graph redact` of another item with --vacuum"
+                );
             }
         }
 
