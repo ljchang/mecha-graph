@@ -1114,12 +1114,15 @@ pub fn discard_last_undo(conn: &Connection) -> Result<Option<String>> {
         crate::redact::purge_snapshot(conn, &uid, identity)?;
         // Found by uid or identity above; by id, should it have neither.
         conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+        Ok(Some(format!(
+            "discarded the undo entry for episode {short}; what it left behind was purged"
+        )))
     } else {
         conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
+        Ok(Some(format!(
+            "discarded the undo entry for the edit of episode {short}; the episode keeps its current text"
+        )))
     }
-    Ok(Some(format!(
-        "discarded the undo entry for episode {short}; what it left behind was purged"
-    )))
 }
 
 /// True redaction (§10) of one episode by uid — the privacy path. See

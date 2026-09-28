@@ -70,8 +70,9 @@
 //! The logical purge is not the physical one. Deleted rows leave bytes in
 //! free pages and the WAL, and an FTS5 delete only appends a tombstone to
 //! the index — the tokens stay in the old segment until a merge. The
-//! privacy path therefore runs an FTS `optimize`; [`scrub`] adds
-//! `secure_delete`, a WAL checkpoint and `VACUUM`.
+//! privacy path therefore runs an FTS `optimize`; [`scrub`] adds a WAL
+//! checkpoint and `VACUUM`; `secure_delete` is set by the CLI's redact before
+//! the purge (`secure_delete_on`), so a library caller sets it itself.
 
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -523,6 +524,37 @@ fn purge_one(
             fact_uids.push(fuid.clone());
         } else {
             crate::fact::attach_derivation(conn, fuid, &survivors)?;
+            // Re-derived means the statistic too, not only the anchor: the
+            // statement *is* the derivation ("3 shared episodes, NPMI .."),
+            // and one that still counted the redacted episode would assert
+            // a count it no longer has. The nightly decay's own rules: the
+            // numbers re-rendered (and the stale vector dropped for re-embed),
+            // or — below the floor the linker needs to mint it at all — a
+            // valid-time close, true then and not now, unless the owner
+            // verified it.
+            match crate::verify::rederive_npmi(conn, subject, object)? {
+                Some((npmi, co)) => {
+                    let statement: String = conn.query_row(
+                        "SELECT statement FROM fact WHERE id = ?1",
+                        params![fid],
+                        |r| r.get(0),
+                    )?;
+                    if let Some(fresh) = crate::decay::render_statement(&statement, co, npmi) {
+                        if fresh != statement {
+                            conn.execute(
+                                "UPDATE fact SET statement = ?2 WHERE id = ?1",
+                                params![fid, fresh],
+                            )?;
+                            conn.execute("DELETE FROM vec_fact WHERE fact_id = ?1", params![fid])?;
+                        }
+                    }
+                }
+                None => {
+                    if !crate::fact::is_user_verified(conn, *fid)? {
+                        crate::fact::close_valid_time(conn, fuid, None)?;
+                    }
+                }
+            }
             rep.rederived += 1;
         }
     }
@@ -1532,6 +1564,47 @@ mod tests {
             .expect("the belief survives");
         assert_eq!(anchor, eps[1], "re-anchored on the newest survivor");
         assert_eq!(obs, eps[1], "its founding observation follows the anchor");
+        // Two shared episodes is under the floor the linker needs to mint a
+        // co-occurrence belief at all: re-derived, it no longer holds, and
+        // is closed in valid time — as the nightly decay would close it.
+        let closed: Option<String> = conn
+            .query_row(
+                "SELECT valid_to FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            closed.is_some(),
+            "a belief under the minting floor stayed open"
+        );
+    }
+
+    /// Re-derived means the statistic too: a belief that still clears the
+    /// floor states the count it has now, not the one the redacted episode
+    /// was part of.
+    #[test]
+    fn a_rederived_belief_states_its_new_count() {
+        let conn = open_memory().unwrap();
+        let (uid, _) = derived_belief(&conn, 4);
+        // A corpus big enough to compute NPMI over once the redacted episode
+        // is gone: ten episodes with mentions remain (three shared + seven).
+        upsert_node(&conn, &Node::new("filler", "person", "Filler")).unwrap();
+        for i in 0..7 {
+            let (id, _) = upsert_episode(&conn, &ep("note", &format!("f-{i}"), "filler")).unwrap();
+            add_mention(&conn, id, "filler", "alias", 1.0).unwrap();
+        }
+        let rep = redact_source(&conn, "agent:mecha", "sess-3", false).unwrap();
+        assert_eq!(rep.rederived, 1);
+        let (statement, closed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT statement, valid_to FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(statement.contains("(3 shared episodes"), "{statement}");
+        assert!(closed.is_none());
     }
 
     /// A sighting the anchor episode made of its own derived belief goes
