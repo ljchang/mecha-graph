@@ -20,9 +20,44 @@ fn channel_column(source: &str) -> Option<&'static str> {
 /// Rebuild the rollup for every person from `mention` × `episode`.
 /// Idempotent and cheap at personal scale; run after each ingest batch.
 pub fn rebuild_person_interactions(conn: &Connection) -> Result<usize> {
-    conn.execute("DELETE FROM person_interaction", [])?;
+    rebuild(conn, None)?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM person_interaction", [], |r| r.get(0))?;
+    Ok(n as usize)
+}
 
-    conn.execute_batch(
+/// Rebuild the rollup for these nodes only, from what `mention` × `episode`
+/// says now. A node with nothing left to say loses its row rather than
+/// keeping one that points at evidence which is gone.
+///
+/// Redaction's half of the rollup: a person's `last_episode_id`, their
+/// first/last-seen times and their count are all derived from episodes, so a
+/// row computed before a redaction goes on naming the deleted episode's uid
+/// and carrying its timestamp until the next full rebuild.
+pub fn rebuild_person_interactions_for(conn: &Connection, node_ids: &[String]) -> Result<()> {
+    if node_ids.is_empty() {
+        return Ok(());
+    }
+    rebuild(conn, Some(&serde_json::to_string(node_ids)?))
+}
+
+/// The one rebuild query, over every person or over the ids in `only`
+/// (a JSON array, so the filter is a bound parameter rather than a
+/// placeholder list spliced into the SQL).
+fn rebuild(conn: &Connection, only: Option<&str>) -> Result<()> {
+    let filter = if only.is_some() {
+        "AND m.node_id IN (SELECT value FROM json_each(?1))"
+    } else {
+        ""
+    };
+    match only {
+        Some(ids) => conn.execute(
+            "DELETE FROM person_interaction WHERE node_id IN (SELECT value FROM json_each(?1))",
+            params![ids],
+        )?,
+        None => conn.execute("DELETE FROM person_interaction", [])?,
+    };
+
+    let insert = format!(
         "INSERT INTO person_interaction
              (node_id, first_seen_at, last_seen_at, last_channel, last_episode_id, interaction_count)
          SELECT m.node_id,
@@ -38,8 +73,13 @@ pub fn rebuild_person_interactions(conn: &Connection) -> Result<usize> {
          JOIN nodes n ON n.id = m.node_id
          WHERE n.node_type = 'person'
            AND e.occurred_at <= datetime('now')   -- future meetings aren't interactions yet
-         GROUP BY m.node_id;",
-    )?;
+           {filter}
+         GROUP BY m.node_id"
+    );
+    match only {
+        Some(ids) => conn.execute(&insert, params![ids])?,
+        None => conn.execute(&insert, [])?,
+    };
 
     for (source, col) in [
         ("calendar.event", "last_meeting_at"),
@@ -48,20 +88,24 @@ pub fn rebuild_person_interactions(conn: &Connection) -> Result<usize> {
         ("sms", "last_message_at"),
         ("slack.thread", "last_slack_at"),
     ] {
-        conn.execute(
-            &format!(
-                "UPDATE person_interaction SET {col} = (
-                     SELECT MAX(e.occurred_at) FROM episode e
-                     JOIN mention m ON m.episode_id = e.id
-                     WHERE m.node_id = person_interaction.node_id AND e.source = ?1 AND e.occurred_at <= datetime('now')
-                 )"
-            ),
-            params![source],
-        )?;
+        let only_rows = if only.is_some() {
+            "WHERE node_id IN (SELECT value FROM json_each(?2))"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE person_interaction SET {col} = (
+                 SELECT MAX(e.occurred_at) FROM episode e
+                 JOIN mention m ON m.episode_id = e.id
+                 WHERE m.node_id = person_interaction.node_id AND e.source = ?1 AND e.occurred_at <= datetime('now')
+             ) {only_rows}"
+        );
+        match only {
+            Some(ids) => conn.execute(&sql, params![source, ids])?,
+            None => conn.execute(&sql, params![source])?,
+        };
     }
-
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM person_interaction", [], |r| r.get(0))?;
-    Ok(n as usize)
+    Ok(())
 }
 
 /// Incremental update for one (episode, person) pair at ingest time.

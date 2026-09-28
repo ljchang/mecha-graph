@@ -590,6 +590,11 @@ UPDATE fact_observation SET confidence =
 WHERE kind = 'asserted';
 "#;
 
+/// The `ON DELETE SET NULL` below is no longer what a redaction relies on:
+/// `redact` deletes the redacted episode's sightings outright and re-derives
+/// the facts they touched (see `redact.rs` — a nulled sighting was counted by
+/// `recompute_confidence` as episodeless support). The clause stays as the
+/// fallback for any other episode delete. The SQL is left as applied.
 const V010_FACT_OBSERVATION: &str = r#"
 -- fact_observation (PLAN.md Wave 2a): how-known AND how-verified,
 -- first-class. Generalizes the single-episode acquisition provenance

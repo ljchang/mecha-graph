@@ -36,6 +36,7 @@ pub mod llm;
 pub mod migrations;
 pub mod precheck;
 pub mod probe;
+pub mod redact;
 pub mod rollup;
 pub mod router;
 pub mod rules;

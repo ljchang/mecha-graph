@@ -677,9 +677,6 @@ pub fn episodes_by_tag(conn: &Connection, tag: &str, limit: i64) -> Result<Vec<E
     Ok(eps)
 }
 
-/// True redaction (§10): purge an episode plus everything derived from it —
-/// mentions, embeddings, FTS rows (via trigger), enrichment, and facts whose
-/// provenance is this episode. The one sanctioned delete in a bi-temporal store.
 /// §10 tiers, weakest → strongest. Cycle order for UI surfaces.
 pub const SENSITIVITY_TIERS: &[&str] = &["public", "personal", "private", "secret"];
 
@@ -790,6 +787,7 @@ const CAND_COLS: &str =
     "id, payload, status, proposed_by, episode_id, confidence, created_at, reviewed_at, reject_reason";
 const MENTION_COLS: &str = "episode_id, node_id, extractor, confidence";
 const ANN_COLS: &str = "id, episode_id, kind, body, created_at";
+const OBS_COLS: &str = "id, fact_id, episode_id, observed_at, kind, method, confidence";
 
 fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
@@ -799,6 +797,11 @@ fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value
         "annotations": dump_rows(conn, &format!("SELECT {ANN_COLS} FROM episode_annotation WHERE episode_id = ?1"), id)?,
         "facts": dump_rows(conn, &format!("SELECT {FACT_COLS} FROM fact WHERE episode_id = ?1"), id)?,
         "candidates": dump_rows(conn, &format!("SELECT {CAND_COLS} FROM fact_candidate WHERE episode_id = ?1"), id)?,
+        // Its sightings of facts it did not found: the purge removes them
+        // and re-derives those facts, so undo has to put them back.
+        "observations": dump_rows(conn, &format!(
+            "SELECT {OBS_COLS} FROM fact_observation
+             WHERE episode_id = ?1 AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1)"), id)?,
     }))
 }
 
@@ -811,12 +814,14 @@ pub fn redact_episode_undoable(conn: &Connection, uid: &str) -> Result<bool> {
         })
         .optional()?;
     let Some(id) = id else { return Ok(false) };
-    let snapshot = snapshot_episode_json(conn, id)?;
-    conn.execute(
-        "INSERT INTO undo_log (action, ref_uid, snapshot) VALUES ('delete', ?1, ?2)",
-        params![uid, snapshot.to_string()],
-    )?;
-    redact_episode(conn, uid)
+    crate::redact::in_savepoint(conn, "redact_undoable", || {
+        let snapshot = snapshot_episode_json(conn, id)?;
+        conn.execute(
+            "INSERT INTO undo_log (action, ref_uid, snapshot) VALUES ('delete', ?1, ?2)",
+            params![uid, snapshot.to_string()],
+        )?;
+        Ok(crate::redact::redact_uid_undoable(conn, uid)?.redacted > 0)
+    })
 }
 
 /// Snapshot body+raw before an in-place edit, for undo.
@@ -876,6 +881,32 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
             restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;
             restore_rows(conn, "fact", FACT_COLS, &snap["facts"])?;
             restore_rows(conn, "fact_candidate", CAND_COLS, &snap["candidates"])?;
+            // Its sightings of other facts, and what they did to those
+            // facts' counters — the purge's rule, run backwards.
+            let counted = snap["episode"][0][2]
+                .as_str()
+                .map(crate::redact::source_counts)
+                .unwrap_or(false);
+            restore_rows(conn, "fact_observation", OBS_COLS, &snap["observations"])?;
+            let mut recount: Vec<(i64, bool)> = vec![];
+            for row in snap["observations"].as_array().into_iter().flatten() {
+                let (Some(fid), kind) = (row[1].as_i64(), row[4].as_str()) else {
+                    continue;
+                };
+                match recount.iter_mut().find(|(f, _)| *f == fid) {
+                    Some((_, c)) => *c |= kind == Some("corroborated"),
+                    None => recount.push((fid, kind == Some("corroborated"))),
+                }
+            }
+            for (fid, corroborated) in recount {
+                if corroborated && counted {
+                    conn.execute(
+                        "UPDATE fact SET observation_count = observation_count + 1 WHERE id = ?1",
+                        params![fid],
+                    )?;
+                }
+                crate::fact::recompute_confidence(conn, fid)?;
+            }
             // The restored facts' observation trail was cascade-deleted;
             // regenerate the founding 'asserted' rows (same shape as the
             // V010 backfill — later corroborations are not reconstructible).
@@ -959,36 +990,11 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
     )))
 }
 
+/// True redaction (§10) of one episode by uid — the privacy path. See
+/// [`crate::redact`] for every table it reaches and the few rows it leaves
+/// on purpose; [`crate::redact::redact_uid`] returns the full report.
 pub fn redact_episode(conn: &Connection, uid: &str) -> Result<bool> {
-    let row: Option<(i64, String, String)> = conn
-        .query_row(
-            "SELECT id, source, source_id FROM episode WHERE uid = ?1",
-            params![uid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((id, source, source_id)) = row else {
-        return Ok(false);
-    };
-
-    // Tombstone first: whole-file sources (ICS, reflect, mbox) re-present
-    // every item on every sync and would otherwise resurrect this episode.
-    conn.execute(
-        "INSERT OR IGNORE INTO episode_tombstone (source, source_id) VALUES (?1, ?2)",
-        params![source, source_id],
-    )?;
-
-    conn.execute("DELETE FROM fact WHERE episode_id = ?1", params![id])?;
-    // Candidates extracted FROM this episode carry its content in their
-    // payloads — true delete takes them too, reviewed or not.
-    conn.execute(
-        "DELETE FROM fact_candidate WHERE episode_id = ?1",
-        params![id],
-    )?;
-    conn.execute("DELETE FROM vec_episode WHERE episode_id = ?1", params![id])?;
-    // mention + episode_enrichment cascade; fts_episode handled by trigger.
-    conn.execute("DELETE FROM episode WHERE id = ?1", params![id])?;
-    Ok(true)
+    Ok(crate::redact::redact_uid(conn, uid)?.redacted > 0)
 }
 
 #[cfg(test)]

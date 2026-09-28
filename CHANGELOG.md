@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mecha-graph redact --source <S> --source-id <ID>`, and redaction that
+  reaches every table.** Redact by provenance as well as by uid — how mecha
+  purges a deleted chat (`--source agent:mecha --source-id <session id>`); no
+  match is success with `redacted: 0`, and `--json` reports what went. A
+  redaction now also takes the vectors of the facts and candidates it deletes,
+  their co-occurrence alarms, the telemetry naming them (`retrieval_touch`,
+  `event_log` — a correction's payload carries its text), the TUI's undo
+  snapshots of the item (by uid and by source id), the `person_interaction`
+  pointer to it, and the generated summaries that could quote it; its
+  sightings of other facts are deleted and those facts re-derived, where the
+  old `SET NULL` turned them into anonymous support. It runs as one savepoint,
+  sets `secure_delete`, and merges the FTS indexes — an FTS5 delete leaves
+  the tokens in the old segment. `--vacuum` checkpoints the WAL and rewrites
+  the file. Nodes left with no mention and no fact are listed, not deleted.
 - **Extraction follows a router's loaded model, and holds it one episode at
   a time.** Every request names the model the router has loaded now (a
   request mid-swap waits up to 15 s for it to settle). Each episode is

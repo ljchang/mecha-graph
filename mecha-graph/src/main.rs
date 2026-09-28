@@ -453,10 +453,24 @@ enum Command {
         #[arg(long, requires = "cascade")]
         across_classes: bool,
     },
-    /// True-delete an episode and everything derived from it
+    /// True-delete an episode and everything derived from it — by uid, or
+    /// every episode with a (source, source_id), e.g. a mecha session:
+    /// `redact --source agent:mecha --source-id <session id>`
     Redact {
         /// Episode uid
-        episode: String,
+        #[arg(required_unless_present = "source", conflicts_with = "source")]
+        episode: Option<String>,
+        /// Redact by provenance instead: the episode source (with --source-id)
+        #[arg(long, requires = "source_id")]
+        source: Option<String>,
+        /// The source's own id for the item (with --source)
+        #[arg(long = "source-id", requires = "source")]
+        source_id: Option<String>,
+        /// Afterwards, checkpoint the WAL and VACUUM so no free page or WAL
+        /// frame keeps the deleted text. Rewrites the whole file: slow on a
+        /// large store, and needs free disk about the size of the database.
+        #[arg(long)]
+        vacuum: bool,
     },
     /// Run the gold-set eval
     Eval {
@@ -3293,11 +3307,81 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             },
         },
 
-        Command::Redact { episode: uid } => {
-            if episode::redact_episode(&conn, &uid)? {
-                println!("redacted episode {uid} and all derived data (tombstoned — re-ingest will not resurrect it)");
+        Command::Redact {
+            episode: uid,
+            source,
+            source_id,
+            vacuum,
+        } => {
+            // Freed pages are zeroed rather than left holding the text. Set
+            // before the purge, because it governs the deletes themselves.
+            let secure_delete = mecha_graph_core::redact::secure_delete_on(&conn)?;
+            let report = match (&uid, &source, &source_id) {
+                (Some(uid), _, _) => mecha_graph_core::redact::redact_uid(&conn, uid)?,
+                (None, Some(s), Some(sid)) => {
+                    mecha_graph_core::redact::redact_source(&conn, s, sid)?
+                }
+                // clap requires exactly one form.
+                _ => unreachable!("redact needs a uid or --source with --source-id"),
+            };
+            let scrub = if vacuum {
+                Some(mecha_graph_core::redact::scrub(&conn)?)
             } else {
-                println!("no episode with uid {uid}");
+                None
+            };
+            if want_json(cli_json, cli_text) {
+                let mut out = serde_json::to_value(&report)?;
+                out["v"] = serde_json::json!(1);
+                out["secure_delete"] = serde_json::json!(secure_delete);
+                out["vacuumed"] = serde_json::json!(scrub.as_ref().is_some_and(|s| s.vacuumed));
+                if let Some(s) = &scrub {
+                    out["wal_checkpoint"] = serde_json::json!({
+                        "busy": s.wal_busy, "log": s.wal_log, "checkpointed": s.wal_checkpointed,
+                    });
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            let what = match (&uid, &source, &source_id) {
+                (Some(u), _, _) => format!("uid {u}"),
+                (_, Some(s), Some(sid)) => format!("{s} {sid}"),
+                _ => String::new(),
+            };
+            if report.redacted == 0 {
+                println!("no episode with {what}");
+            } else {
+                println!(
+                    "redacted {} episode(s) for {what} and all derived data (tombstoned — re-ingest will not resurrect it)",
+                    report.redacted
+                );
+                println!(
+                    "  {} fact(s), {} candidate(s), {} sighting(s) of other facts, {} event(s), {} touch(es), {} summary(ies) cleared",
+                    report.facts,
+                    report.candidates,
+                    report.observations,
+                    report.events,
+                    report.touches,
+                    report.summaries_cleared
+                );
+            }
+            if report.undo_snapshots > 0 {
+                println!("  {} undo snapshot(s) purged", report.undo_snapshots);
+            }
+            if !report.orphaned_nodes.is_empty() {
+                println!(
+                    "  kept, now with no mention and no fact: {}",
+                    report.orphaned_nodes.join(", ")
+                );
+            }
+            match &scrub {
+                Some(s) if s.wal_busy != 0 => println!(
+                    "vacuumed; the WAL could not be truncated (another connection is reading) — its old frames go when it next resets"
+                ),
+                Some(_) => println!("vacuumed and WAL truncated"),
+                None => {}
+            }
+            if !secure_delete {
+                println!("warning: secure_delete did not take on this build — freed pages may keep text until --vacuum");
             }
         }
 
