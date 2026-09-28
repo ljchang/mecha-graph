@@ -88,6 +88,10 @@ pub struct RedactReport {
     /// Nodes the episodes touched that now have no mention and no fact —
     /// kept, listed so the owner can decide.
     pub orphaned_nodes: Vec<String>,
+    /// Whether a tombstone was written for an identity that matched no
+    /// episode (`--tombstone-absent`): the redaction arrived before the
+    /// ingest, and the tombstone is what makes that ingest a no-op.
+    pub tombstoned_absent: bool,
 }
 
 /// Which door a redaction came through.
@@ -137,20 +141,42 @@ pub fn redact_uid(conn: &Connection, uid: &str) -> Result<RedactReport> {
 /// `UNIQUE(source, source_id)` makes that zero or one today; the loop does
 /// not depend on it. Zero is success with `redacted: 0` — the item may never
 /// have been ingested — and still purges any undo snapshot of it.
-pub fn redact_source(conn: &Connection, source: &str, source_id: &str) -> Result<RedactReport> {
+///
+/// **Zero is also the one case where the caller's intent is knowable and the
+/// store's state is not**: a redaction can arrive before the ingest it is
+/// meant to prevent (a conversation deleted while its distill is in flight,
+/// a session file not yet swept by tonight's cursor). `tombstone_absent`
+/// writes the tombstone anyway, so that ingest lands as `Tombstoned`. It is
+/// the caller's to ask for, never the default: a mistyped id would
+/// otherwise block a legitimate future item forever — which is a risk a
+/// caller holding an exact id (mecha, naming its own session) does not run.
+pub fn redact_source(
+    conn: &Connection,
+    source: &str,
+    source_id: &str,
+    tombstone_absent: bool,
+) -> Result<RedactReport> {
     let targets = targets(
         conn,
         "SELECT id, uid, source, source_id FROM episode WHERE source = ?1 AND source_id = ?2",
         params![source, source_id],
     )?;
     in_savepoint(conn, "redact_source", || {
-        redact_targets(
+        let mut rep = redact_targets(
             conn,
             &targets,
             &[],
             vec![(source.to_string(), source_id.to_string())],
             Mode::Privacy,
-        )
+        )?;
+        if targets.is_empty() && tombstone_absent {
+            conn.execute(
+                "INSERT OR IGNORE INTO episode_tombstone (source, source_id) VALUES (?1, ?2)",
+                params![source, source_id],
+            )?;
+            rep.tombstoned_absent = true;
+        }
+        Ok(rep)
     })
 }
 
@@ -221,16 +247,23 @@ fn redact_targets(
     if mode == Mode::Privacy {
         let mut uids: Vec<String> = targets.iter().map(|t| t.uid.clone()).collect();
         uids.extend(extra_uids.iter().cloned());
-        purge_undo(conn, &uids, &identities, &mut rep)?;
+        purge_undo(conn, &uids, &identities, &mut rep, &mut touched)?;
     }
 
     let touched: Vec<String> = touched.into_iter().collect();
-    crate::rollup::rebuild_person_interactions_for(conn, &touched)?;
-    rep.summaries_cleared = conn.execute(
-        "UPDATE node_context SET summary = '', summary_updated_at = NULL
-         WHERE node_id IN (SELECT value FROM json_each(?1)) AND summary <> ''",
-        params![serde_json::to_string(&touched)?],
-    )?;
+    // Derived state is re-derived only on the privacy path. The TUI's delete
+    // is undoable, and `undo_last` restores rows, not rollups or generated
+    // summaries — so rebuilding them here made Ctrl-Z answer "when did I
+    // last talk to P?" as if P had never been seen. There, the nightly
+    // rebuild and the summariser catch up, as they did before.
+    if mode == Mode::Privacy {
+        crate::rollup::rebuild_person_interactions_for(conn, &touched)?;
+        rep.summaries_cleared = conn.execute(
+            "UPDATE node_context SET summary = '', summary_updated_at = NULL
+             WHERE node_id IN (SELECT value FROM json_each(?1)) AND summary <> ''",
+            params![serde_json::to_string(&touched)?],
+        )?;
+    }
 
     for n in &touched {
         let still_there: bool = conn.query_row(
@@ -448,6 +481,7 @@ fn purge_undo(
     uids: &[String],
     identities: &[(String, String)],
     rep: &mut RedactReport,
+    touched: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut ids: BTreeSet<i64> = BTreeSet::new();
     for uid in uids {
@@ -490,6 +524,12 @@ fn purge_undo(
                 .unwrap_or_default();
             if !ep_uid.is_empty() {
                 purge_telemetry(conn, None, &ep_uid, &fact_uids, rep)?;
+            }
+            // The nodes the deleted copy mentioned (MENTION_COLS: node_id is
+            // column 1). Its TUI delete left their rollup and summary for undo
+            // to find; with the snapshot gone, this path owns re-deriving them.
+            if let Some(ms) = v["mentions"].as_array() {
+                touched.extend(ms.iter().filter_map(|m| m[1].as_str().map(str::to_string)));
             }
         }
         rep.undo_snapshots +=
@@ -953,7 +993,7 @@ mod tests {
         // Same source id under another source is a different item.
         let (keep, _) = upsert_episode(&conn, &ep("note", "sess-1", "unrelated note")).unwrap();
 
-        let rep = redact_source(&conn, "agent:mecha", "sess-1").unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-1", false).unwrap();
         assert_eq!(rep.redacted, 1);
         assert_eq!(rep.uids, vec![f.uid.clone()]);
         assert_eq!((rep.facts, rep.candidates, rep.observations), (1, 1, 1));
@@ -974,10 +1014,56 @@ mod tests {
         assert_eq!(o, IngestOutcome::Tombstoned);
     }
 
+    /// A redaction that beats its ingest: the conversation was deleted while
+    /// its distill was in flight. Asked for, the tombstone is written anyway
+    /// and the late ingest is refused; not asked for, nothing is written.
+    #[test]
+    fn a_redaction_that_arrives_before_its_ingest_can_still_forbid_it() {
+        let conn = open_memory().unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "in-flight", true).unwrap();
+        assert_eq!(rep.redacted, 0);
+        assert!(rep.tombstoned_absent);
+        let (_, outcome) = upsert_episode(
+            &conn,
+            &ep("agent:mecha", "in-flight", "said after the delete"),
+        )
+        .unwrap();
+        assert!(matches!(outcome, crate::episode::IngestOutcome::Tombstoned));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM episode"), 0);
+    }
+
+    /// Ctrl-Z must round-trip: the TUI's delete leaves the rollup and the
+    /// generated summary alone, because `undo_last` restores neither.
+    #[test]
+    fn an_undoable_delete_leaves_derived_state_for_undo_to_find() {
+        let conn = open_memory().unwrap();
+        upsert_node(&conn, &Node::new("wren", "person", "Wren")).unwrap();
+        let (e, _) = upsert_episode(&conn, &ep("bee", "b1", "Wren said hi")).unwrap();
+        add_mention(&conn, e, "wren", "alias", 1.0).unwrap();
+        crate::rollup::rebuild_person_interactions_for(&conn, &["wren".to_string()]).unwrap();
+        let before = count(&conn, "SELECT COUNT(*) FROM person_interaction");
+        assert_eq!(before, 1, "the fixture has a rollup row to lose");
+        let uid: String = conn
+            .query_row("SELECT uid FROM episode WHERE id = ?1", params![e], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(redact_episode_undoable(&conn, &uid).unwrap());
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_interaction"),
+            before
+        );
+        crate::episode::undo_last(&conn).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_interaction"),
+            before
+        );
+    }
+
     #[test]
     fn a_source_id_that_was_never_ingested_is_success_with_nothing_done() {
         let conn = open_memory().unwrap();
-        let rep = redact_source(&conn, "agent:mecha", "never-distilled").unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "never-distilled", false).unwrap();
         assert_eq!(rep.redacted, 0);
         assert!(rep.uids.is_empty());
         assert!(!rep.fts_optimized);
@@ -1014,7 +1100,7 @@ mod tests {
             "the schema keeps one live episode per (source, source_id)"
         );
 
-        let rep = redact_source(&conn, "agent:mecha", "sess-1").unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-1", false).unwrap();
         assert_eq!(rep.redacted, 1);
         assert_eq!(
             rep.undo_snapshots, 2,
@@ -1119,7 +1205,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state(&conn).0, 2);
-        redact_source(&conn, "agent:mecha", "s").unwrap();
+        redact_source(&conn, "agent:mecha", "s", false).unwrap();
         assert_eq!(state(&conn).0, 2);
     }
 
@@ -1129,7 +1215,7 @@ mod tests {
         upsert_node(&conn, &Node::new("wren", "person", "Wren")).unwrap();
         let (e, _) = upsert_episode(&conn, &ep("agent:mecha", "s", "Wren said hi")).unwrap();
         add_mention(&conn, e, "wren", "alias", 1.0).unwrap();
-        let rep = redact_source(&conn, "agent:mecha", "s").unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "s", false).unwrap();
         assert_eq!(rep.orphaned_nodes, vec!["wren".to_string()]);
         assert!(crate::graph::get_node(&conn, "wren").unwrap().is_some());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_interaction"), 0);
@@ -1144,7 +1230,7 @@ mod tests {
             "CREATE TRIGGER boom BEFORE DELETE ON episode BEGIN SELECT RAISE(ABORT, 'boom'); END;",
         )
         .unwrap();
-        assert!(redact_source(&conn, "agent:mecha", "sess-1").is_err());
+        assert!(redact_source(&conn, "agent:mecha", "sess-1", false).is_err());
         assert!(crate::episode::get_episode(&conn, f.id).unwrap().is_some());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM episode_tombstone"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM fact_candidate"), 1);
@@ -1171,7 +1257,7 @@ mod tests {
         assert!(file_holds(&db, NEEDLE), "sanity: the text reached the file");
 
         assert!(secure_delete_on(&conn).unwrap());
-        let rep = redact_source(&conn, "agent:mecha", "sess-1").unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-1", false).unwrap();
         assert_eq!(rep.uids, vec![f.uid]);
         let s = scrub(&conn).unwrap();
         assert!(s.vacuumed);
@@ -1200,7 +1286,7 @@ mod tests {
             fixture(&conn, "agent:mecha", "sess-1");
             assert!(secure_delete_on(&conn).unwrap());
             assert_eq!(
-                redact_source(&conn, "agent:mecha", "sess-1")
+                redact_source(&conn, "agent:mecha", "sess-1", false)
                     .unwrap()
                     .redacted,
                 1

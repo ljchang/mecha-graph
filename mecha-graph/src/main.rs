@@ -471,6 +471,11 @@ enum Command {
         /// large store, and needs free disk about the size of the database.
         #[arg(long)]
         vacuum: bool,
+        /// With --source: when nothing matches, write the tombstone anyway,
+        /// so an ingest still in flight lands as a no-op. For a caller holding
+        /// an exact id — a mistyped one would block a future item for good.
+        #[arg(long = "tombstone-absent", requires = "source")]
+        tombstone_absent: bool,
     },
     /// Run the gold-set eval
     Eval {
@@ -3312,6 +3317,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             source,
             source_id,
             vacuum,
+            tombstone_absent,
         } => {
             // Freed pages are zeroed rather than left holding the text. Set
             // before the purge, because it governs the deletes themselves.
@@ -3319,7 +3325,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let report = match (&uid, &source, &source_id) {
                 (Some(uid), _, _) => mecha_graph_core::redact::redact_uid(&conn, uid)?,
                 (None, Some(s), Some(sid)) => {
-                    mecha_graph_core::redact::redact_source(&conn, s, sid)?
+                    mecha_graph_core::redact::redact_source(&conn, s, sid, tombstone_absent)?
                 }
                 // clap requires exactly one form.
                 _ => unreachable!("redact needs a uid or --source with --source-id"),
