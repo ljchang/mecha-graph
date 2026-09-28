@@ -354,10 +354,16 @@ fn purge_one(
     let fact_uids: Vec<String> = founded.iter().map(|f| f.1.clone()).collect();
     for (fid, fuid, _, _) in &founded {
         conn.execute("DELETE FROM vec_fact WHERE fact_id = ?1", params![fid])?;
-        conn.execute(
-            "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
-            params![fuid],
-        )?;
+        // The alarm's first sighting is deliberately never overwritten, and
+        // undo does not restore it — so the TUI's delete leaves it, or Ctrl-Z
+        // would re-raise a long-standing collapse as new. The privacy path
+        // takes it here, or with the snapshot in `purge_undo`.
+        if mode == Mode::Privacy {
+            conn.execute(
+                "DELETE FROM cooccurrence_alarm WHERE fact_uid = ?1",
+                params![fuid],
+            )?;
+        }
         conn.execute(
             "DELETE FROM fact_observation WHERE fact_id = ?1",
             params![fid],
@@ -557,6 +563,10 @@ fn purge_undo(
                         .collect()
                 })
                 .unwrap_or_default();
+            conn.execute(
+                "DELETE FROM cooccurrence_alarm WHERE fact_uid IN (SELECT value FROM json_each(?1))",
+                params![serde_json::to_string(&fact_uids)?],
+            )?;
             if !ep_uid.is_empty() {
                 // EPISODE_COLS starts with `id`, as `undo_last` reads it.
                 let ep_id = v["episode"][0][0].as_i64();
@@ -1317,6 +1327,29 @@ mod tests {
         .unwrap();
         assert!(redact_uid(&conn, &f.uid).is_err());
         assert!(crate::episode::get_episode(&conn, f.id).unwrap().is_some());
+    }
+
+    /// Ctrl-Z round-trips what undo cannot rebuild: a candidate's verdicts
+    /// (write-once, the precision figure's trials) come back with it, and a
+    /// collapse alarm is left alone rather than re-raised as new.
+    #[test]
+    fn an_undone_delete_keeps_verdicts_and_alarms() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-6");
+        let verdicts = count(&conn, "SELECT COUNT(*) FROM agent_verdict");
+        let alarms = count(&conn, "SELECT COUNT(*) FROM cooccurrence_alarm");
+        assert!(verdicts > 0 && alarms > 0, "the fixture has both to lose");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM cooccurrence_alarm"),
+            alarms
+        );
+        crate::episode::undo_last(&conn).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM agent_verdict"), verdicts);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM cooccurrence_alarm"),
+            alarms
+        );
     }
 
     #[test]

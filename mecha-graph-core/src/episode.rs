@@ -788,6 +788,11 @@ const CAND_COLS: &str =
 const MENTION_COLS: &str = "episode_id, node_id, extractor, confidence";
 const ANN_COLS: &str = "id, episode_id, kind, body, created_at";
 const OBS_COLS: &str = "id, fact_id, episode_id, observed_at, kind, method, confidence";
+const VERDICT_COLS: &str =
+    "id, candidate_id, mechanism, verdict, basis, model, created_at, outcome";
+/// [`VERDICT_COLS`] less the id, for restoring, on the same rowid rule.
+const VERDICT_RESTORE_COLS: &str =
+    "candidate_id, mechanism, verdict, basis, model, created_at, outcome";
 /// [`OBS_COLS`] less the id, for restoring: a freed rowid may be taken again.
 const OBS_RESTORE_COLS: &str = "fact_id, episode_id, observed_at, kind, method, confidence";
 
@@ -804,6 +809,12 @@ fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value
         "observations": dump_rows(conn, &format!(
             "SELECT {OBS_COLS} FROM fact_observation
              WHERE episode_id = ?1 AND fact_id NOT IN (SELECT id FROM fact WHERE episode_id = ?1)"), id)?,
+        // Its candidates' verdicts: write-once, the whole basis of each
+        // mechanism's precision figure, and cascade-deleted with the
+        // candidate — so undo can bring them back only from here.
+        "verdicts": dump_rows(conn, &format!(
+            "SELECT {VERDICT_COLS} FROM agent_verdict
+             WHERE candidate_id IN (SELECT id FROM fact_candidate WHERE episode_id = ?1)"), id)?,
     }))
 }
 
@@ -917,6 +928,25 @@ fn undo_apply(
             restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;
             restore_rows(conn, "fact", FACT_COLS, &snap["facts"])?;
             restore_rows(conn, "fact_candidate", CAND_COLS, &snap["candidates"])?;
+            // Verdicts under fresh ids, and only onto a candidate that came
+            // back (a snapshot from before this field has none to restore).
+            for row in snap["verdicts"].as_array().into_iter().flatten() {
+                let Some(vals) = row.as_array() else { continue };
+                let Some(cid) = vals.get(1).and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                let parent: bool = conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM fact_candidate WHERE id = ?1)",
+                    params![cid],
+                    |r| r.get(0),
+                )?;
+                if parent {
+                    let fresh = serde_json::Value::Array(vec![serde_json::Value::Array(
+                        vals[1..].to_vec(),
+                    )]);
+                    restore_rows(conn, "agent_verdict", VERDICT_RESTORE_COLS, &fresh)?;
+                }
+            }
             // Its sightings of other facts, and what they did to those
             // facts' counters — the purge's rule, run backwards.
             let counted = snap["episode"][0][2]

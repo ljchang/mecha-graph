@@ -3330,7 +3330,9 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 // clap requires exactly one form.
                 _ => unreachable!("redact needs a uid or --source with --source-id"),
             };
-            let scrub = if vacuum {
+            // Only when something was removed: a rewrite of the whole file
+            // for a match of nothing buys nothing, and needs the free disk.
+            let scrub = if vacuum && (report.redacted > 0 || report.undo_snapshots > 0) {
                 Some(mecha_graph_core::redact::scrub(&conn)?)
             } else {
                 None
