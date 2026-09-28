@@ -788,6 +788,8 @@ const CAND_COLS: &str =
 const MENTION_COLS: &str = "episode_id, node_id, extractor, confidence";
 const ANN_COLS: &str = "id, episode_id, kind, body, created_at";
 const OBS_COLS: &str = "id, fact_id, episode_id, observed_at, kind, method, confidence";
+/// [`OBS_COLS`] less the id, for restoring: a freed rowid may be taken again.
+const OBS_RESTORE_COLS: &str = "fact_id, episode_id, observed_at, kind, method, confidence";
 
 fn snapshot_episode_json(conn: &Connection, id: i64) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
@@ -857,7 +859,29 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
     let snap: serde_json::Value = serde_json::from_str(&snapshot)
         .map_err(|e| crate::error::Error::Parse(format!("undo snapshot: {e}")))?;
 
-    match action.as_str() {
+    // All or nothing, as the delete side is: a restore that stopped part-way
+    // would leave the episode half back with its ingest block already lifted,
+    // and the undo entry queued to fail the same way on every later undo.
+    crate::redact::in_savepoint(conn, "undo_last", || {
+        undo_apply(conn, log_id, &action, &snap)
+    })?;
+    Ok(Some(format!(
+        "restored {} of episode {}",
+        if action == "delete" { "delete" } else { "edit" },
+        ref_uid
+            .as_deref()
+            .map(|u| &u[..8.min(u.len())])
+            .unwrap_or("?")
+    )))
+}
+
+fn undo_apply(
+    conn: &Connection,
+    log_id: i64,
+    action: &str,
+    snap: &serde_json::Value,
+) -> Result<()> {
+    match action {
         "delete" => {
             // Undoing the delete lifts its tombstone — re-ingest may resume.
             if let Some(row) = snap["episode"]
@@ -887,12 +911,34 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
                 .as_str()
                 .map(crate::redact::source_counts)
                 .unwrap_or(false);
-            restore_rows(conn, "fact_observation", OBS_COLS, &snap["observations"])?;
+            // Row by row, and only what actually lands moves a counter. Each
+            // is re-inserted *without* its old id — a plain rowid is reused
+            // once freed, so replaying it could be silently ignored while the
+            // counter still went up — and a sighting of a fact that is gone
+            // since (redacted with its own episode) is skipped, not a foreign
+            // key failure that would sink the whole undo.
             let mut recount: Vec<(i64, bool)> = vec![];
             for row in snap["observations"].as_array().into_iter().flatten() {
-                let (Some(fid), kind) = (row[1].as_i64(), row[4].as_str()) else {
+                let Some(vals) = row.as_array() else { continue };
+                let (Some(fid), kind) = (
+                    vals.get(1).and_then(|v| v.as_i64()),
+                    vals.get(4).and_then(|v| v.as_str()),
+                ) else {
                     continue;
                 };
+                let parent: bool = conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM fact WHERE id = ?1)",
+                    params![fid],
+                    |r| r.get(0),
+                )?;
+                if !parent {
+                    continue;
+                }
+                let fresh =
+                    serde_json::Value::Array(vec![serde_json::Value::Array(vals[1..].to_vec())]);
+                if restore_rows(conn, "fact_observation", OBS_RESTORE_COLS, &fresh)? == 0 {
+                    continue;
+                }
                 match recount.iter_mut().find(|(f, _)| *f == fid) {
                     Some((_, c)) => *c |= kind == Some("corroborated"),
                     None => recount.push((fid, kind == Some("corroborated"))),
@@ -980,14 +1026,7 @@ pub fn undo_last(conn: &Connection) -> Result<Option<String>> {
         _ => {}
     }
     conn.execute("DELETE FROM undo_log WHERE id = ?1", params![log_id])?;
-    Ok(Some(format!(
-        "restored {} of episode {}",
-        if action == "delete" { "delete" } else { "edit" },
-        ref_uid
-            .as_deref()
-            .map(|u| &u[..8.min(u.len())])
-            .unwrap_or("?")
-    )))
+    Ok(())
 }
 
 /// True redaction (§10) of one episode by uid — the privacy path. See

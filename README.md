@@ -136,7 +136,7 @@ claude mcp add graph -- mecha-graph-mcp
   retrieval excludes `private` and above — messages and wearable transcripts
   land as `private`. Opt in per query with `--private` /
   `include_private: true`.
-- **True delete.** `mecha-graph redact --episode <uid>` purges the episode,
+- **True delete.** `mecha-graph redact <uid>` purges the episode,
   its raw archive, mentions, embeddings, FTS rows, enrichment, and derived
   facts; `tombstone` keeps re-ingest from resurrecting it.
 - **Local by construction.** Nothing reaches the network except the

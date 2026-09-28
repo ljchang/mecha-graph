@@ -428,7 +428,7 @@ fn purge_one(
             "UPDATE nodes SET source_ref = NULL WHERE source_ref = ?1",
             params![t.uid],
         )?;
-        purge_telemetry(conn, Some(id), &t.uid, &fact_uids, rep)?;
+        purge_telemetry(conn, Some(id), None, &t.uid, &fact_uids, rep)?;
     }
 
     // FTS row goes with it (trg_episode_ad).
@@ -446,15 +446,16 @@ pub(crate) fn source_counts(source: &str) -> bool {
 
 /// `retrieval_touch` and `event_log` rows naming an episode or its facts.
 /// `ep_id` is the episode's integer id — for an episode known only from an
-/// undo snapshot, the id the snapshot recorded. It may since have been
-/// reused, and on the privacy path that is the right side to err on: a
-/// correction's payload (`episode_id`, `right`/`wrong` text) is reachable
-/// *only* by that id, so over-deleting costs one telemetry row and
-/// under-deleting leaves the corrected sentence in the file `--vacuum` then
-/// rewrites.
+/// undo snapshot, the id the snapshot recorded, which is how a correction's
+/// payload (`episode_id`, with its `right`/`wrong` text) is reached at all.
+/// Rowids are reused once freed, so for a snapshot `id_until` bounds those
+/// id matches to rows logged no later than the snapshot was taken: nothing
+/// the deleted episode caused can postdate it, and a live episode that
+/// inherited the id keeps the corrections the ladder reads.
 fn purge_telemetry(
     conn: &Connection,
     ep_id: Option<i64>,
+    id_until: Option<&str>,
     ep_uid: &str,
     fact_uids: &[String],
     rep: &mut RedactReport,
@@ -476,13 +477,14 @@ fn purge_telemetry(
          WHERE ref = ?1
             OR ref IN (SELECT value FROM json_each(?2))
             OR CASE WHEN json_valid(payload) THEN
-                   json_extract(payload, '$.episode_id') = ?3
-                OR json_extract(payload, '$.trigger_episode') = ?3
+                   ((json_extract(payload, '$.episode_id') = ?3
+                     OR json_extract(payload, '$.trigger_episode') = ?3)
+                    AND (?4 IS NULL OR ts <= ?4))
                 OR json_extract(payload, '$.trigger_fact') IN (SELECT value FROM json_each(?2))
                 OR EXISTS (SELECT 1 FROM json_each(payload, '$.fact_uids') j
                            WHERE j.value IN (SELECT value FROM json_each(?2)))
                ELSE 0 END",
-        params![ep_uid, facts, ep_id],
+        params![ep_uid, facts, ep_id, id_until],
     )?;
     Ok(())
 }
@@ -517,13 +519,17 @@ fn purge_undo(
         )?);
     }
     for log_id in ids {
-        let snapshot: Option<String> = conn
+        let row: Option<(String, String)> = conn
             .query_row(
-                "SELECT snapshot FROM undo_log WHERE id = ?1",
+                "SELECT snapshot, created_at FROM undo_log WHERE id = ?1",
                 params![log_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let (snapshot, taken_at) = match row {
+            Some((s, at)) => (Some(s), Some(at)),
+            None => (None, None),
+        };
         if let Some(v) = snapshot.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
             // Snapshot rows are column arrays in EPISODE_COLS / FACT_COLS
             // order: uid is column 1 of both.
@@ -539,7 +545,11 @@ fn purge_undo(
             if !ep_uid.is_empty() {
                 // EPISODE_COLS starts with `id`, as `undo_last` reads it.
                 let ep_id = v["episode"][0][0].as_i64();
-                purge_telemetry(conn, ep_id, &ep_uid, &fact_uids, rep)?;
+                // Bounded by when the snapshot was taken: rowids are reused
+                // once freed, so after it the id may name a *live* episode
+                // whose corrections the ladder still reads. Anything the
+                // deleted episode caused was logged before its snapshot.
+                purge_telemetry(conn, ep_id, taken_at.as_deref(), &ep_uid, &fact_uids, rep)?;
                 // The TUI's delete left the pointer for undo; with the
                 // snapshot going, nothing can restore what it points at.
                 conn.execute(
@@ -1146,6 +1156,104 @@ mod tests {
                 "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%a sentence to forget%'"
             ),
             0
+        );
+    }
+
+    /// Undo restores a sighting of a fact founded elsewhere. If that fact was
+    /// redacted with its own episode in between, the sighting is skipped —
+    /// never a foreign-key failure that leaves the episode half back and the
+    /// undo entry failing forever.
+    #[test]
+    fn undo_after_the_sighted_fact_was_redacted_restores_the_rest_and_clears_the_entry() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-1");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        let founder: String = conn
+            .query_row(
+                "SELECT e.uid FROM fact x JOIN episode e ON e.id = x.episode_id WHERE x.id = ?1",
+                params![f.other_fact],
+                |r| r.get(0),
+            )
+            .unwrap();
+        redact_uid(&conn, &founder).unwrap();
+        crate::episode::undo_last(&conn).expect("undo must not fail on a fact that is gone");
+        assert!(crate::episode::get_episode(&conn, f.id).unwrap().is_some());
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'"
+            ),
+            0
+        );
+    }
+
+    /// A freed rowid is taken by the next observation; the restored sighting
+    /// must still land, and the counter move only for what landed.
+    #[test]
+    fn undo_restores_a_sighting_whose_old_rowid_was_reused() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-2");
+        let sightings = |conn: &Connection| {
+            count(
+                conn,
+                &format!(
+                    "SELECT COUNT(*) FROM fact_observation WHERE fact_id = {} AND episode_id = {}",
+                    f.other_fact, f.id
+                ),
+            )
+        };
+        assert_eq!(sightings(&conn), 1, "the fixture corroborates once");
+        let before: i64 = conn
+            .query_row(
+                "SELECT observation_count FROM fact WHERE id = ?1",
+                params![f.other_fact],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        // Something else takes the freed rowid before the undo.
+        conn.execute(
+            "INSERT INTO fact_observation (fact_id, episode_id, observed_at, kind, method, confidence)
+             VALUES (?1, NULL, '2026-09-28', 'asserted', 'probe', 0.5)",
+            params![f.other_fact],
+        )
+        .unwrap();
+        crate::episode::undo_last(&conn).unwrap();
+        assert_eq!(
+            sightings(&conn),
+            1,
+            "the sighting was dropped on a rowid clash"
+        );
+        let after: i64 = conn
+            .query_row(
+                "SELECT observation_count FROM fact WHERE id = ?1",
+                params![f.other_fact],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    /// The snapshot's integer id reaches its corrections, but only those
+    /// logged before the snapshot: a later row under a reused id belongs to
+    /// whatever episode holds the id now.
+    #[test]
+    fn a_snapshot_id_does_not_reach_corrections_logged_after_it() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-3");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        conn.execute(
+            "INSERT INTO event_log (ts, kind, ref, payload) VALUES ('2999-01-01 00:00:00', 'correction_unresolved', NULL, ?1)",
+            params![serde_json::json!({"episode_id": f.id, "wrong": "a later episode's"}).to_string()],
+        )
+        .unwrap();
+        redact_source(&conn, "bee.conversation", "b-3", false).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%a later episode%'"
+            ),
+            1
         );
     }
 
