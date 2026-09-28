@@ -445,8 +445,13 @@ pub(crate) fn source_counts(source: &str) -> bool {
 }
 
 /// `retrieval_touch` and `event_log` rows naming an episode or its facts.
-/// `ep_id` is None for an episode known only from an undo snapshot whose
-/// integer id may since have been reused.
+/// `ep_id` is the episode's integer id — for an episode known only from an
+/// undo snapshot, the id the snapshot recorded. It may since have been
+/// reused, and on the privacy path that is the right side to err on: a
+/// correction's payload (`episode_id`, `right`/`wrong` text) is reachable
+/// *only* by that id, so over-deleting costs one telemetry row and
+/// under-deleting leaves the corrected sentence in the file `--vacuum` then
+/// rewrites.
 fn purge_telemetry(
     conn: &Connection,
     ep_id: Option<i64>,
@@ -532,7 +537,9 @@ fn purge_undo(
                 })
                 .unwrap_or_default();
             if !ep_uid.is_empty() {
-                purge_telemetry(conn, None, &ep_uid, &fact_uids, rep)?;
+                // EPISODE_COLS starts with `id`, as `undo_last` reads it.
+                let ep_id = v["episode"][0][0].as_i64();
+                purge_telemetry(conn, ep_id, &ep_uid, &fact_uids, rep)?;
                 // The TUI's delete left the pointer for undo; with the
                 // snapshot going, nothing can restore what it points at.
                 conn.execute(
@@ -1109,6 +1116,39 @@ mod tests {
     /// id" at most one live row. The other copy there can be is a snapshot:
     /// deleted in the TUI, tombstone lifted, re-captured — and the privacy
     /// path must take the old snapshot as well as the live episode.
+    /// Deleted in the TUI first (telemetry left for undo), redacted for
+    /// privacy later: a correction logged against it is reachable only by
+    /// the episode's integer id, which the snapshot recorded — and its
+    /// payload carries the corrected sentence verbatim.
+    #[test]
+    fn a_privacy_redaction_after_a_tui_delete_takes_the_corrections_text() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "c-1");
+        let payload = serde_json::json!({
+            "episode_id": f.id, "wrong": "a sentence to forget", "about": "x",
+        })
+        .to_string();
+        crate::ledger::log_event(&conn, "correction_unresolved", None, Some(&payload)).unwrap();
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%a sentence to forget%'"
+            ),
+            1,
+            "the undoable delete leaves telemetry for Ctrl-Z"
+        );
+        let rep = redact_source(&conn, "bee.conversation", "c-1", false).unwrap();
+        assert!(rep.undo_snapshots >= 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%a sentence to forget%'"
+            ),
+            0
+        );
+    }
+
     #[test]
     fn redacting_by_source_takes_the_live_episode_and_an_older_deleted_copy() {
         let conn = open_memory().unwrap();
