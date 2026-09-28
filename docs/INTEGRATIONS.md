@@ -118,10 +118,12 @@ isolated.
   `/props`, because on a router what it serves cannot otherwise be told, so a
   bare OpenAI-compatible endpoint (vLLM, a proxy) is not supported as the chat
   endpoint. Installed beside mecha that is mecha's own server, holding the
-  model once. There is
-  deliberately no code that looks for mecha or reads its config —
-  mecha-graph-core knows nothing about any agent (lib.rs rule 1), and a user
-  running their own llama-server gets the shared path for the same reason.
+  model once. The client deliberately has no code that looks for mecha or
+  reads its config. mecha-graph-core knows nothing about any agent (lib.rs
+  rule 1), and a user running their own llama-server gets the shared path
+  for the same reason. The one place mecha's files are touched is the
+  binary's opt-in holds directory (below), which `nightly.sh` names only
+  where mecha made it.
 - **Behind a router, the client follows the loaded model.** Every request
   names whatever model the router has loaded at that moment, not the one
   loaded when the run began. A request that lands mid-swap waits up to 15 s

@@ -91,7 +91,12 @@ EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # that directory — elsewhere there is no switch to wait on, and a default
 # naming a missing directory would read as a guard switched off. Set it in
 # nightly.env to point elsewhere, or empty to turn holds off.
-if [ -z "${MECHA_GRAPH_HOLDS_DIR+set}" ] && [ -d "$HOME/.mecha/holds" ]; then
+# `export` either way: a value nightly.env set is a shell variable only, and
+# unexported the child saw it unset — the documented way to point holds
+# elsewhere silently turned them off (found on review).
+if [ -n "${MECHA_GRAPH_HOLDS_DIR+set}" ]; then
+    export MECHA_GRAPH_HOLDS_DIR
+elif [ -d "$HOME/.mecha/holds" ]; then
     export MECHA_GRAPH_HOLDS_DIR="$HOME/.mecha/holds"
 fi
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists

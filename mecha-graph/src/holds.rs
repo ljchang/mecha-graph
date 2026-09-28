@@ -84,9 +84,21 @@ pub struct Held {
 }
 
 impl Drop for Held {
+    /// A hold that cannot be released keeps a model switch waiting on this
+    /// process for the rest of the run, so that is said; a missing file is
+    /// not (the cancel file usually is).
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_file(self.path.with_extension("cancel"));
+        for path in [self.path.clone(), self.path.with_extension("cancel")] {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "mecha-graph: could not release {} ({e}) — a model switch will wait on \
+                         this run until it exits",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 }
 
