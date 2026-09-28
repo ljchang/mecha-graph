@@ -122,6 +122,22 @@ isolated.
   deliberately no code that looks for mecha or reads its config —
   mecha-graph-core knows nothing about any agent (lib.rs rule 1), and a user
   running their own llama-server gets the shared path for the same reason.
+- **Behind a router, the client follows the loaded model.** Every request
+  names whatever model the router has loaded at that moment, not the one
+  loaded when the run began. A request that lands mid-swap waits up to 15 s
+  for the router to settle. So a long run goes on with the model the owner
+  picked, instead of loading its own back, and each episode is recorded
+  under the model that extracted it.
+- **`MECHA_GRAPH_HOLDS_DIR`: holding a shared router per episode.** When it
+  names an existing directory, `extract` takes a hold there for each episode,
+  in the file protocol a model switch waits on
+  (`mecha-graph/src/holds.rs`). A switch then lets the episode in flight
+  finish, and an episode doesn't start while one is pending.
+  - `scripts/nightly.sh` defaults it to `~/.mecha/holds`. Set it empty to turn
+    holds off; a named directory that doesn't exist is said once per run.
+  - A switch still pending after 30 minutes, or a switch file that can't be
+    read for 10, stops extraction for the night with an error. The episodes
+    stay pending.
 - **Starting a server is opt-in, gated on `[llm] model_path`.** A machine that
   has not named a GGUF cannot start one, which is the whole safety property:
   probe-and-spawn on its own would answer a transient outage of mecha's server

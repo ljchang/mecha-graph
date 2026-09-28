@@ -349,10 +349,10 @@ pub fn extract_pending(
 
 /// [`extract_pending`], with `gate` called before each episode and what it
 /// returns held until that episode is settled — a lease on a shared server,
-/// say, which the caller knows about and this crate does not. Each episode
-/// also [follows](ChatClient::follow) the server's loaded model, so a long
-/// run goes on with whatever model is loaded rather than the one it began on,
-/// and records each episode under the model that extracted it.
+/// say, which the caller knows about and this crate does not. Every request
+/// the client makes follows the server's loaded model (`post_within`), so a
+/// long run goes on with whatever model is loaded rather than the one it
+/// began on, and records each episode under the model that extracted it.
 pub fn extract_pending_gated(
     conn: &Connection,
     chat: &ChatClient,
@@ -394,7 +394,6 @@ pub fn extract_pending_gated(
                 return Err(e);
             }
         };
-        chat.follow();
         let episode = Pending {
             id: episode_id,
             body: &body,
@@ -519,6 +518,10 @@ fn extract_settled(
             conn, chat, system, schema, episode, committed, report, false,
         )?;
     }
+    // The model the episode's last attempt went to, read before the canary
+    // below: the canary follows the router, and a charge recorded after it
+    // could name a model that never saw this episode (found on review).
+    let tried = chat.model();
     if let Some(e) = failed {
         // A fault the answer names as the server's setup stops the run —
         // every later long episode would fail the same way — but this one
@@ -528,12 +531,12 @@ fn extract_settled(
         // `extract --charged`, re-run with `--episode` once the server is fixed.
         if matches!(e, Error::Server(_)) {
             report.errors += 1;
-            mark_attempted(conn, episode.id, &chat.model(), &e)?;
+            mark_attempted(conn, episode.id, &tried, &e)?;
             return Err(e);
         }
         server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
-        mark_attempted(conn, episode.id, &chat.model(), &e)?;
+        mark_attempted(conn, episode.id, &tried, &e)?;
     }
     Ok(())
 }

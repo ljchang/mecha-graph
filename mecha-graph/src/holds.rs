@@ -43,6 +43,15 @@ const POLL: Duration = Duration::from_millis(500);
 /// that might be real, and the run is retried the next night.
 const UNREADABLE_LIMIT: Duration = Duration::from_secs(600);
 
+/// How long a live switch is waited on before extraction stops for the night.
+/// mecha's own runs wait on a switch without limit (its D13), but this is a
+/// batch with a morning to be done by: a switch that stays pending — itself
+/// waiting on a long run, or a download — must not hold the night, which then
+/// reads as neither clean nor charged and overlaps the next cron (found on
+/// review). Stopping keeps the direction — nothing runs under the switch —
+/// and says so; the episodes stay pending for the next night.
+const LIVE_LIMIT: Duration = Duration::from_secs(1800);
+
 /// What the switch file says.
 #[derive(Debug, PartialEq, Eq)]
 enum Pending {
@@ -61,6 +70,13 @@ pub struct Holds {
 
 /// An episode's hold, released on drop — with the cancel file a "switch now"
 /// may have written beside it, so it cannot reach whatever holds next.
+///
+/// The cancel file is not read, and that is deliberate: an episode is one or
+/// two blocking requests that cannot be interrupted mid-flight, and "switch
+/// now" does not need them to be — after its grace it unloads the model, the
+/// request in flight fails, and the client's retry follows the router to the
+/// new model (`ChatClient::follow_settled`). The hold then drops with the
+/// episode, as it would have.
 pub struct Held {
     path: PathBuf,
 }
@@ -100,7 +116,21 @@ impl Holds {
     /// gives a box where mecha never made `~/.mecha/holds`.
     fn from_dir(value: Option<std::ffi::OsString>, base_url: &str) -> Option<Holds> {
         let dir = PathBuf::from(value.filter(|v| !v.is_empty())?);
-        dir.is_dir().then(|| Holds::new(dir, base_url))
+        if !dir.is_dir() {
+            // Named and missing: fine on a box without mecha, and a silent
+            // guard-off if the directory ever moved — so said, once per run
+            // (found on review).
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "mecha-graph: MECHA_GRAPH_HOLDS_DIR is {} but no such directory exists — \
+                     extracting without holds",
+                    dir.display()
+                );
+            }
+            return None;
+        }
+        Some(Holds::new(dir, base_url))
     }
 
     fn new(dir: PathBuf, base_url: &str) -> Holds {
@@ -172,12 +202,18 @@ impl Holds {
     /// pending — without limit, as every mecha run does: the switch is the
     /// owner's, and it ends, or its switcher dies and it stops counting.
     pub fn enter(&self, what: &str) -> std::io::Result<Held> {
-        self.enter_within(what, UNREADABLE_LIMIT)
+        self.enter_within(what, UNREADABLE_LIMIT, LIVE_LIMIT)
     }
 
-    fn enter_within(&self, what: &str, unreadable_limit: Duration) -> std::io::Result<Held> {
+    fn enter_within(
+        &self,
+        what: &str,
+        unreadable_limit: Duration,
+        live_limit: Duration,
+    ) -> std::io::Result<Held> {
         let mut said = false;
         let mut unreadable_since: Option<std::time::Instant> = None;
+        let waiting_since = std::time::Instant::now();
         loop {
             let held = self.write_hold(what)?;
             let mut state = self.pending();
@@ -210,6 +246,15 @@ impl Holds {
                     }
                 } else {
                     unreadable_since = None;
+                    if waiting_since.elapsed() >= live_limit {
+                        return Err(std::io::Error::other(format!(
+                            "a model switch on {} has been pending for {}s — stopping \
+                             extraction for tonight rather than hold the night for it; the \
+                             episodes stay pending",
+                            self.base,
+                            live_limit.as_secs()
+                        )));
+                    }
                 }
                 std::thread::sleep(POLL);
                 state = self.pending();
@@ -326,10 +371,34 @@ mod tests {
         let h = Holds::new(d, "http://127.0.0.1:8080");
         std::fs::write(h.switch_path(), b"not json").unwrap();
         let err = h
-            .enter_within("mecha-graph extract", Duration::from_millis(700))
+            .enter_within(
+                "mecha-graph extract",
+                Duration::from_millis(700),
+                Duration::from_secs(60),
+            )
             .err()
             .expect("held under an unreadable switch file");
         assert!(err.to_string().contains("cancel-switch"), "{err}");
+    }
+
+    /// A live switch that stays pending stops extraction after its bound,
+    /// with an error saying so — the night is not held for it (found on
+    /// review).
+    #[test]
+    fn a_switch_that_stays_pending_stops_extraction_after_its_bound() {
+        let d = dir("live-bound");
+        let h = Holds::new(d, "http://127.0.0.1:8080");
+        let switch = serde_json::json!({ "pid": std::process::id(), "to": "b" });
+        std::fs::write(h.switch_path(), switch.to_string()).unwrap();
+        let err = h
+            .enter_within(
+                "mecha-graph extract",
+                Duration::from_secs(60),
+                Duration::from_millis(700),
+            )
+            .err()
+            .expect("held under a pending switch");
+        assert!(err.to_string().contains("pending for"), "{err}");
     }
 
     /// Off unless the directory is named, non-empty and exists — the

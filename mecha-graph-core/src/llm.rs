@@ -282,6 +282,11 @@ struct Served {
     /// for different fixes (found on review of #22).
     props_error: Option<String>,
     resident: Option<String>,
+    /// A router list this reads in full — non-empty, every status known —
+    /// with nothing resident: the one state that is a swap in progress (the
+    /// old model unloaded, the new one not yet asked for). Two resident, an
+    /// empty list, or an unknown status are not settling into anything.
+    settling: bool,
     /// `Some` on a router: `Some(ids)` from a `/models` it read, `Some(None)`
     /// when that list could not be read.
     router_ids: Option<Option<Vec<String>>>,
@@ -339,11 +344,42 @@ fn probe(base_url: &str) -> Served {
     Served {
         props_read: true,
         props_error: None,
+        settling: router && nothing_resident(models.as_ref()),
         resident: served_from(&props, models.as_ref()),
         router_ids: router.then(|| router_ids(models.as_ref())),
         models_error,
     }
 }
+
+/// A router list read in full — non-empty, every status one this knows —
+/// with no model resident. The same closed status set as [`served_from`].
+fn nothing_resident(models: Option<&serde_json::Value>) -> bool {
+    const KNOWN: [&str; 5] = ["unloaded", "loading", "loaded", "sleeping", "downloading"];
+    let Some(data) = models
+        .and_then(|m| m.get("data"))
+        .and_then(|d| d.as_array())
+    else {
+        return false;
+    };
+    let status = |m: &serde_json::Value| {
+        m.pointer("/status/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    !data.is_empty()
+        && data.iter().all(|m| KNOWN.contains(&status(m).as_str()))
+        && !data
+            .iter()
+            .any(|m| matches!(status(m).as_str(), "loaded" | "loading" | "sleeping"))
+}
+
+/// How long a request waits for a router mid-swap to show its new model. The
+/// window is the router between unloading one model and being asked for the
+/// next — under a second in a `mecha model use` — so this is generous, and
+/// short enough that a router simply left with nothing loaded costs a few
+/// seconds per request rather than `load_wait` (found on review).
+const SETTLE_WAIT: Duration = Duration::from_secs(15);
 
 /// Every model id a router lists — the names a request may carry — or `None`
 /// when there is no list to read (not the same as an empty one).
@@ -665,12 +701,14 @@ impl ChatClient {
         let started = Instant::now();
         loop {
             let served = probe(self.base_url());
-            // Only a router that *answered* and could not name one model is
-            // mid-swap. One that did not answer is not settling into
-            // anything: waited out like a swap it cost up to `load_wait` per
-            // request with the episode's hold held (found on review), and the
-            // request's own error handling is what that case needs.
-            if served.resident.is_none() && !matches!(served.router_ids, Some(Some(_))) {
+            // Only a router mid-swap is waited for: one that answered in full
+            // with nothing resident. One that did not answer, answered with
+            // two resident, an empty list or a status this does not know is
+            // not settling into anything — waited out, each cost up to
+            // `load_wait` per request with the episode's hold held (found on
+            // review, twice). Those keep the current name, and the request's
+            // own error handling is what they need.
+            if served.resident.is_none() && !served.settling {
                 return;
             }
             if let Some(resident) = served.resident {
@@ -685,7 +723,7 @@ impl ChatClient {
                 }
                 return;
             }
-            if started.elapsed() >= self.load_wait {
+            if started.elapsed() >= SETTLE_WAIT.min(self.load_wait) {
                 return;
             }
             std::thread::sleep(self.load_poll);
@@ -1284,6 +1322,36 @@ mod tests {
             "waited {:?} on a router that never answered",
             started.elapsed()
         );
+    }
+
+    /// Only a router mid-swap — read in full, nothing resident — is waited
+    /// for. Two resident, or a status this does not know, is not settling
+    /// into anything, and the request goes out at once under the name it
+    /// has (found on review).
+    #[test]
+    fn a_router_that_cannot_name_one_model_is_not_waited_out_unless_mid_swap() {
+        let [props, _] = router_with("a");
+        let two = (
+            200,
+            r#"{"data":[{"id":"a","status":{"value":"loaded"}},{"id":"b","status":{"value":"sleeping"}}]}"#
+                .to_string(),
+        );
+        let (url, seen) = stub_recording(vec![props, two, (200, ANSWER.into())]);
+        let c = following(&url, "a");
+        let started = Instant::now();
+        c.complete_json("s", "u").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(seen.lock().unwrap()[2].contains(r#""model":"a""#));
+
+        assert!(nothing_resident(Some(&serde_json::json!({"data": [
+            {"id": "a", "status": {"value": "unloaded"}}]}))));
+        assert!(!nothing_resident(Some(&serde_json::json!({"data": []}))));
+        assert!(!nothing_resident(Some(&serde_json::json!({"data": [
+            {"id": "a", "status": {"value": "resident"}}]}))));
     }
 
     /// `follow` moves to the router's one resident model, and keeps the name
