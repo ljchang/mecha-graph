@@ -30,6 +30,26 @@ use std::time::Duration;
 /// How often a waiting episode looks for the switch to have cleared.
 const POLL: Duration = Duration::from_millis(500);
 
+/// How long a switch file nobody can read is waited on before extraction
+/// stops and says so. A live switch is waited on without limit — it ends, or
+/// its switcher dies and stops counting — but an unreadable file names no
+/// switcher to outlive, so without a bound it would hang the whole nightly
+/// run, which then reads as neither clean nor charged (found on review).
+/// Stopping is still the fail-closed direction: nothing runs under a switch
+/// that might be real, and the run is retried the next night.
+const UNREADABLE_LIMIT: Duration = Duration::from_secs(600);
+
+/// What the switch file says.
+#[derive(Debug, PartialEq, Eq)]
+enum Pending {
+    None,
+    /// A switch by a live process, to this model.
+    Live(String),
+    /// A file that exists and cannot be read as a switch — pending, the
+    /// fail-closed way, but only for [`UNREADABLE_LIMIT`].
+    Unreadable,
+}
+
 pub struct Holds {
     dir: PathBuf,
     base: String,
@@ -66,7 +86,14 @@ fn alive(pid: u64) -> bool {
 impl Holds {
     /// From `MECHA_GRAPH_HOLDS_DIR`, when it names a directory that exists.
     pub fn from_env(base_url: &str) -> Option<Holds> {
-        let dir = PathBuf::from(std::env::var_os("MECHA_GRAPH_HOLDS_DIR")?);
+        Holds::from_dir(std::env::var_os("MECHA_GRAPH_HOLDS_DIR"), base_url)
+    }
+
+    /// The pure half of [`from_env`](Self::from_env): off when unset, empty,
+    /// or naming no existing directory — which is what `nightly.sh`'s default
+    /// gives a box where mecha never made `~/.mecha/holds`.
+    fn from_dir(value: Option<std::ffi::OsString>, base_url: &str) -> Option<Holds> {
+        let dir = PathBuf::from(value.filter(|v| !v.is_empty())?);
         dir.is_dir().then(|| Holds::new(dir, base_url))
     }
 
@@ -86,28 +113,33 @@ impl Holds {
         self.dir.join(format!("switch-{slug}.json"))
     }
 
-    /// Is a switch pending on this router? An unreadable file is pending —
-    /// mecha's fail-closed direction, erring toward waiting — and one whose
-    /// switcher is gone is not (mecha sweeps it).
-    fn pending(&self) -> Option<String> {
+    /// Is a switch pending on this router? One whose switcher is gone is not
+    /// (mecha sweeps it). A file this cannot read as a switch — not JSON, or
+    /// a `pid` that is not a number — is [`Pending::Unreadable`]: never "no
+    /// switch", which would run straight through one if mecha ever renamed or
+    /// re-typed the field (found on review).
+    fn pending(&self) -> Pending {
         let path = self.switch_path();
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(_) => return Some("(unreadable switch file)".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pending::None,
+            Err(_) => return Pending::Unreadable,
         };
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => {
-                let pid = v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
-                alive(pid).then(|| {
-                    v.get("to")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("another model")
-                        .to_string()
-                })
-            }
-            Err(_) => Some("(unreadable switch file)".into()),
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Pending::Unreadable;
+        };
+        let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) else {
+            return Pending::Unreadable;
+        };
+        if !alive(pid) {
+            return Pending::None;
         }
+        Pending::Live(
+            v.get("to")
+                .and_then(|t| t.as_str())
+                .unwrap_or("another model")
+                .to_string(),
+        )
     }
 
     fn write_hold(&self, what: &str) -> std::io::Result<Held> {
@@ -132,18 +164,47 @@ impl Holds {
     /// pending — without limit, as every mecha run does: the switch is the
     /// owner's, and it ends, or its switcher dies and it stops counting.
     pub fn enter(&self, what: &str) -> std::io::Result<Held> {
+        self.enter_within(what, UNREADABLE_LIMIT)
+    }
+
+    fn enter_within(&self, what: &str, unreadable_limit: Duration) -> std::io::Result<Held> {
         let mut said = false;
+        let mut unreadable_since: Option<std::time::Instant> = None;
         loop {
             let held = self.write_hold(what)?;
-            let Some(to) = self.pending() else {
+            let mut state = self.pending();
+            if state == Pending::None {
                 return Ok(held);
-            };
+            }
             drop(held);
             if !std::mem::replace(&mut said, true) {
-                eprintln!("mecha-graph: the router is switching to {to}; waiting for it");
+                match &state {
+                    Pending::Live(to) => {
+                        eprintln!("mecha-graph: the router is switching to {to}; waiting for it")
+                    }
+                    _ => eprintln!(
+                        "mecha-graph: {} cannot be read; waiting for it to clear",
+                        self.switch_path().display()
+                    ),
+                }
             }
-            while self.pending().is_some() {
+            while state != Pending::None {
+                if state == Pending::Unreadable {
+                    let since = *unreadable_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= unreadable_limit {
+                        return Err(std::io::Error::other(format!(
+                            "{} has been unreadable for {}s, so whether a model switch is \
+                             pending is unknown — stopping rather than extract under one. \
+                             `mecha model cancel-switch` withdraws it.",
+                            self.switch_path().display(),
+                            unreadable_limit.as_secs()
+                        )));
+                    }
+                } else {
+                    unreadable_since = None;
+                }
                 std::thread::sleep(POLL);
+                state = self.pending();
             }
         }
     }
@@ -233,15 +294,45 @@ mod tests {
         let h = Holds::new(d, "http://127.0.0.1:8080");
         let dead = serde_json::json!({ "pid": u32::MAX - 1, "to": "b" });
         std::fs::write(h.switch_path(), dead.to_string()).unwrap();
-        assert!(h.pending().is_none());
+        assert_eq!(h.pending(), Pending::None);
         std::fs::write(h.switch_path(), b"not json").unwrap();
-        assert!(h.pending().is_some());
+        assert_eq!(h.pending(), Pending::Unreadable);
+        // The two keys read out of mecha's switch file, pinned: a pid that is
+        // not a number is unreadable, never "no switch".
+        let mecha_shaped = serde_json::json!({
+            "pid": std::process::id(), "base_url": "http://127.0.0.1:8080",
+            "from": "a", "to": "b", "started_at": "2026-09-28T03:21:40.1Z",
+        });
+        std::fs::write(h.switch_path(), mecha_shaped.to_string()).unwrap();
+        assert_eq!(h.pending(), Pending::Live("b".into()));
+        let retyped = serde_json::json!({ "pid": std::process::id().to_string(), "to": "b" });
+        std::fs::write(h.switch_path(), retyped.to_string()).unwrap();
+        assert_eq!(h.pending(), Pending::Unreadable);
     }
 
-    /// Off unless the directory is named and exists.
+    /// An unreadable switch file is waited on, then stops extraction with an
+    /// error naming it — never a hang (found on review).
+    #[test]
+    fn an_unreadable_switch_file_stops_extraction_rather_than_hangs() {
+        let d = dir("unreadable");
+        let h = Holds::new(d, "http://127.0.0.1:8080");
+        std::fs::write(h.switch_path(), b"not json").unwrap();
+        let err = h
+            .enter_within("mecha-graph extract", Duration::from_millis(700))
+            .err()
+            .expect("held under an unreadable switch file");
+        assert!(err.to_string().contains("cancel-switch"), "{err}");
+    }
+
+    /// Off unless the directory is named, non-empty and exists — the
+    /// set-but-missing case is what nightly.sh's default gives a box without
+    /// mecha. Pure, so no test touches the process environment.
     #[test]
     fn holds_are_off_without_an_existing_directory() {
-        std::env::remove_var("MECHA_GRAPH_HOLDS_DIR");
-        assert!(Holds::from_env("http://127.0.0.1:8080").is_none());
+        let base = "http://127.0.0.1:8080";
+        assert!(Holds::from_dir(None, base).is_none());
+        assert!(Holds::from_dir(Some("".into()), base).is_none());
+        assert!(Holds::from_dir(Some("/nonexistent/mecha/holds".into()), base).is_none());
+        assert!(Holds::from_dir(Some(dir("on").into_os_string()), base).is_some());
     }
 }

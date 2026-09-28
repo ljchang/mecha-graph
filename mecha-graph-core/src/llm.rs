@@ -650,6 +650,39 @@ impl ChatClient {
         Some(resident)
     }
 
+    /// [`follow`](Self::follow), for a request about to be re-sent: when the
+    /// router cannot say what is loaded, wait for it to settle (polling every
+    /// `load_poll`, up to `load_wait`) instead of keeping the old name. The
+    /// unsure moments — nothing loaded, or the old model still loaded beside
+    /// the new one loading — are exactly the mid-swap window a retry lands
+    /// in, and re-sending the old selecting name there is what loaded it
+    /// back (found on review). If nothing settles in that time, nobody is
+    /// loading anything, and the current name is the right one to send.
+    fn follow_settled(&self) {
+        if !self.follows {
+            return;
+        }
+        let started = Instant::now();
+        loop {
+            if let Some(resident) = probe(self.base_url()).resident {
+                let mut current = self.model.lock().unwrap_or_else(|p| p.into_inner());
+                if *current != resident {
+                    eprintln!(
+                        "mecha-graph: {} now has '{resident}' loaded (was '{}') — following it",
+                        self.base_url(),
+                        *current
+                    );
+                    *current = resident;
+                }
+                return;
+            }
+            if started.elapsed() >= self.load_wait {
+                return;
+            }
+            std::thread::sleep(self.load_poll);
+        }
+    }
+
     pub fn is_managed(&self) -> bool {
         self.backend.is_managed()
     }
@@ -795,7 +828,8 @@ impl ChatClient {
             // while loading — names what the router has loaded *now*: the
             // failure is most often the loaded model being switched out from
             // under it, and re-sending the old name loads it back.
-            if !std::mem::take(&mut first) && self.follow().is_some() {
+            if !std::mem::take(&mut first) {
+                self.follow_settled();
                 body["model"] = serde_json::Value::String(self.model());
             }
             let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
@@ -1166,6 +1200,45 @@ mod tests {
             c.model(),
             "b",
             "the result would be recorded under the old model"
+        );
+    }
+
+    /// A retry that lands mid-swap — the router showing nothing loaded —
+    /// waits for the router to settle and names what it settles on, never the
+    /// old name it began with (found on review).
+    #[test]
+    fn a_retry_mid_swap_waits_for_the_router_to_settle() {
+        let [props, _] = router_with("b");
+        let [props2, loaded_b] = router_with("b");
+        let none = (
+            200,
+            r#"{"data":[{"id":"a","status":{"value":"unloaded"}},{"id":"b","status":{"value":"unloaded"}}]}"#
+                .to_string(),
+        );
+        let (url, seen) = stub_recording(vec![
+            (
+                500,
+                r#"{"error":{"message":"proxy error: Failed to read connection"}}"#.into(),
+            ),
+            props,
+            none,
+            props2,
+            loaded_b,
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#.into(),
+            ),
+        ]);
+        let mut c = ChatClient::at(&url);
+        c.follows = true;
+        *c.model.lock().unwrap() = "a".into();
+        c.retry_delays = vec![Duration::from_millis(50)];
+        c.complete_json("s", "u").unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[5].contains(r#""model":"b""#),
+            "re-sent mid-swap under the old name: {}",
+            seen[5]
         );
     }
 
