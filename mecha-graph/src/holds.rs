@@ -23,6 +23,10 @@
 //! slug is the router's base URL with every non-alphanumeric byte as `_`.
 //! The handshake is mecha's: write the hold, *then* look for a switch, and
 //! yield — drop the hold, wait for the switch to clear, try again.
+//!
+//! **Only the batch holds.** `extract --episode` (one interactive re-run)
+//! takes no hold: a switch mid-run costs one re-runnable episode, and it
+//! still follows the router on every request.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -76,11 +80,13 @@ fn base(url: &str) -> String {
         .to_string()
 }
 
-/// Is a process with this pid running? `/proc`, since this runs beside a
-/// Linux router; a pid that cannot be told is not alive, so a dead switcher's
-/// file is never waited on for ever.
-fn alive(pid: u64) -> bool {
-    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
+/// Is a process with this pid running? `None` when this host has no
+/// `/proc` to ask — a check that cannot run, which must not read as "gone"
+/// and so as "no switch" (found on review).
+fn alive(pid: u64) -> Option<bool> {
+    Path::new("/proc/self")
+        .exists()
+        .then(|| pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
 }
 
 impl Holds {
@@ -131,8 +137,10 @@ impl Holds {
         let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) else {
             return Pending::Unreadable;
         };
-        if !alive(pid) {
-            return Pending::None;
+        match alive(pid) {
+            Some(false) => return Pending::None,
+            None => return Pending::Unreadable,
+            Some(true) => {}
         }
         Pending::Live(
             v.get("to")

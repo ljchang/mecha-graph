@@ -4115,15 +4115,17 @@ reject: it was never true (retracted; the class learns)"
                 // Each episode holds a shared router, when a holds directory
                 // is named, so a model switch waits for the episode in
                 // flight rather than cutting it off (holds.rs).
-                let holds = holds::Holds::from_env(chat.base_url());
                 mecha_graph_core::extract::extract_pending_gated(
                     &conn,
                     &chat,
                     limit,
                     (!sources.is_empty()).then_some(&sources[..]),
                     (!excluded.is_empty()).then_some(&excluded[..]),
+                    // Asked per episode, so a holds directory made mid-run —
+                    // mecha's first switch on a box that had none — is
+                    // noticed (found on review).
                     &mut || -> mecha_graph_core::Result<Box<dyn std::any::Any>> {
-                        match &holds {
+                        match &holds::Holds::from_env(chat.base_url()) {
                             Some(h) => h
                                 .enter("mecha-graph extract")
                                 .map(|held| Box::new(held) as Box<dyn std::any::Any>)

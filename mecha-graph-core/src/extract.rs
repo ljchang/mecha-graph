@@ -372,8 +372,28 @@ pub fn extract_pending_gated(
         ..Default::default()
     };
 
+    // Say what was done before stopping: what this batch staged is
+    // committed, and a log reading only "failed" would understate it (as
+    // summarize already guards; found on review of #22). Said for a gate
+    // that stops the run too — an unreadable switch file after charged
+    // episodes would otherwise report them nowhere (found on review of #24).
+    // **scripts/nightly.sh parses this line** for its ALERTS count — reword
+    // it and change the sed there with it, or charges read as a clean night.
+    let stopping = |report: &ExtractReport| {
+        eprintln!(
+            "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
+             {} fact and {} commitment candidate(s) staged before the stop",
+            report.episodes, report.errors, report.fact_candidates, report.commitment_candidates
+        );
+    };
     for (episode_id, _uid, body, occurred_at) in rows {
-        let _lease = gate()?;
+        let _lease = match gate() {
+            Ok(lease) => lease,
+            Err(e) => {
+                stopping(&report);
+                return Err(e);
+            }
+        };
         chat.follow();
         let episode = Pending {
             id: episode_id,
@@ -389,20 +409,7 @@ pub fn extract_pending_gated(
             &mut committed,
             &mut report,
         ) {
-            // Say what was done before stopping: what this batch staged is
-            // committed, and a log reading only "failed" would understate it
-            // (as summarize already guards; found on review of #22).
-            // **scripts/nightly.sh parses this line** for its ALERTS count —
-            // reword it and change the sed there with it, or charges read as
-            // a clean night.
-            eprintln!(
-                "extract: stopping — {} episode(s) tried, {} charged as their own failure, \
-                 {} fact and {} commitment candidate(s) staged before the stop",
-                report.episodes,
-                report.errors,
-                report.fact_candidates,
-                report.commitment_candidates
-            );
+            stopping(&report);
             return Err(e);
         }
     }

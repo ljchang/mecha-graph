@@ -664,7 +664,16 @@ impl ChatClient {
         }
         let started = Instant::now();
         loop {
-            if let Some(resident) = probe(self.base_url()).resident {
+            let served = probe(self.base_url());
+            // Only a router that *answered* and could not name one model is
+            // mid-swap. One that did not answer is not settling into
+            // anything: waited out like a swap it cost up to `load_wait` per
+            // request with the episode's hold held (found on review), and the
+            // request's own error handling is what that case needs.
+            if served.resident.is_none() && !matches!(served.router_ids, Some(Some(_))) {
+                return;
+            }
+            if let Some(resident) = served.resident {
                 let mut current = self.model.lock().unwrap_or_else(|p| p.into_inner());
                 if *current != resident {
                     eprintln!(
@@ -795,6 +804,11 @@ impl ChatClient {
         timeout: Duration,
         retry_delays: &[Duration],
     ) -> Result<serde_json::Value> {
+        // Every request, not only a re-sent one, names what the router has
+        // loaded now: the canary after a timeout and the episode's re-run are
+        // fresh requests, and naming the model the run began with there
+        // loaded it back over a switch just as a retry did (found on review).
+        self.follow_settled();
         let mut body = serde_json::json!({
             "model": self.model(),
             "messages": [
@@ -1166,35 +1180,40 @@ mod tests {
         ]
     }
 
+    const ANSWER: &str = r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#;
+    const CUT_OFF: &str = r#"{"error":{"message":"proxy error: Failed to read connection"}}"#;
+
+    fn following(url: &str, model: &str) -> ChatClient {
+        let mut c = ChatClient::at(url);
+        c.follows = true;
+        *c.model.lock().unwrap() = model.into();
+        c.retry_delays = vec![Duration::from_millis(50)];
+        c
+    }
+
     /// A request re-sent after the server failed it names what the router
     /// has loaded *now*. Re-sending the name it began with is what loaded the
     /// old model back over the owner's switch (2026-09-28).
     #[test]
     fn a_retry_names_the_model_the_router_has_loaded_now() {
-        let [props, models] = router_with("b");
+        let [props_a, models_a] = router_with("a");
+        let [props_b, models_b] = router_with("b");
         let (url, seen) = stub_recording(vec![
-            (
-                500,
-                r#"{"error":{"message":"proxy error: Failed to read connection"}}"#.into(),
-            ),
-            props,
-            models,
-            (
-                200,
-                r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#.into(),
-            ),
+            props_a,
+            models_a,
+            (500, CUT_OFF.into()),
+            props_b,
+            models_b,
+            (200, ANSWER.into()),
         ]);
-        let mut c = ChatClient::at(&url);
-        c.follows = true;
-        *c.model.lock().unwrap() = "a".into();
-        c.retry_delays = vec![Duration::from_millis(50)];
+        let c = following(&url, "a");
         c.complete_json("s", "u").unwrap();
         let seen = seen.lock().unwrap();
-        assert!(seen[0].contains(r#""model":"a""#), "{}", seen[0]);
+        assert!(seen[2].contains(r#""model":"a""#), "{}", seen[2]);
         assert!(
-            seen[3].contains(r#""model":"b""#),
+            seen[5].contains(r#""model":"b""#),
             "the retry named the old model: {}",
-            seen[3]
+            seen[5]
         );
         assert_eq!(
             c.model(),
@@ -1203,42 +1222,67 @@ mod tests {
         );
     }
 
+    /// A *fresh* request — the canary after a timeout, an episode's re-run —
+    /// names what the router has loaded now too, not the name the run began
+    /// with: a timeout returns before the retry loop turns over, so following
+    /// only on re-send left these two naming the stale model (found on
+    /// review).
+    #[test]
+    fn a_fresh_request_names_the_model_the_router_has_loaded_now() {
+        let [props_b, models_b] = router_with("b");
+        let (url, seen) = stub_recording(vec![props_b, models_b, (200, ANSWER.into())]);
+        let c = following(&url, "a");
+        c.complete_json("s", "u").unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen[2].contains(r#""model":"b""#), "{}", seen[2]);
+    }
+
     /// A retry that lands mid-swap — the router showing nothing loaded —
     /// waits for the router to settle and names what it settles on, never the
     /// old name it began with (found on review).
     #[test]
     fn a_retry_mid_swap_waits_for_the_router_to_settle() {
+        let [props_a, models_a] = router_with("a");
         let [props, _] = router_with("b");
-        let [props2, loaded_b] = router_with("b");
+        let [props_b, models_b] = router_with("b");
         let none = (
             200,
             r#"{"data":[{"id":"a","status":{"value":"unloaded"}},{"id":"b","status":{"value":"unloaded"}}]}"#
                 .to_string(),
         );
         let (url, seen) = stub_recording(vec![
-            (
-                500,
-                r#"{"error":{"message":"proxy error: Failed to read connection"}}"#.into(),
-            ),
+            props_a,
+            models_a,
+            (500, CUT_OFF.into()),
             props,
             none,
-            props2,
-            loaded_b,
-            (
-                200,
-                r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#.into(),
-            ),
+            props_b,
+            models_b,
+            (200, ANSWER.into()),
         ]);
-        let mut c = ChatClient::at(&url);
-        c.follows = true;
-        *c.model.lock().unwrap() = "a".into();
-        c.retry_delays = vec![Duration::from_millis(50)];
+        let c = following(&url, "a");
         c.complete_json("s", "u").unwrap();
         let seen = seen.lock().unwrap();
         assert!(
-            seen[5].contains(r#""model":"b""#),
+            seen[7].contains(r#""model":"b""#),
             "re-sent mid-swap under the old name: {}",
-            seen[5]
+            seen[7]
+        );
+    }
+
+    /// A router that does not answer is not settling into anything: the
+    /// request goes on to its own error at once, rather than waiting out
+    /// `load_wait` (600 s outside tests) per request (found on review).
+    #[test]
+    fn a_router_that_does_not_answer_is_not_waited_out_like_a_swap() {
+        let url = dead_server();
+        let c = following(&url, "a");
+        let started = Instant::now();
+        assert!(c.complete_json("s", "u").is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?} on a router that never answered",
+            started.elapsed()
         );
     }
 
