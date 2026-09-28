@@ -787,6 +787,8 @@ const CAND_COLS: &str =
     "id, payload, status, proposed_by, episode_id, confidence, created_at, reviewed_at, reject_reason";
 const MENTION_COLS: &str = "episode_id, node_id, extractor, confidence";
 const ANN_COLS: &str = "id, episode_id, kind, body, created_at";
+/// [`ANN_COLS`] less the id, for restoring under a fresh one.
+const ANN_RESTORE_COLS: &str = "episode_id, kind, body, created_at";
 const OBS_COLS: &str = "id, fact_id, episode_id, observed_at, kind, method, confidence";
 const VERDICT_COLS: &str =
     "id, candidate_id, mechanism, verdict, basis, model, created_at, outcome";
@@ -929,8 +931,31 @@ fn undo_apply(
             }
             restore_rows(conn, "episode_raw", "episode_id, content", &snap["raw"])?;
             restore_rows(conn, "mention", MENTION_COLS, &snap["mentions"])?;
-            restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;
-            restore_rows(conn, "fact", FACT_COLS, &snap["facts"])?;
+            // Annotations are the owner's own words and nothing points at
+            // their ids, so each is restored under a fresh one: a freed rowid
+            // taken since cannot drop a hand-typed note.
+            for row in snap["annotations"].as_array().into_iter().flatten() {
+                let Some(vals) = row.as_array() else { continue };
+                let fresh =
+                    serde_json::Value::Array(vec![serde_json::Value::Array(vals[1..].to_vec())]);
+                restore_rows(conn, "episode_annotation", ANN_RESTORE_COLS, &fresh)?;
+            }
+            // Facts keep their ids — sightings and candidates below point at
+            // them — so each must land as itself. One whose id (or uid) is held
+            // by another fact now is refused, as the episode row is: its
+            // sightings would otherwise be restored onto a stranger.
+            for row in snap["facts"].as_array().into_iter().flatten() {
+                let one = serde_json::Value::Array(vec![row.clone()]);
+                if restore_rows(conn, "fact", FACT_COLS, &one)? == 0 {
+                    return Err(crate::error::Error::Other(format!(
+                        "cannot undo: another fact now holds the id ({}) or uid of one this \
+                         episode founded, so its sightings would be restored onto the wrong \
+                         one. `mecha-graph undo --discard` drops this entry; the episode stays \
+                         deleted",
+                        row[0]
+                    )));
+                }
+            }
             // Facts restored from the snapshot carry their own counters in
             // the row, so their sightings below must not be counted again.
             let restored_facts: std::collections::BTreeSet<i64> = snap["facts"]

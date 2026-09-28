@@ -1569,6 +1569,28 @@ mod tests {
         );
     }
 
+    /// A founded fact's id taken by another fact since: undo refuses, rather
+    /// than restore the episode with that fact silently missing and its
+    /// sightings attached to the stranger.
+    #[test]
+    fn undo_refuses_when_a_founded_facts_id_was_taken() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-10");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        conn.execute(
+            "INSERT INTO fact (id, uid, subject_id, predicate, statement, confidence, extractor)
+             VALUES (?1, 'stranger-fact', 'ada', 'related_to', 'a stranger', 0.5, 'test')",
+            params![f.own_fact],
+        )
+        .unwrap();
+        let err = crate::episode::undo_last(&conn).unwrap_err().to_string();
+        assert!(err.contains("another fact"), "{err}");
+        assert!(
+            crate::episode::get_episode(&conn, f.id).unwrap().is_none(),
+            "half-restored"
+        );
+    }
+
     /// An unreadable snapshot is an error, never a purge that reports it taken.
     #[test]
     fn an_unreadable_undo_snapshot_stops_the_redaction() {
