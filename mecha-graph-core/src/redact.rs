@@ -241,7 +241,7 @@ fn redact_targets(
     let mut rep = RedactReport::default();
     let mut touched: BTreeSet<String> = BTreeSet::new();
     for t in targets {
-        purge_one(conn, t, &mut rep, &mut touched)?;
+        purge_one(conn, t, mode, &mut rep, &mut touched)?;
     }
 
     if mode == Mode::Privacy {
@@ -289,6 +289,7 @@ fn redact_targets(
 fn purge_one(
     conn: &Connection,
     t: &Target,
+    mode: Mode,
     rep: &mut RedactReport,
     touched: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -416,11 +417,19 @@ fn purge_one(
             params![id],
         )?;
     }
-    conn.execute(
-        "UPDATE nodes SET source_ref = NULL WHERE source_ref = ?1",
-        params![t.uid],
-    )?;
-    purge_telemetry(conn, Some(id), &t.uid, &fact_uids, rep)?;
+    // Pointers and telemetry only on the privacy path: `undo_last` restores
+    // rows the snapshot holds, and neither of these is in it — so the TUI's
+    // delete must leave an event node's `source_ref`, the `event_log` rows
+    // naming its facts, and their demand counters for Ctrl-Z to find. The
+    // snapshot keeps the body verbatim anyway; when the privacy path later
+    // takes the snapshot, `purge_undo` takes these with it.
+    if mode == Mode::Privacy {
+        conn.execute(
+            "UPDATE nodes SET source_ref = NULL WHERE source_ref = ?1",
+            params![t.uid],
+        )?;
+        purge_telemetry(conn, Some(id), &t.uid, &fact_uids, rep)?;
+    }
 
     // FTS row goes with it (trg_episode_ad).
     conn.execute("DELETE FROM episode WHERE id = ?1", params![id])?;
@@ -524,6 +533,12 @@ fn purge_undo(
                 .unwrap_or_default();
             if !ep_uid.is_empty() {
                 purge_telemetry(conn, None, &ep_uid, &fact_uids, rep)?;
+                // The TUI's delete left the pointer for undo; with the
+                // snapshot going, nothing can restore what it points at.
+                conn.execute(
+                    "UPDATE nodes SET source_ref = NULL WHERE source_ref = ?1",
+                    params![ep_uid],
+                )?;
             }
             // The nodes the deleted copy mentioned (MENTION_COLS: node_id is
             // column 1). Its TUI delete left their rollup and summary for undo
@@ -1048,6 +1063,19 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
+        // An event node pointing at the episode and a demand counter for it:
+        // neither is in the undo snapshot, so the undoable delete must leave both.
+        conn.execute(
+            "UPDATE nodes SET source_ref = ?1 WHERE id = 'wren'",
+            params![uid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO retrieval_touch (kind, ref_id, first_at, last_at)
+             VALUES ('episode', ?1, '2026-09-01', '2026-09-01')",
+            params![uid],
+        )
+        .unwrap();
         assert!(redact_episode_undoable(&conn, &uid).unwrap());
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM person_interaction"),
@@ -1058,6 +1086,13 @@ mod tests {
             count(&conn, "SELECT COUNT(*) FROM person_interaction"),
             before
         );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM retrieval_touch"), 1);
+        let pointer: Option<String> = conn
+            .query_row("SELECT source_ref FROM nodes WHERE id = 'wren'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pointer.as_deref(), Some(uid.as_str()));
     }
 
     #[test]

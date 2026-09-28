@@ -3355,6 +3355,16 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             };
             if report.redacted == 0 {
                 println!("no episode with {what}");
+                // A permanent ingest block written on a match of nothing: the
+                // one outcome a mistyped id must not be able to hide.
+                if report.tombstoned_absent {
+                    if let (Some(s), Some(sid)) = (&source, &source_id) {
+                        println!(
+                            "  tombstone written anyway (--tombstone-absent): {s} {sid} will never be \
+                             ingested. If the id was wrong: mecha-graph tombstone rm {s} {sid}"
+                        );
+                    }
+                }
             } else {
                 println!(
                     "redacted {} episode(s) for {what} and all derived data (tombstoned — re-ingest will not resurrect it)",
