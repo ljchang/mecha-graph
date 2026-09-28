@@ -447,7 +447,17 @@ fn port_of(base_url: &str) -> Option<u16> {
 }
 
 pub struct ChatClient {
-    pub model: String,
+    /// What requests name, and what extraction records as the extractor.
+    /// Behind a router it is re-read from the router ([`ChatClient::follow`])
+    /// rather than fixed at connect: the name *selects* there, so a client
+    /// that kept the one it connected with loaded it back over any other the
+    /// owner chose — 2026-09-28, a night's extraction resolved one model at
+    /// 01:40 and undid a switch to another at 03:22, by retrying a request
+    /// the switch had cut off.
+    model: std::sync::Mutex<String>,
+    /// Whether [`ChatClient::follow`] asks the server again: only behind a
+    /// router, where the loaded model can change under a running client.
+    follows: bool,
     pub timeout: Duration,
     pub max_tokens: u32,
     /// On, and measured to matter: the prompt's durability and subject rules
@@ -480,7 +490,8 @@ impl ChatClient {
     /// server's answer (or its absence) to reach `post`.
     pub(crate) fn at(base_url: &str) -> ChatClient {
         ChatClient {
-            model: "test-model".into(),
+            model: std::sync::Mutex::new("test-model".into()),
+            follows: false,
             timeout: Duration::from_secs(5),
             max_tokens: 64,
             think: false,
@@ -589,7 +600,8 @@ impl ChatClient {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS),
         );
         Ok(ChatClient {
-            model,
+            model: std::sync::Mutex::new(model),
+            follows: served.router_ids.is_some(),
             timeout,
             max_tokens: DEFAULT_MAX_TOKENS,
             think: true,
@@ -603,6 +615,39 @@ impl ChatClient {
 
     pub fn base_url(&self) -> &str {
         self.backend.base_url()
+    }
+
+    /// The model requests name now, and the one a result is recorded under.
+    pub fn model(&self) -> String {
+        self.model
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+
+    /// Behind a router, take whatever model it has loaded now — what a long
+    /// run calls before each unit of work and before re-sending a request,
+    /// so it goes on with the owner's pick instead of loading its own back.
+    /// Keeps the current name when the router cannot say (nothing loaded,
+    /// two loaded, a list this does not read, no answer): mid-swap is the
+    /// usual reason, and the next call sees the new one. Returns the model it
+    /// moved to, if it moved.
+    pub fn follow(&self) -> Option<String> {
+        if !self.follows {
+            return None;
+        }
+        let resident = probe(self.base_url()).resident?;
+        let mut current = self.model.lock().unwrap_or_else(|p| p.into_inner());
+        if *current == resident {
+            return None;
+        }
+        eprintln!(
+            "mecha-graph: {} now has '{resident}' loaded (was '{}') — following it",
+            self.base_url(),
+            *current
+        );
+        *current = resident.clone();
+        Some(resident)
     }
 
     pub fn is_managed(&self) -> bool {
@@ -718,7 +763,7 @@ impl ChatClient {
         retry_delays: &[Duration],
     ) -> Result<serde_json::Value> {
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": self.model(),
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user",   "content": user }
@@ -744,7 +789,15 @@ impl ChatClient {
         //   while it loads a model — and only a sustained one is `Transport`.
         let mut attempt = 0;
         let mut loading_since: Option<Instant> = None;
+        let mut first = true;
         let resp = loop {
+            // A request re-sent — after a 5xx, a dropped connection, a 503
+            // while loading — names what the router has loaded *now*: the
+            // failure is most often the loaded model being switched out from
+            // under it, and re-sending the old name loads it back.
+            if !std::mem::take(&mut first) && self.follow().is_some() {
+                body["model"] = serde_json::Value::String(self.model());
+            }
             let sent = ureq::post(&format!("{}/v1/chat/completions", self.base_url()))
                 .timeout(timeout)
                 .send_json(body.clone());
@@ -847,7 +900,7 @@ impl ChatClient {
             return Err(Error::Other(format!(
                 "empty completion from {} after {reasoning_len} chars of reasoning \
                  (finish_reason={finish})",
-                self.model
+                self.model()
             )));
         }
 
@@ -991,7 +1044,7 @@ pub(crate) mod test_http {
 
 #[cfg(test)]
 mod tests {
-    use super::test_http::{answer, dead_server, hung_server, stub};
+    use super::test_http::{answer, dead_server, hung_server, stub, stub_recording};
     use super::*;
 
     /// A router's bare `/props` is never the answer — the night it was, every
@@ -1058,6 +1111,87 @@ mod tests {
             router_ids(Some(&serde_json::json!({"data": []}))),
             Some(vec![])
         );
+    }
+
+    /// A router's placeholder `/props`, then its `/models` with `loaded`
+    /// resident — the two answers [`probe`] reads, in order.
+    fn router_with(loaded: &str) -> [(u16, String); 2] {
+        [
+            (
+                200,
+                r#"{"role":"router","model_alias":"llama-server"}"#.into(),
+            ),
+            (
+                200,
+                format!(
+                    r#"{{"data":[{{"id":"a","status":{{"value":"{}"}}}},{{"id":"b","status":{{"value":"{}"}}}}]}}"#,
+                    if loaded == "a" { "loaded" } else { "unloaded" },
+                    if loaded == "b" { "loaded" } else { "unloaded" },
+                ),
+            ),
+        ]
+    }
+
+    /// A request re-sent after the server failed it names what the router
+    /// has loaded *now*. Re-sending the name it began with is what loaded the
+    /// old model back over the owner's switch (2026-09-28).
+    #[test]
+    fn a_retry_names_the_model_the_router_has_loaded_now() {
+        let [props, models] = router_with("b");
+        let (url, seen) = stub_recording(vec![
+            (
+                500,
+                r#"{"error":{"message":"proxy error: Failed to read connection"}}"#.into(),
+            ),
+            props,
+            models,
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#.into(),
+            ),
+        ]);
+        let mut c = ChatClient::at(&url);
+        c.follows = true;
+        *c.model.lock().unwrap() = "a".into();
+        c.retry_delays = vec![Duration::from_millis(50)];
+        c.complete_json("s", "u").unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].contains(r#""model":"a""#), "{}", seen[0]);
+        assert!(
+            seen[3].contains(r#""model":"b""#),
+            "the retry named the old model: {}",
+            seen[3]
+        );
+        assert_eq!(
+            c.model(),
+            "b",
+            "the result would be recorded under the old model"
+        );
+    }
+
+    /// `follow` moves to the router's one resident model, and keeps the name
+    /// it has when the router cannot say (mid-swap) or is not a router.
+    #[test]
+    fn follow_takes_the_resident_model_and_keeps_its_own_when_unsure() {
+        let [props, models] = router_with("b");
+        let url = stub(vec![props, models]);
+        let mut c = ChatClient::at(&url);
+        c.follows = true;
+        *c.model.lock().unwrap() = "a".into();
+        assert_eq!(c.follow().as_deref(), Some("b"));
+        assert_eq!(c.model(), "b");
+
+        let [props, _] = router_with("b");
+        let none = (200, r#"{"data":[{"id":"a","status":{"value":"unloaded"}},{"id":"b","status":{"value":"unloaded"}}]}"#.to_string());
+        let url = stub(vec![props, none]);
+        let mut c = ChatClient::at(&url);
+        c.follows = true;
+        *c.model.lock().unwrap() = "a".into();
+        assert_eq!(c.follow(), None, "nothing resident is not a reason to move");
+        assert_eq!(c.model(), "a");
+
+        let c = ChatClient::at("http://127.0.0.1:9");
+        assert_eq!(c.follow(), None, "a client that does not follow never asks");
     }
 
     /// A 5xx and no answer at all are the server's; a 4xx is an answer; a

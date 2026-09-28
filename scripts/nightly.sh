@@ -84,6 +84,12 @@ PRECHECK_AUTO_ACCEPT="$PRECHECK_AUTO_ACCEPT_RESOLVED"
 PRECHECK_TRIAGE="$PRECHECK_TRIAGE_RESOLVED"
 EXTRACT_LIMIT="${EXTRACT_LIMIT:-100}"
 EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
+# Extraction holds a shared model router one episode at a time, in the holds
+# directory mecha's model switch waits on, so a switch lets the episode in
+# flight finish instead of cutting it off, and the next episode follows the
+# new model (mecha-graph/src/holds.rs). Unused when the directory does not
+# exist; set it empty to turn holds off.
+export MECHA_GRAPH_HOLDS_DIR="${MECHA_GRAPH_HOLDS_DIR-$HOME/.mecha/holds}"
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
 # the deterministic tiers already extracted; LLM-extracting them was the
 # single largest manufacturer of review-queue trivia. Opt back in with

@@ -803,11 +803,13 @@ dependencies = [
 name = "mecha-graph"
 version = "0.1.5"
 dependencies = [
+ "chrono",
  "clap",
  "crossterm",
  "mecha-graph-core",
  "ratatui",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

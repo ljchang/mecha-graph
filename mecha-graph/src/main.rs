@@ -1,6 +1,7 @@
 //! `mecha-graph` CLI.
 
 mod closure;
+mod holds;
 mod render;
 mod tui;
 
@@ -4111,12 +4112,29 @@ reject: it was never true (retracted; the class learns)"
             } else {
                 let sources: Vec<&str> = source.iter().map(|s| s.as_str()).collect();
                 let excluded: Vec<&str> = exclude_source.iter().map(|s| s.as_str()).collect();
-                mecha_graph_core::extract::extract_pending(
+                // Each episode holds a shared router, when a holds directory
+                // is named, so a model switch waits for the episode in
+                // flight rather than cutting it off (holds.rs).
+                let holds = holds::Holds::from_env(chat.base_url());
+                mecha_graph_core::extract::extract_pending_gated(
                     &conn,
                     &chat,
                     limit,
                     (!sources.is_empty()).then_some(&sources[..]),
                     (!excluded.is_empty()).then_some(&excluded[..]),
+                    &mut || -> mecha_graph_core::Result<Box<dyn std::any::Any>> {
+                        match &holds {
+                            Some(h) => h
+                                .enter("mecha-graph extract")
+                                .map(|held| Box::new(held) as Box<dyn std::any::Any>)
+                                .map_err(|e| {
+                                    mecha_graph_core::Error::Other(format!(
+                                        "mecha-graph: could not hold the router: {e}"
+                                    ))
+                                }),
+                            None => Ok(Box::new(())),
+                        }
+                    },
                 )?
             };
             // **scripts/nightly.sh parses this line** for its ALERTS count.

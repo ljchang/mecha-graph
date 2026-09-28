@@ -342,6 +342,25 @@ pub fn extract_pending(
     sources: Option<&[&str]>,
     exclude_sources: Option<&[&str]>,
 ) -> Result<ExtractReport> {
+    extract_pending_gated(conn, chat, limit, sources, exclude_sources, &mut || {
+        Ok(Box::new(()))
+    })
+}
+
+/// [`extract_pending`], with `gate` called before each episode and what it
+/// returns held until that episode is settled — a lease on a shared server,
+/// say, which the caller knows about and this crate does not. Each episode
+/// also [follows](ChatClient::follow) the server's loaded model, so a long
+/// run goes on with whatever model is loaded rather than the one it began on,
+/// and records each episode under the model that extracted it.
+pub fn extract_pending_gated(
+    conn: &Connection,
+    chat: &ChatClient,
+    limit: usize,
+    sources: Option<&[&str]>,
+    exclude_sources: Option<&[&str]>,
+    gate: &mut dyn FnMut() -> Result<Box<dyn std::any::Any>>,
+) -> Result<ExtractReport> {
     let rows = pending_episodes(conn, limit, sources, exclude_sources)?;
     let mut committed = commitment_block_set(conn)?;
 
@@ -354,6 +373,8 @@ pub fn extract_pending(
     };
 
     for (episode_id, _uid, body, occurred_at) in rows {
+        let _lease = gate()?;
+        chat.follow();
         let episode = Pending {
             id: episode_id,
             body: &body,
@@ -500,12 +521,12 @@ fn extract_settled(
         // `extract --charged`, re-run with `--episode` once the server is fixed.
         if matches!(e, Error::Server(_)) {
             report.errors += 1;
-            mark_attempted(conn, episode.id, &chat.model, &e)?;
+            mark_attempted(conn, episode.id, &chat.model(), &e)?;
             return Err(e);
         }
         server_answers(chat, system, schema, episode.id, &e)?;
         report.errors += 1;
-        mark_attempted(conn, episode.id, &chat.model, &e)?;
+        mark_attempted(conn, episode.id, &chat.model(), &e)?;
     }
     Ok(())
 }
@@ -707,7 +728,7 @@ fn extract_episode(
             "INSERT OR REPLACE INTO extract_state
                  (episode_id, model, prompt_version, candidates_created, failure, reason_recorded)
              VALUES (?1, ?2, ?3, ?4, NULL, 1)",
-            params![episode_id, chat.model, PROMPT_VERSION, created],
+            params![episode_id, chat.model(), PROMPT_VERSION, created],
         )?;
     }
     Ok(None)
