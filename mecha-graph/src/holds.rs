@@ -310,10 +310,18 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(v["taken_at"].as_str().unwrap()).is_ok(),
             "{v}"
         );
+        // mecha's "switch now" writes `<pid>-<uuid>.cancel` beside the hold —
+        // the extension replaced, not appended. Pinned as a literal name, so
+        // a drift on either side fails here rather than leaving it behind.
         let path = held.path.clone();
-        std::fs::write(path.with_extension("cancel"), b"switch now\n").unwrap();
+        let cancel = d.join(format!("{pid}-{}.cancel", &rest[..32]));
+        std::fs::write(&cancel, b"switch now\n").unwrap();
         drop(held);
-        assert!(!path.exists() && !path.with_extension("cancel").exists());
+        assert!(!path.exists(), "the hold outlived its episode");
+        assert!(
+            !cancel.exists(),
+            "the cancel file mecha writes was left behind"
+        );
     }
 
     /// An episode does not start under a pending switch: it waits until the

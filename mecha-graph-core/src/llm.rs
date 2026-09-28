@@ -679,14 +679,23 @@ impl ChatClient {
             .unwrap_or_else(|p| p.into_inner().clone())
     }
 
-    /// [`follow`](Self::follow), for a request about to be re-sent: when the
-    /// router cannot say what is loaded, wait for it to settle (polling every
-    /// `load_poll`, up to `load_wait`) instead of keeping the old name. The
-    /// unsure moments — nothing loaded, or the old model still loaded beside
-    /// the new one loading — are exactly the mid-swap window a retry lands
-    /// in, and re-sending the old selecting name there is what loaded it
-    /// back (found on review). If nothing settles in that time, nobody is
-    /// loading anything, and the current name is the right one to send.
+    /// Behind a router, set the name every request carries — called before
+    /// each one, first attempt and re-send alike — to what the router has
+    /// loaded now, so a long run goes on with the owner's pick instead of
+    /// loading its own back (2026-09-28).
+    ///
+    /// - One model resident: take it.
+    /// - Nothing resident but one model `downloading`: take that, the swap's
+    ///   target; a request naming it queues until it is up.
+    /// - Nothing resident, the list read in full (`Served::settling`): a swap
+    ///   between unloading one model and being asked for the next. Poll every
+    ///   `load_poll` for up to [`SETTLE_WAIT`] (capped by `load_wait`), then
+    ///   keep the current name — nobody is loading anything.
+    /// - Anything else keeps the current name at once: a router that did not
+    ///   answer, two resident, an empty list, a status this does not know.
+    ///   Waiting those out cost up to `load_wait` per request with the
+    ///   episode's hold held (found on review). Two resident is a swap window
+    ///   too, but only off `--models-max 1`, where a name is a guess anyway.
     fn follow_settled(&self) {
         if !self.follows {
             return;

@@ -87,9 +87,13 @@ EXTRACT_MODEL="${EXTRACT_MODEL:-gemma4:e4b}"
 # Extraction holds a shared model router one episode at a time, in the holds
 # directory mecha's model switch waits on, so a switch lets the episode in
 # flight finish instead of cutting it off, and the next episode follows the
-# new model (mecha-graph/src/holds.rs). Unused when the directory does not
-# exist; set it empty to turn holds off.
-export MECHA_GRAPH_HOLDS_DIR="${MECHA_GRAPH_HOLDS_DIR-$HOME/.mecha/holds}"
+# new model (mecha-graph/src/holds.rs). Defaulted only where mecha has made
+# that directory — elsewhere there is no switch to wait on, and a default
+# naming a missing directory would read as a guard switched off. Set it in
+# nightly.env to point elsewhere, or empty to turn holds off.
+if [ -z "${MECHA_GRAPH_HOLDS_DIR+set}" ] && [ -d "$HOME/.mecha/holds" ]; then
+    export MECHA_GRAPH_HOLDS_DIR="$HOME/.mecha/holds"
+fi
 # Calendar is 65% of the corpus and its bodies are titles + attendee lists
 # the deterministic tiers already extracted; LLM-extracting them was the
 # single largest manufacturer of review-queue trivia. Opt back in with

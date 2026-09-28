@@ -133,8 +133,9 @@ isolated.
   in the file protocol a model switch waits on
   (`mecha-graph/src/holds.rs`). A switch then lets the episode in flight
   finish, and an episode doesn't start while one is pending.
-  - `scripts/nightly.sh` defaults it to `~/.mecha/holds`. Set it empty to turn
-    holds off; a named directory that doesn't exist is said once per run.
+  - `scripts/nightly.sh` defaults it to `~/.mecha/holds` only where that
+    directory exists. Set it empty in `nightly.env` to turn holds off; a
+    named directory that doesn't exist is said once per run.
   - A switch still pending after 30 minutes, or a switch file that can't be
     read for 10, stops extraction for the night with an error. The episodes
     stay pending.
