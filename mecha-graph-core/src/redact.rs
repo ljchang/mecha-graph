@@ -586,23 +586,27 @@ fn purge_one(
                 // count is restated and the belief stays open.
                 None => {
                     let co = survivors.len() as i64;
-                    if co < crate::linkers::NPMI_MIN_COOCCUR {
-                        if !crate::fact::is_user_verified(conn, *fid)? {
-                            crate::fact::close_valid_time(conn, fuid, None)?;
-                            let payload = serde_json::json!({
-                                "class": "npmi", "reason": "redacted_contributor",
-                                "shared_now": co,
-                                "npmi_min_cooccur": crate::linkers::NPMI_MIN_COOCCUR,
-                            });
-                            crate::ledger::log_event(
-                                conn,
-                                "belief_decayed",
-                                Some(fuid),
-                                Some(&payload.to_string()),
-                            )?;
-                            rep.derived_closed += 1;
-                        }
+                    let closes = co < crate::linkers::NPMI_MIN_COOCCUR
+                        && !crate::fact::is_user_verified(conn, *fid)?;
+                    if closes {
+                        crate::fact::close_valid_time(conn, fuid, None)?;
+                        let payload = serde_json::json!({
+                            "class": "npmi", "reason": "redacted_contributor",
+                            "shared_now": co,
+                            "npmi_min_cooccur": crate::linkers::NPMI_MIN_COOCCUR,
+                        });
+                        crate::ledger::log_event(
+                            conn,
+                            "belief_decayed",
+                            Some(fuid),
+                            Some(&payload.to_string()),
+                        )?;
+                        rep.derived_closed += 1;
                     } else {
+                        // Open — the corpus too small to compute over, or the
+                        // owner verified it and the hold keeps it open under
+                        // the floor — so it states the count it has now,
+                        // never one only the redacted episode made true.
                         let statement: String = conn.query_row(
                             "SELECT statement FROM fact WHERE id = ?1",
                             params![fid],
@@ -1745,6 +1749,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, before);
+    }
+
+    /// A belief the owner verified stays open under the floor (the hold),
+    /// but still states the count it has now.
+    #[test]
+    fn a_verified_belief_under_the_floor_stays_open_and_restates_its_count() {
+        let conn = open_memory().unwrap();
+        let (uid, _) = derived_belief(&conn, 3);
+        conn.execute(
+            "INSERT INTO fact_observation (fact_id, episode_id, observed_at, kind, method, confidence)
+             SELECT id, NULL, '2026-09-01', 'verified', 'user', 1.0 FROM fact WHERE uid = ?1",
+            params![uid],
+        )
+        .unwrap();
+        let rep = redact_source(&conn, "agent:mecha", "sess-2", false).unwrap();
+        assert_eq!((rep.rederived, rep.derived_closed), (1, 0));
+        let (statement, closed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT statement, valid_to FROM fact WHERE uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(closed.is_none(), "the owner's hold was overridden");
+        assert!(statement.contains("(2 shared episodes"), "{statement}");
     }
 
     /// Re-derived means the statistic too: a belief that still clears the
