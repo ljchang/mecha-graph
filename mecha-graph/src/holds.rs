@@ -7,7 +7,7 @@
 //! for every run that holds the router (mecha's D13); a client that holds
 //! nothing is cut off mid-request and, retrying, loads its model back. On
 //! 2026-09-28 a nightly extraction did exactly that to the owner's switch.
-//! Following the router per episode (`ChatClient::follow`) makes the next
+//! Following the router on every request (`ChatClient::follow_settled`) makes the next
 //! episode use the new model; the hold is what keeps a switch from landing
 //! mid-episode, so one episode is answered by one model.
 //!
@@ -35,10 +35,10 @@ use std::time::Duration;
 const POLL: Duration = Duration::from_millis(500);
 
 /// How long a switch file nobody can read is waited on before extraction
-/// stops and says so. A live switch is waited on without limit — it ends, or
-/// its switcher dies and stops counting — but an unreadable file names no
-/// switcher to outlive, so without a bound it would hang the whole nightly
-/// run, which then reads as neither clean nor charged (found on review).
+/// stops and says so. An unreadable file names no switcher to outlive, so
+/// without a bound it would hang the whole nightly run, which then reads as
+/// neither clean nor charged (found on review). A live switch has its own,
+/// longer bound ([`LIVE_LIMIT`]).
 /// Stopping is still the fail-closed direction: nothing runs under a switch
 /// that might be real, and the run is retried the next night.
 const UNREADABLE_LIMIT: Duration = Duration::from_secs(600);
@@ -59,8 +59,10 @@ enum Pending {
     /// A switch by a live process, to this model.
     Live(String),
     /// A file that exists and cannot be read as a switch — pending, the
-    /// fail-closed way, but only for [`UNREADABLE_LIMIT`].
-    Unreadable,
+    /// fail-closed way, but only for [`UNREADABLE_LIMIT`] — and why: "not
+    /// JSON", a permission error and a transient I/O error need different
+    /// fixes, and only the first is `cancel-switch`'s (found on review).
+    Unreadable(String),
 }
 
 pub struct Holds {
@@ -159,17 +161,24 @@ impl Holds {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pending::None,
-            Err(_) => return Pending::Unreadable,
+            Err(e) => return Pending::Unreadable(format!("cannot be read ({e})")),
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return Pending::Unreadable;
+        let v = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                return Pending::Unreadable(format!("is not a switch file mecha wrote ({e})"))
+            }
         };
         let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) else {
-            return Pending::Unreadable;
+            return Pending::Unreadable("has no numeric `pid`".into());
         };
         match alive(pid) {
             Some(false) => return Pending::None,
-            None => return Pending::Unreadable,
+            None => {
+                return Pending::Unreadable(
+                    "names a switcher this host cannot check (no /proc)".into(),
+                )
+            }
             Some(true) => {}
         }
         Pending::Live(
@@ -199,8 +208,9 @@ impl Holds {
     }
 
     /// Hold the router for one episode, first waiting out any switch that is
-    /// pending — without limit, as every mecha run does: the switch is the
-    /// owner's, and it ends, or its switcher dies and it stops counting.
+    /// pending — up to [`LIVE_LIMIT`] for a live one and [`UNREADABLE_LIMIT`]
+    /// for a file nobody can read, then stopping with an error that says
+    /// which.
     pub fn enter(&self, what: &str) -> std::io::Result<Held> {
         self.enter_within(what, UNREADABLE_LIMIT, LIVE_LIMIT)
     }
@@ -226,20 +236,21 @@ impl Holds {
                     Pending::Live(to) => {
                         eprintln!("mecha-graph: the router is switching to {to}; waiting for it")
                     }
-                    _ => eprintln!(
-                        "mecha-graph: {} cannot be read; waiting for it to clear",
+                    Pending::Unreadable(why) => eprintln!(
+                        "mecha-graph: {} {why}; waiting for it to clear",
                         self.switch_path().display()
                     ),
+                    Pending::None => {}
                 }
             }
             while state != Pending::None {
-                if state == Pending::Unreadable {
+                if let Pending::Unreadable(why) = &state {
                     let since = *unreadable_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= unreadable_limit {
                         return Err(std::io::Error::other(format!(
-                            "{} has been unreadable for {}s, so whether a model switch is \
-                             pending is unknown — stopping rather than extract under one. \
-                             `mecha model cancel-switch` withdraws it.",
+                            "{} {why}, and has for {}s, so whether a model switch is pending \
+                             is unknown — stopping rather than extract under one. If no switch \
+                             is in progress, `mecha model cancel-switch` withdraws the file.",
                             self.switch_path().display(),
                             unreadable_limit.as_secs()
                         )));
@@ -349,7 +360,7 @@ mod tests {
         std::fs::write(h.switch_path(), dead.to_string()).unwrap();
         assert_eq!(h.pending(), Pending::None);
         std::fs::write(h.switch_path(), b"not json").unwrap();
-        assert_eq!(h.pending(), Pending::Unreadable);
+        assert!(matches!(h.pending(), Pending::Unreadable(_)));
         // The two keys read out of mecha's switch file, pinned: a pid that is
         // not a number is unreadable, never "no switch".
         let mecha_shaped = serde_json::json!({
@@ -360,7 +371,7 @@ mod tests {
         assert_eq!(h.pending(), Pending::Live("b".into()));
         let retyped = serde_json::json!({ "pid": std::process::id().to_string(), "to": "b" });
         std::fs::write(h.switch_path(), retyped.to_string()).unwrap();
-        assert_eq!(h.pending(), Pending::Unreadable);
+        assert!(matches!(h.pending(), Pending::Unreadable(_)));
     }
 
     /// An unreadable switch file is waited on, then stops extraction with an
