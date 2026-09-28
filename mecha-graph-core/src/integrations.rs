@@ -70,6 +70,13 @@ pub struct LlmConfig {
     /// Defaults to `llama-server` on PATH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_bin: Option<String>,
+    /// A directory of holds on a shared model router (`~/.mecha/holds`, for
+    /// mecha's): `extract` holds the router there one episode at a time, so a
+    /// model switch waits for the episode in flight. An opt-in by being
+    /// configured, on the `model_path` precedent (ARCHITECTURE.md); unset,
+    /// nothing is held. A leading `~/` is the home directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holds_dir: Option<PathBuf>,
     /// Extra flags for a managed server, appended after the defaults so they
     /// can override them.
     #[serde(default, skip_serializing_if = "Option::is_none")]

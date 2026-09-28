@@ -11,10 +11,15 @@
 //! episode use the new model; the hold is what keeps a switch from landing
 //! mid-episode, so one episode is answered by one model.
 //!
-//! **Off unless asked.** The directory comes from `MECHA_GRAPH_HOLDS_DIR`
-//! (`scripts/nightly.sh` points it at `~/.mecha/holds`) and must already
-//! exist — this never creates one, and knows nothing else about mecha. The
-//! core crate knows nothing of it either (lib.rs rule 1): it takes a gate.
+//! **Off unless configured, and never degrading once it is.** The directory
+//! is `[llm] holds_dir` in `~/.mecha-graph/config.toml` — a config key, not
+//! an environment variable, by ARCHITECTURE.md's rule for an opt-in on mecha:
+//! an environment variable is lost by the next shell that did not export it,
+//! which is how a hand-run `extract` would have gone unheld (found on
+//! review). Configured, a directory that does not exist or a config that
+//! cannot be read stops extraction rather than running unheld. This never
+//! creates the directory and knows nothing else about mecha; the core crate
+//! knows nothing of it either (lib.rs rule 1): it takes a gate.
 //!
 //! **The wire format is mecha's, and pinned by a test on each side**
 //! (`the_files_are_the_ones_mecha_reads` here). A hold is
@@ -120,31 +125,52 @@ fn alive(pid: u64) -> Option<bool> {
 }
 
 impl Holds {
-    /// From `MECHA_GRAPH_HOLDS_DIR`, when it names a directory that exists.
-    pub fn from_env(base_url: &str) -> Option<Holds> {
-        Holds::from_dir(std::env::var_os("MECHA_GRAPH_HOLDS_DIR"), base_url)
+    /// From `[llm] holds_dir`, read now — per episode, so a config edited
+    /// mid-run is honoured. `Ok(None)`: not configured, nothing to hold.
+    pub fn from_config(base_url: &str) -> Result<Option<Holds>, String> {
+        let configured = mecha_graph_core::integrations::load_config()
+            .map(|c| c.llm.holds_dir)
+            .map_err(|e| e.to_string());
+        Holds::from_setting(
+            configured,
+            std::env::var_os("HOME").map(PathBuf::from),
+            base_url,
+        )
     }
 
-    /// The pure half of [`from_env`](Self::from_env): off when unset, empty,
-    /// or naming no existing directory — which is what `nightly.sh`'s default
-    /// gives a box where mecha never made `~/.mecha/holds`.
-    fn from_dir(value: Option<std::ffi::OsString>, base_url: &str) -> Option<Holds> {
-        let dir = PathBuf::from(value.filter(|v| !v.is_empty())?);
-        if !dir.is_dir() {
-            // Named and missing: fine on a box without mecha, and a silent
-            // guard-off if the directory ever moved — so said, once per run
-            // (found on review).
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "mecha-graph: MECHA_GRAPH_HOLDS_DIR is {} but no such directory exists — \
-                     extracting without holds",
+    /// The pure half of [`from_config`](Self::from_config). Configured, the
+    /// guard never degrades: a directory that is not there, or a config that
+    /// cannot be read, is an `Err` that stops extraction — never a run that
+    /// goes unheld and says nothing (ARCHITECTURE.md's rule for an opt-in).
+    fn from_setting(
+        configured: Result<Option<PathBuf>, String>,
+        home: Option<PathBuf>,
+        base_url: &str,
+    ) -> Result<Option<Holds>, String> {
+        let Some(dir) = configured.map_err(|e| {
+            format!("the config could not be read ({e}), so whether to hold the router is unknown")
+        })?
+        else {
+            return Ok(None);
+        };
+        let dir = match (dir.strip_prefix("~"), home) {
+            (Ok(rest), Some(home)) => home.join(rest),
+            (Ok(_), None) => {
+                return Err(format!(
+                    "[llm] holds_dir is {} and HOME is not set",
                     dir.display()
-                );
+                ))
             }
-            return None;
+            (Err(_), _) => dir,
+        };
+        if !dir.is_dir() {
+            return Err(format!(
+                "[llm] holds_dir is {}, which is not a directory — refusing to extract \
+                 unheld; create it, or remove the key to extract without holds",
+                dir.display()
+            ));
         }
-        Some(Holds::new(dir, base_url))
+        Ok(Some(Holds::new(dir, base_url)))
     }
 
     fn new(dir: PathBuf, base_url: &str) -> Holds {
@@ -432,15 +458,39 @@ mod tests {
         assert!(err.to_string().contains("pending for"), "{err}");
     }
 
-    /// Off unless the directory is named, non-empty and exists — the
-    /// set-but-missing case is what nightly.sh's default gives a box without
-    /// mecha. Pure, so no test touches the process environment.
+    /// Off only when not configured. Configured, a missing directory or an
+    /// unreadable config stops extraction rather than running unheld, and a
+    /// leading `~` is the home directory. Pure, so no test touches the
+    /// process environment or the real config.
     #[test]
-    fn holds_are_off_without_an_existing_directory() {
+    fn holds_are_off_only_when_not_configured() {
         let base = "http://127.0.0.1:8080";
-        assert!(Holds::from_dir(None, base).is_none());
-        assert!(Holds::from_dir(Some("".into()), base).is_none());
-        assert!(Holds::from_dir(Some("/nonexistent/mecha/holds".into()), base).is_none());
-        assert!(Holds::from_dir(Some(dir("on").into_os_string()), base).is_some());
+        let home = Some(std::env::temp_dir());
+        assert!(matches!(
+            Holds::from_setting(Ok(None), home.clone(), base),
+            Ok(None)
+        ));
+        let missing = Holds::from_setting(
+            Ok(Some("/nonexistent/mecha/holds".into())),
+            home.clone(),
+            base,
+        );
+        assert!(missing
+            .err()
+            .unwrap()
+            .contains("refusing to extract unheld"));
+        let unreadable = Holds::from_setting(Err("bad toml".into()), home.clone(), base);
+        assert!(unreadable.err().unwrap().contains("could not be read"));
+        let on = dir("on");
+        assert!(matches!(
+            Holds::from_setting(Ok(Some(on.clone())), home, base),
+            Ok(Some(_))
+        ));
+        let name = on.file_name().unwrap().to_owned();
+        let tilde = PathBuf::from("~").join(&name);
+        let h = Holds::from_setting(Ok(Some(tilde)), on.parent().map(PathBuf::from), base)
+            .unwrap()
+            .expect("~ resolved against home");
+        assert_eq!(h.dir, on);
     }
 }

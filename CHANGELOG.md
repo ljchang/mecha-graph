@@ -12,9 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Extraction follows a router's loaded model, and holds it one episode at
   a time.** Every request names the model the router has loaded now (a
   request mid-swap waits up to 15 s for it to settle). Each episode is
-  recorded under the model that extracted it. With `MECHA_GRAPH_HOLDS_DIR`
-  naming an existing directory (`nightly.sh` defaults it to
-  `~/.mecha/holds`), each episode takes a hold a model switch waits on.
+  recorded under the model that extracted it. With `[llm] holds_dir` set
+  (to `~/.mecha/holds`, beside mecha), each episode takes a hold a model
+  switch waits on.
   Before this, a night's extraction resolved one model at startup, named it
   for hours, and on 2026-09-28 undid the owner's switch to another by
   retrying a request the switch had cut off.

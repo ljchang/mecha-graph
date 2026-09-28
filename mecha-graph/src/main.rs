@@ -4121,19 +4121,20 @@ reject: it was never true (retracted; the class learns)"
                     limit,
                     (!sources.is_empty()).then_some(&sources[..]),
                     (!excluded.is_empty()).then_some(&excluded[..]),
-                    // Asked per episode, so a holds directory made mid-run —
-                    // mecha's first switch on a box that had none — is
-                    // noticed (found on review).
+                    // `[llm] holds_dir`, read per episode: a config edited
+                    // mid-run is honoured, and a configured directory that
+                    // is missing stops the run rather than going unheld.
                     &mut || -> mecha_graph_core::Result<Box<dyn std::any::Any>> {
-                        match &holds::Holds::from_env(chat.base_url()) {
+                        let hold_err = |e: String| {
+                            mecha_graph_core::Error::Other(format!(
+                                "mecha-graph: could not hold the router: {e}"
+                            ))
+                        };
+                        match holds::Holds::from_config(chat.base_url()).map_err(hold_err)? {
                             Some(h) => h
                                 .enter("mecha-graph extract")
                                 .map(|held| Box::new(held) as Box<dyn std::any::Any>)
-                                .map_err(|e| {
-                                    mecha_graph_core::Error::Other(format!(
-                                        "mecha-graph: could not hold the router: {e}"
-                                    ))
-                                }),
+                                .map_err(|e| hold_err(e.to_string())),
                             None => Ok(Box::new(())),
                         }
                     },

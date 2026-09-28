@@ -130,14 +130,16 @@ isolated.
   for the router to settle. So a long run goes on with the model the owner
   picked, instead of loading its own back, and each episode is recorded
   under the model that extracted it.
-- **`MECHA_GRAPH_HOLDS_DIR`: holding a shared router per episode.** When it
-  names an existing directory, `extract` takes a hold there for each episode,
-  in the file protocol a model switch waits on
-  (`mecha-graph/src/holds.rs`). A switch then lets the episode in flight
-  finish, and an episode doesn't start while one is pending.
-  - `scripts/nightly.sh` defaults it to `~/.mecha/holds` only where that
-    directory exists. Set it empty in `nightly.env` to turn holds off; a
-    named directory that doesn't exist is said once per run.
+- **`[llm] holds_dir`: holding a shared router per episode.** With
+  `holds_dir = "~/.mecha/holds"` in `~/.mecha-graph/config.toml`, `extract`
+  takes a hold there for each episode, in the file protocol a model switch
+  waits on (`mecha-graph/src/holds.rs`). A switch then lets the episode in
+  flight finish, and an episode doesn't start while one is pending.
+  - It's a config key, not an environment variable, so every run honours it,
+    not only the nightly (ARCHITECTURE.md's rule for an opt-in on mecha).
+  - Unset, nothing is held. Set, it never degrades: a directory that isn't
+    there, or a config that can't be read, stops extraction with an error
+    instead of running unheld.
   - A switch still pending after 30 minutes, or a switch file that can't be
     read for 10, stops extraction for the night with an error. The episodes
     stay pending.

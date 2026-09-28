@@ -711,6 +711,27 @@ impl ChatClient {
             // review, twice). Those keep the current name, and the request's
             // own error handling is what they need.
             if served.resident.is_none() && !served.settling {
+                // A router this could not read at all leaves the name as it
+                // was — on a re-send, the one name that can undo a switch — so
+                // that is said, once per run, rather than leaving the night's
+                // log clean over a guard that did nothing (found on review).
+                if !served.props_read || served.models_error.is_some() {
+                    static SAID: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "mecha-graph: could not read what {} has loaded ({}) — requests \
+                             keep naming '{}' until it answers",
+                            self.base_url(),
+                            served
+                                .props_error
+                                .as_deref()
+                                .or(served.models_error.as_deref())
+                                .unwrap_or("no reason recorded"),
+                            self.model()
+                        );
+                    }
+                }
                 return;
             }
             // Nothing resident but one model downloading is a swap whose
@@ -794,8 +815,8 @@ impl ChatClient {
         })
     }
 
-    /// Does the server answer *this* request — same model, same system
-    /// prompt, same `response_format` — with nothing in it? One completion of
+    /// Does the server answer *this* request — same system prompt, same
+    /// `response_format`, the model loaded now (below) — with nothing in it? One completion of
     /// an empty input under a short timeout.
     ///
     /// This is how a failed input is charged: an input that fails while the
@@ -815,6 +836,13 @@ impl ChatClient {
     /// Sent once, with no retries: it is a liveness check, so its bound is
     /// `canary_timeout` and nothing more, and failing it stops the run with
     /// nothing marked — the side to err on.
+    ///
+    /// Like every request it names the model the router has loaded *now*
+    /// (`follow_settled`), which after a switch mid-episode is not the one
+    /// the failing request went to — so it can answer where that model did
+    /// not (a smaller context, say), and the episode is charged as its own.
+    /// Recorded under the model it failed on, and re-runnable with
+    /// `--episode`; sending the stale name instead would load it back.
     pub fn canary(&self, system: &str, response_format: serde_json::Value) -> Result<()> {
         self.post_within(
             system,
