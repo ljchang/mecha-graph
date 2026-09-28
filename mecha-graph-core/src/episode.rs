@@ -899,7 +899,19 @@ fn undo_apply(
                     )?;
                 }
             }
-            restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])?;
+            // The episode row first, and it must land. Its id is a plain
+            // rowid, reused once freed: if a newer episode holds it now, an
+            // ignored insert would restore every child row below onto *that*
+            // episode — this one's transcript and beliefs filed under an
+            // unrelated note. Refused instead; the savepoint undoes the
+            // tombstone lift, and the entry stays for the operator to see.
+            if restore_rows(conn, "episode", EPISODE_COLS, &snap["episode"])? == 0 {
+                return Err(crate::error::Error::Other(format!(
+                    "cannot undo: episode id {} now belongs to another episode, so its \
+                     rows would be restored onto the wrong one",
+                    snap["episode"][0][0]
+                )));
+            }
             restore_rows(conn, "episode_raw", "episode_id, content", &snap["raw"])?;
             restore_rows(conn, "mention", MENTION_COLS, &snap["mentions"])?;
             restore_rows(conn, "episode_annotation", ANN_COLS, &snap["annotations"])?;

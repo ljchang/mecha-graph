@@ -48,8 +48,12 @@
 //! `orphaned_nodes`, never deleted, because a node can be the owner's own
 //! (an accepted task) whatever minted it; belief changes the episode caused
 //! in *other* facts (a correction's supersede, a class demotion), which are
-//! the owner's rulings and are not reverted; and `query_log`, which holds
-//! query text with no link to any episode.
+//! the owner's rulings and are not reverted; `query_log`, which holds
+//! query text with no link to any episode; and **every copy of the database
+//! outside this file** — the `graph.db.pre-*.bak` backups and `backups/`, a
+//! `fork` (a full copy under its own key), and a `decrypt --out` plaintext
+//! snapshot. Nothing here can reach them, [`scrub`] included, and the report
+//! cannot know they exist; removing them is the operator's job.
 //!
 //! The logical purge is not the physical one. Deleted rows leave bytes in
 //! free pages and the WAL, and an FTS5 delete only appends a tombstone to
@@ -530,7 +534,18 @@ fn purge_undo(
             Some((s, at)) => (Some(s), Some(at)),
             None => (None, None),
         };
-        if let Some(v) = snapshot.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        // A snapshot that cannot be read cannot be purged *of* anything: the
+        // id that reaches its corrections and the nodes to re-derive are
+        // inside it. An error, so the savepoint rolls back and the report
+        // never counts it as taken.
+        let parsed =
+            match snapshot {
+                Some(s) => Some(serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                    crate::error::Error::Parse(format!("undo snapshot {log_id}: {e}"))
+                })?),
+                None => None,
+            };
+        if let Some(v) = parsed {
             // Snapshot rows are column arrays in EPISODE_COLS / FACT_COLS
             // order: uid is column 1 of both.
             let ep_uid = v["episode"][0][1].as_str().unwrap_or_default().to_string();
@@ -1255,6 +1270,53 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// The deleted episode's rowid taken by a newer episode: undo refuses,
+    /// rather than restore its rows onto the one that holds the id now.
+    #[test]
+    fn undo_refuses_when_the_episode_id_was_taken_and_restores_nothing() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-4");
+        assert!(redact_episode_undoable(&conn, &f.uid).unwrap());
+        conn.execute(
+            "INSERT INTO episode (id, uid, source, source_id, body, occurred_at, content_hash)
+             VALUES (?1, 'newcomer', 'note', 'n-1', 'an unrelated note', '2026-09-28', 'h')",
+            params![f.id],
+        )
+        .unwrap();
+        let raw_before = count(&conn, "SELECT COUNT(*) FROM episode_raw");
+        assert!(crate::episode::undo_last(&conn).is_err());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM episode_raw"), raw_before);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM episode_tombstone WHERE source_id = 'b-4'"
+            ),
+            1,
+            "the tombstone lift was rolled back"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM undo_log WHERE action = 'delete'"
+            ),
+            1
+        );
+    }
+
+    /// An unreadable snapshot is an error, never a purge that reports it taken.
+    #[test]
+    fn an_unreadable_undo_snapshot_stops_the_redaction() {
+        let conn = open_memory().unwrap();
+        let f = fixture(&conn, "bee.conversation", "b-5");
+        conn.execute(
+            "INSERT INTO undo_log (action, ref_uid, snapshot) VALUES ('delete', ?1, '{not json')",
+            params![f.uid],
+        )
+        .unwrap();
+        assert!(redact_uid(&conn, &f.uid).is_err());
+        assert!(crate::episode::get_episode(&conn, f.id).unwrap().is_some());
     }
 
     #[test]
