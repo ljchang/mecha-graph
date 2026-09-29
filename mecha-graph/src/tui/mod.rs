@@ -795,6 +795,21 @@ fn event_loop(
     }
 }
 
+/// What the TUI says when the embedding server is not ready — the reason
+/// kept, because "press again" is advice a permanently broken server never
+/// satisfies (found on review).
+fn embed_status(health: &mecha_graph_core::embed::EmbedHealth) -> String {
+    use mecha_graph_core::embed::EmbedHealth;
+    match health {
+        EmbedHealth::Ready => "embedding server ready".into(),
+        EmbedHealth::Absent(why) => format!("no embedding server ({why})"),
+        EmbedHealth::Failing(why) => format!(
+            "embedding server not ready ({why}) — if it is starting, try again in a moment; \
+             if this persists, `systemctl --user status llama-embed`"
+        ),
+    }
+}
+
 /// How long a Ctrl-E waits on the embedding server inside the key handler.
 /// Long enough for a server that is already up; a cold one is woken by the
 /// attempt and caught by the next Ctrl-E.
@@ -891,10 +906,7 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
         _ => None,
     };
     let unavailable = deep && embedder.is_none();
-    let waking = matches!(
-        health,
-        Some(mecha_graph_core::embed::EmbedHealth::Failing(_))
-    );
+    let why = health.as_ref().map(embed_status).unwrap_or_default();
     let started = std::time::Instant::now();
     let run = |embedder| {
         router::query(
@@ -929,16 +941,7 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
             "semantic search failed ({e}) — showing {} keyword items instead",
             pack.items.len()
         ),
-        (None, true) if waking => format!(
-            "embedding server starting — press Ctrl-E again in a moment; showing {} \
-             keyword items",
-            pack.items.len()
-        ),
-        (None, true) => format!(
-            "semantic search unavailable — no embedding server answering; showing {} \
-             keyword items",
-            pack.items.len()
-        ),
+        (None, true) => format!("{why}; showing {} keyword items", pack.items.len()),
         (None, false) => format!(
             "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
             pack.items.len(),
@@ -1034,11 +1037,18 @@ impl App {
             return Ok(());
         };
         let e = mecha_graph_core::embed::Embedder::default();
-        if !e.available() {
-            self.review.group_view = false;
-            self.review.cluster_view = true;
-            self.status = "embedding server not answering — groups need vectors".into();
-            return Ok(());
+        // The key handler's budget, not the 20 s one — this runs after every
+        // verdict while group view is on, and the server sleeps (found on
+        // review). A sleeping server is woken by the probe and ready for the
+        // next `g`.
+        match e.health_within(TUI_PROBE_BUDGET) {
+            mecha_graph_core::embed::EmbedHealth::Ready => {}
+            health => {
+                self.review.group_view = false;
+                self.review.cluster_view = true;
+                self.status = format!("groups need vectors — {}", embed_status(&health));
+                return Ok(());
+            }
         }
         self.review.groups = mecha_graph_core::similar::groups_for_class(
             &self.conn,

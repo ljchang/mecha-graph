@@ -277,7 +277,8 @@ impl Embedder {
     /// loaded model: [`EmbedHealth::Absent`] at once. Everything else — a 503
     /// while it loads, a reset or timeout from the socket's front end, a 5xx,
     /// a bad status line — is something there, polled to the deadline and
-    /// reported as [`EmbedHealth::Failing`] if it never comes good.
+    /// reported as [`EmbedHealth::Failing`] if it never comes good. A 4xx
+    /// other than 404 is `Failing` at once: waiting will not fix it.
     pub fn health_within(&self, budget: Duration) -> EmbedHealth {
         let deadline = std::time::Instant::now() + budget;
         let mut last = String::from("no answer");
@@ -294,6 +295,12 @@ impl Embedder {
                 Err(ureq::Error::Status(404, _)) => {
                     return EmbedHealth::Absent("answers /health 404 — not llama-server".into())
                 }
+                // Any other 4xx (a proxy's 401, a 400) will not come good by
+                // waiting: there, and failing, said at once — `llm.rs`'s
+                // `Unknown` on the first non-404 status (found on review).
+                Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
+                    return EmbedHealth::Failing(format!("/health answered HTTP {code}"))
+                }
                 Err(ureq::Error::Transport(t))
                     if matches!(
                         t.kind(),
@@ -307,6 +314,9 @@ impl Embedder {
                 }
                 Err(e) => {
                     last = e.to_string();
+                    // Recomputed after the request, so a short budget (the
+                    // TUI's 2 s) is not overshot by a stale `left`.
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
                     std::thread::sleep(Duration::from_millis(250).min(left));
                 }
             }
@@ -1066,6 +1076,37 @@ mod tests {
             e.health_within(Duration::from_millis(800)),
             EmbedHealth::Failing(_)
         ));
+    }
+
+    /// A 4xx other than 404 will not come good by waiting — `Failing`, fast.
+    #[test]
+    fn a_401_is_failing_at_once() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            e.health_within(Duration::from_secs(10)),
+            EmbedHealth::Failing(_)
+        ));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     #[test]
