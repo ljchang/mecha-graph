@@ -1548,7 +1548,7 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
             let embedder = embed::Embedder::default();
             // A LOOKUP or AGGREGATE never reaches the vector arm: no probe,
             // and no on-demand model started for it.
-            let emb = (router::needs_vectors(&query, lens.scope) && embedder.available())
+            let emb = (router::needs_vectors(&conn, &query, lens.scope)? && embedder.available())
                 .then_some(&embedder);
             let pack = router::query_lens(&conn, emb, &query, k, budget, private, Some("cli.query"), lens)?;
             if want_json(cli_json, cli_text) {

@@ -1050,13 +1050,25 @@ impl App {
                 return Ok(());
             }
         }
-        self.review.groups = mecha_graph_core::similar::groups_for_class(
+        // The probe said ready, but the server can stop between it and the
+        // embed: an embedding failure is a status line here too, never an
+        // error out of the event loop (found on review).
+        self.review.groups = match mecha_graph_core::similar::groups_for_class(
             &self.conn,
             &e,
             &proposer,
             &predicate,
             mecha_graph_core::similar::GROUP_THRESHOLD,
-        )?;
+        ) {
+            Ok(groups) => groups,
+            Err(err @ mecha_graph_core::Error::Embed(_)) => {
+                self.review.group_view = false;
+                self.review.cluster_view = true;
+                self.status = format!("groups need vectors — embedding failed ({err})");
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         let len = self.review.groups.len();
         let sel = self.review.group_list.selected().unwrap_or(0);
         self.review.group_list.select(if len == 0 {

@@ -506,7 +506,8 @@ fn kg_search(
 
     // Probed only when the router will use vectors: a LOOKUP or AGGREGATE
     // would pay the budget and start the model for an answer from rollups.
-    let emb = (router::needs_vectors(query, scope) && embedder_ready(embedder)).then_some(embedder);
+    let emb = (router::needs_vectors(conn, query, scope)? && embedder_ready(embedder))
+        .then_some(embedder);
     // Same window for both readers, or the comparison spans eras.
     let window = match (args["since"].as_str(), args["until"].as_str()) {
         (None, None) => None,
@@ -1672,8 +1673,17 @@ mod tests {
         *LAST_NOT_READY.lock().unwrap() = Some(std::time::Instant::now());
         assert!(!embedder_ready(&e), "a fresh 'not ready' is believed");
 
-        *LAST_NOT_READY.lock().unwrap() = std::time::Instant::now()
-            .checked_sub(NOT_READY_MEMO + std::time::Duration::from_secs(1));
+        // `Instant` counts from boot: on a machine up for less than the
+        // window there is no instant old enough, and setting `None` would
+        // test the no-memo branch while passing as if it tested expiry
+        // (found on review). Said, and skipped.
+        let Some(past) = std::time::Instant::now()
+            .checked_sub(NOT_READY_MEMO + std::time::Duration::from_secs(1))
+        else {
+            eprintln!("skipping the expiry half: uptime is shorter than NOT_READY_MEMO");
+            return;
+        };
+        *LAST_NOT_READY.lock().unwrap() = Some(past);
         assert!(embedder_ready(&e), "an expired one is probed again");
         assert!(LAST_NOT_READY.lock().unwrap().is_none());
     }

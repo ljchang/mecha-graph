@@ -71,9 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake the model for nothing); it probes on each Ctrl-E, and says "semantic
   search unavailable" rather than labelling keyword results "semantic".
   Permanent errors — a malformed URL, an unknown scheme — are a fast "no"; an
-  unresolvable host is polled, since a resolver blip is transient. A LOOKUP
-  or AGGREGATE query (`kg_search`, `mecha-graph query`) is answered from
-  rollups and no longer probes, so it never starts the model.
+  unresolvable host is polled, since a resolver blip is transient. A query
+  that will embed nothing — an AGGREGATE over facts, or a tag-only query — no
+  longer probes (`kg_search`, `mecha-graph query`, and the gold eval, so the
+  guard scores the path production runs), so it never starts the model; a
+  LOOKUP still probes, because it can fall through to recall.
   `Embedder::health_within` keeps "nothing here" apart from "there and
   failing", so `mecha-graph embed` no longer advises starting a second server
   over one that holds the port, and the TUI's group view and semantic search
