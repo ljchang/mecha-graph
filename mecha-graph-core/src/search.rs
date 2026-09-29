@@ -165,6 +165,10 @@ pub fn known_sources(conn: &Connection) -> Result<Vec<String>> {
 /// filter-first); `include_private` gates the §10 sensitivity tiers (default
 /// retrieval excludes private+).
 #[allow(clippy::too_many_arguments)]
+///
+/// `Some(embedder)` means the caller already probed it with
+/// [`Embedder::available`]; a failure to embed is an error, not an empty
+/// vector arm.
 pub fn hybrid_episodes(
     conn: &Connection,
     embedder: Option<&Embedder>,
@@ -239,6 +243,9 @@ pub fn hybrid_episodes(
 /// enough that it never displaces a reviewed fact of equal relevance.
 pub const SHADOW_DISCOUNT: f64 = 0.8;
 
+/// `Some(embedder)` means the caller already probed it with
+/// [`Embedder::available`]; a failure to embed is an error, not an empty
+/// vector arm.
 pub fn hybrid_facts(
     conn: &Connection,
     embedder: Option<&Embedder>,

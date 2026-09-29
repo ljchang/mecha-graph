@@ -59,11 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind a systemd socket (mecha's `scripts/llama/`), and a cold start takes
   ~4 s, so a sleeping server read as absent and semantic search, `kg_search`
   and `embed` fell back to keyword-only without a word. The probe now waits up
-  to 20 s (`embed::AVAILABLE_TIMEOUT`) and treats a 503 as a server loading —
-  `llm.rs`'s `Health::Loading` — polling it to the same deadline. Search no
+  to 20 s (`embed::AVAILABLE_TIMEOUT`); only a refused connection or a 404 is
+  a fast "no" — a 503 (loading), a reset, a timeout or a 5xx is something
+  there, polled to the same deadline, as `llm.rs`'s `health()` keeps them
+  apart. Search no
   longer re-probes per arm: the caller's gate is the probe, so one query waits
   at most once, and an embedder that dies mid-run is an error rather than a
-  silently empty vector arm.
+  silently empty vector arm. In the TUI that error is a status line over the
+  keyword results — a sleeping server never closes the session.
 
 - **LLM calls against a llama-server router** (mecha's :8080 from
   2026-09-27): `served_model` read the router's placeholder `/props` alias

@@ -865,23 +865,46 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
     }
     let embedder = if deep { app.embedder.as_ref() } else { None };
     let started = std::time::Instant::now();
-    let pack = router::query(
-        &app.conn,
-        embedder,
-        &q,
-        15,
-        6000,
-        app.search.show_private,
-        Some("tui.search"),
-    )?;
-    app.search.mode = if deep { "semantic" } else { "live" };
-    app.status = format!(
-        "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
-        pack.items.len(),
-        pack.intent,
-        app.search.mode,
-        started.elapsed().as_millis()
-    );
+    let run = |embedder| {
+        router::query(
+            &app.conn,
+            embedder,
+            &q,
+            15,
+            6000,
+            app.search.show_private,
+            Some("tui.search"),
+        )
+    };
+    // The embedder was probed once, at startup, and the server behind it
+    // sleeps after ten idle minutes — so a semantic search can fail on a
+    // stale `Some`. That is a status line and the keyword results, never an
+    // error out of the event loop: `reload_groups`'s convention, and the TUI
+    // is the correction channel a sleeping server must not close (found on
+    // review).
+    let (pack, semantic_failed) = match run(embedder) {
+        Ok(pack) => (pack, None),
+        Err(e) if embedder.is_some() => (run(None)?, Some(e)),
+        Err(e) => return Err(e),
+    };
+    app.search.mode = if deep && semantic_failed.is_none() {
+        "semantic"
+    } else {
+        "live"
+    };
+    app.status = match &semantic_failed {
+        Some(e) => format!(
+            "semantic search failed ({e}) — showing {} keyword items instead",
+            pack.items.len()
+        ),
+        None => format!(
+            "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
+            pack.items.len(),
+            pack.intent,
+            app.search.mode,
+            started.elapsed().as_millis()
+        ),
+    };
     let n = pack.ambiguous.len() + pack.items.len();
     app.search.list.select(if n == 0 {
         None

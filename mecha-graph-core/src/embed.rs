@@ -252,12 +252,11 @@ impl Embedder {
     /// and every caller that gates on it (semantic search per query,
     /// `kg_search`, `embed`) quietly degraded to keyword-only.
     ///
-    /// **A 503 is a server loading, not an absent one** — `llm.rs`'s
-    /// `Health::Loading`, and `docs/INTEGRATIONS.md`'s policy for the same
-    /// binary on :8080. Behind the socket the proxy waits for health itself,
-    /// but a hand-started server answers 503 for the whole load, so the probe
-    /// polls it to the same deadline rather than reading it as "no" in a
-    /// millisecond (found on review).
+    /// **Only "nothing here" is a fast no.** A refused connection or a 404
+    /// ends the probe at once; a 503 (loading — `llm.rs`'s `Health::Loading`,
+    /// `docs/INTEGRATIONS.md`'s policy for the same binary on :8080), a reset,
+    /// a timeout or a 5xx is something there, and is polled to the same
+    /// deadline (found on review).
     pub fn available(&self) -> bool {
         let deadline = std::time::Instant::now() + AVAILABLE_TIMEOUT;
         loop {
@@ -270,10 +269,19 @@ impl Embedder {
                 .call()
             {
                 Ok(_) => return true,
-                Err(ureq::Error::Status(503, _)) => {
-                    std::thread::sleep(Duration::from_millis(250).min(left));
+                // Nothing listening, or something that is not llama-server
+                // (ollama answers /health 404): absent, and said at once.
+                Err(ureq::Error::Status(404, _)) => return false,
+                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
+                    return false
                 }
-                Err(_) => return false,
+                // Everything else is something *there*: a 503 while it
+                // loads, a reset or a timeout from the socket's front end
+                // during a cold start, a 5xx. `llm.rs`'s `Health::Unknown`
+                // keeps "there and failing" apart from "nothing here" for
+                // the same reason (found on review), so it is waited out to
+                // the deadline, never read as absence in a millisecond.
+                Err(_) => std::thread::sleep(Duration::from_millis(250).min(left)),
             }
         }
     }
@@ -967,6 +975,59 @@ mod tests {
             e.available(),
             "a server that answers after 2.5 s is up, not absent"
         );
+    }
+
+    /// A socket front end that resets the probe's connection during a cold
+    /// start is a server on its way, not an absent one.
+    #[test]
+    fn available_waits_through_a_reset() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // First connection: accepted and dropped without a response.
+            if let Ok((conn, _)) = listener.accept() {
+                drop(conn);
+            }
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(e.available(), "a reset mid-start is not absence");
+    }
+
+    /// The other direction: nothing listening is "no", at once — not after
+    /// the whole deadline.
+    #[test]
+    fn available_is_a_fast_no_when_nothing_listens() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(!e.available());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     /// A hand-started llama-server answers `/health` 503 for the length of
