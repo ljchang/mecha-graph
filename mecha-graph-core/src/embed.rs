@@ -251,11 +251,31 @@ impl Embedder {
     /// up at 1.5 s — as this one did — reported a sleeping server as absent,
     /// and every caller that gates on it (semantic search per query,
     /// `kg_search`, `embed`) quietly degraded to keyword-only.
+    ///
+    /// **A 503 is a server loading, not an absent one** — `llm.rs`'s
+    /// `Health::Loading`, and `docs/INTEGRATIONS.md`'s policy for the same
+    /// binary on :8080. Behind the socket the proxy waits for health itself,
+    /// but a hand-started server answers 503 for the whole load, so the probe
+    /// polls it to the same deadline rather than reading it as "no" in a
+    /// millisecond (found on review).
     pub fn available(&self) -> bool {
-        ureq::get(&format!("{}/health", self.base_url))
-            .timeout(AVAILABLE_TIMEOUT)
-            .call()
-            .is_ok()
+        let deadline = std::time::Instant::now() + AVAILABLE_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            match ureq::get(&format!("{}/health", self.base_url))
+                .timeout(left)
+                .call()
+            {
+                Ok(_) => return true,
+                Err(ureq::Error::Status(503, _)) => {
+                    std::thread::sleep(Duration::from_millis(250).min(left));
+                }
+                Err(_) => return false,
+            }
+        }
     }
 }
 
@@ -675,6 +695,29 @@ mod cache_tests {
         }
     }
 
+    /// Search no longer re-probes per arm: the caller's `available()` gate
+    /// is what put an embedder in its hands. So an embedder that stops
+    /// answering mid-run is an error the caller sees, not a vector arm
+    /// quietly left empty — which is what the per-arm probe used to turn it
+    /// into.
+    #[test]
+    fn a_dead_embedder_mid_run_is_an_error_not_an_empty_arm() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        assert!(crate::search::hybrid_facts(&conn, Some(&e), "anything", true, 5).is_err());
+        assert!(crate::search::hybrid_episodes(
+            &conn,
+            Some(&e),
+            "anything",
+            None,
+            None,
+            None,
+            true,
+            5
+        )
+        .is_err());
+    }
+
     fn store(conn: &Connection, e: &Embedder, id: i64, text: &str, v: &[f32]) {
         conn.execute(
             "INSERT OR REPLACE INTO candidate_embedding
@@ -924,6 +967,46 @@ mod tests {
             e.available(),
             "a server that answers after 2.5 s is up, not absent"
         );
+    }
+
+    /// A hand-started llama-server answers `/health` 503 for the length of
+    /// its load. That is a server, loading — `available()` must wait for it
+    /// rather than read the first 503 as absence.
+    #[test]
+    fn available_waits_through_503_loading() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let (status, body) = if n < 3 {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"error":{"message":"Loading model"}}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"status":"ok"}"#)
+                };
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(e.available(), "503 is loading, not absent");
     }
 
     use super::*;

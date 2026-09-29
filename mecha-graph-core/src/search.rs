@@ -201,12 +201,16 @@ pub fn hybrid_episodes(
 
     let pool = k * 3; // over-fetch each arm before fusion
     let bm25 = bm25_ranked(conn, "fts_episode", query, cand_slice, pool)?;
+    // No probe here: the caller's `available()` gate made `embedder` what it
+    // is, and probing again per arm doubled the wait on a server that never
+    // came up (found on review). A server that dies mid-run is an error out
+    // of `embed_query`, not a silently empty vector arm.
     let vec = match embedder {
-        Some(e) if e.available() => {
+        Some(e) => {
             let qvec = e.embed_query(query)?;
             vec_ranked(conn, "vec_episode", "episode_id", &qvec, cand_slice, pool)?
         }
-        _ => vec![],
+        None => vec![],
     };
 
     let mut hits = rrf_fuse(&bm25, &vec, k * 2);
@@ -244,12 +248,16 @@ pub fn hybrid_facts(
 ) -> Result<Vec<Hit>> {
     let pool = k * 3;
     let bm25 = bm25_ranked(conn, "fts_fact", query, None, pool)?;
+    // No probe here: the caller's `available()` gate made `embedder` what it
+    // is, and probing again per arm doubled the wait on a server that never
+    // came up (found on review). A server that dies mid-run is an error out
+    // of `embed_query`, not a silently empty vector arm.
     let vec = match embedder {
-        Some(e) if e.available() => {
+        Some(e) => {
             let qvec = e.embed_query(query)?;
             vec_ranked(conn, "vec_fact", "fact_id", &qvec, None, pool)?
         }
-        _ => vec![],
+        None => vec![],
     };
     let mut hits = rrf_fuse(&bm25, &vec, k * 2);
 
