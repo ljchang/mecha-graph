@@ -40,6 +40,26 @@ use std::time::Duration;
 /// chat model, and llama-server serves one model per process.
 pub const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:8081";
 
+/// How long [`Embedder::available`] waits for `/health`: a cold start of the
+/// on-demand server (model load, then its health gate) fits well inside it,
+/// and a server that is genuinely down still answers "no" in bounded time.
+pub const AVAILABLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What [`Embedder::health_within`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedHealth {
+    /// `/health` answered 2xx.
+    Ready,
+    /// Nothing that could become an embedding server: start one.
+    Absent(String),
+    /// Something is there and did not come good in time: do not start a
+    /// second one over it — look at the one that is there.
+    Failing(String),
+    /// The configured URL cannot be used at all: fix the setting
+    /// (`MECHA_GRAPH_EMBED_URL`, `[llm] embed_url`).
+    Misconfigured(String),
+}
+
 /// Fallback when nothing is configured. 768 is what the store already holds
 /// (nomic-embed-text-v1.5), so an unconfigured install keeps working.
 pub const DEFAULT_EMBED_DIMS: usize = 768;
@@ -237,11 +257,94 @@ impl Embedder {
             .ok_or_else(|| Error::Embed("empty embedding batch".into()))
     }
 
+    /// Whether the embedding server answers `/health` within
+    /// [`AVAILABLE_TIMEOUT`]. [`Embedder::health_within`] says why not.
     pub fn available(&self) -> bool {
-        ureq::get(&format!("{}/health", self.base_url))
-            .timeout(Duration::from_millis(1500))
-            .call()
-            .is_ok()
+        matches!(self.health_within(AVAILABLE_TIMEOUT), EmbedHealth::Ready)
+    }
+
+    /// What `/health` says within `budget`, keeping "nothing here" apart from
+    /// "there and failing" — `llm.rs`'s `health()` split, kept rather than
+    /// collapsed to a bool so a caller can say which (found on review).
+    ///
+    /// **Patient enough for a cold start.** Since 2026-09-29 the server behind
+    /// :8081 runs on demand: a systemd socket holds the port, and the first
+    /// connection starts the model and waits for it (~4 s measured, more under
+    /// load). This probe's own request is what wakes it, so a probe that gave
+    /// up at 1.5 s — as this one did — reported a sleeping server as absent,
+    /// and every caller that gates on it quietly degraded to keyword-only.
+    ///
+    /// **Only "nothing here" is a fast answer.** A refused connection or a 404
+    /// (ollama answers `/health` so — not llama-server) is
+    /// [`EmbedHealth::Absent`] at once; a malformed URL or an unknown scheme
+    /// is [`EmbedHealth::Misconfigured`] at once — it can never become a
+    /// loaded model, and the fix is the setting, not a server. A request the client itself refuses to send (a bad proxy, an
+    /// https-only policy) is [`EmbedHealth::Failing`] at once. Everything else — a 503
+    /// while it loads, a reset or timeout from the socket's front end, a 5xx,
+    /// a bad status line — is something there, polled to the deadline and
+    /// reported as [`EmbedHealth::Failing`] if it never comes good. A 4xx
+    /// other than 404 is `Failing` at once: waiting will not fix it.
+    pub fn health_within(&self, budget: Duration) -> EmbedHealth {
+        let deadline = std::time::Instant::now() + budget;
+        let mut last = String::from("no answer");
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return EmbedHealth::Failing(last);
+            }
+            match ureq::get(&format!("{}/health", self.base_url))
+                .timeout(left)
+                .call()
+            {
+                Ok(_) => return EmbedHealth::Ready,
+                Err(ureq::Error::Status(404, _)) => {
+                    return EmbedHealth::Absent("answers /health 404 — not llama-server".into())
+                }
+                // Any other 4xx (a proxy's 401, a 400) will not come good by
+                // waiting: there, and failing, said at once — `llm.rs`'s
+                // `Unknown` on the first non-404 status (found on review).
+                Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
+                    return EmbedHealth::Failing(format!("/health answered HTTP {code}"))
+                }
+                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
+                    return EmbedHealth::Absent(t.to_string())
+                }
+                // Not a server's answer at all but the URL itself — a missing
+                // scheme (`localhost:8081`), a typo. Neither "start one" nor
+                // "look at the one there" is the right advice; the setting is
+                // (found on review).
+                Err(ureq::Error::Transport(t))
+                    if matches!(
+                        t.kind(),
+                        ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme
+                    ) =>
+                {
+                    return EmbedHealth::Misconfigured(t.to_string())
+                }
+                // The request never left the client and never will: a bad
+                // proxy setting, or an https-only policy against an http URL.
+                // Said at once, not polled for the whole budget. (DNS is not
+                // here: a resolver blip is transient, and `llm.rs` keeps only
+                // a refused connection as absence — found on review.)
+                Err(ureq::Error::Transport(t))
+                    if matches!(
+                        t.kind(),
+                        ureq::ErrorKind::InvalidProxyUrl
+                            | ureq::ErrorKind::ProxyUnauthorized
+                            | ureq::ErrorKind::InsecureRequestHttpsOnly
+                    ) =>
+                {
+                    return EmbedHealth::Failing(t.to_string())
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    // Recomputed after the request, so a short budget (the
+                    // TUI's 2 s) is not overshot by a stale `left`.
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(Duration::from_millis(250).min(left));
+                }
+            }
+        }
     }
 }
 
@@ -661,6 +764,29 @@ mod cache_tests {
         }
     }
 
+    /// Search no longer re-probes per arm: the caller's `available()` gate
+    /// is what put an embedder in its hands. So an embedder that stops
+    /// answering mid-run is an error the caller sees, not a vector arm
+    /// quietly left empty — which is what the per-arm probe used to turn it
+    /// into.
+    #[test]
+    fn a_dead_embedder_mid_run_is_an_error_not_an_empty_arm() {
+        let conn = crate::db::open_memory().unwrap();
+        let e = unreachable_embedder();
+        assert!(crate::search::hybrid_facts(&conn, Some(&e), "anything", true, 5).is_err());
+        assert!(crate::search::hybrid_episodes(
+            &conn,
+            Some(&e),
+            "anything",
+            None,
+            None,
+            None,
+            true,
+            5
+        )
+        .is_err());
+    }
+
     fn store(conn: &Connection, e: &Embedder, id: i64, text: &str, v: &[f32]) {
         conn.execute(
             "INSERT OR REPLACE INTO candidate_embedding
@@ -873,6 +999,237 @@ mod tests {
             Some(1024),
             "re-aligned to siblings"
         );
+    }
+
+    /// An on-demand server answers `/health` only after it has loaded. A
+    /// probe that gives up first reports a sleeping server as absent, and
+    /// every caller that gates on it degrades to keyword-only search without
+    /// a word — so this must hold for a server slower than the old 1.5 s cap.
+    #[test]
+    fn available_waits_out_a_cold_start() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                // Longer than the probe used to wait; well inside a cold start.
+                std::thread::sleep(Duration::from_millis(2500));
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(
+            e.available(),
+            "a server that answers after 2.5 s is up, not absent"
+        );
+    }
+
+    /// A socket front end that resets the probe's connection during a cold
+    /// start is a server on its way, not an absent one.
+    #[test]
+    fn available_waits_through_a_reset() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // First connection: accepted and dropped without a response.
+            if let Ok((conn, _)) = listener.accept() {
+                drop(conn);
+            }
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(e.available(), "a reset mid-start is not absence");
+    }
+
+    /// A server that holds the port and keeps failing is `Failing` — so a
+    /// caller can say "look at the one that is there" rather than advise
+    /// starting a second server over it.
+    #[test]
+    fn a_server_answering_502_is_failing_not_absent() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(matches!(
+            e.health_within(Duration::from_millis(800)),
+            EmbedHealth::Failing(_)
+        ));
+    }
+
+    /// A 4xx other than 404 will not come good by waiting — `Failing`, fast.
+    #[test]
+    fn a_401_is_failing_at_once() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            e.health_within(Duration::from_secs(10)),
+            EmbedHealth::Failing(_)
+        ));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn nothing_listening_is_absent() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(matches!(
+            e.health_within(Duration::from_secs(5)),
+            EmbedHealth::Absent(_)
+        ));
+    }
+
+    /// A malformed URL can never become a loaded model: "no", at once — and
+    /// named as the setting's fault, not a missing server.
+    #[test]
+    fn available_is_a_fast_no_for_a_malformed_url() {
+        let e = Embedder {
+            base_url: "http//127.0.0.1:8081".into(),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(!e.available());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(matches!(
+            e.health_within(Duration::from_secs(5)),
+            EmbedHealth::Misconfigured(_)
+        ));
+    }
+
+    /// The other direction: nothing listening is "no", at once — not after
+    /// the whole deadline.
+    #[test]
+    fn available_is_a_fast_no_when_nothing_listens() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(!e.available());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// A hand-started llama-server answers `/health` 503 for the length of
+    /// its load. That is a server, loading — `available()` must wait for it
+    /// rather than read the first 503 as absence.
+    #[test]
+    fn available_waits_through_503_loading() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for n in 0.. {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let (status, body) = if n < 3 {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"error":{"message":"Loading model"}}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"status":"ok"}"#)
+                };
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(e.available(), "503 is loading, not absent");
     }
 
     use super::*;

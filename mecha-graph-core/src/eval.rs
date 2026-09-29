@@ -118,7 +118,15 @@ pub fn run(
     let mut results = Vec::new();
 
     for g in gold {
-        let pack = router::query(conn, embedder, &g.query, 10, 8000, true, None)?;
+        // The same per-query decision production makes (`needs_vectors`), so
+        // the regression guard scores the path that runs (found on review).
+        // Result-neutral by construction: the only skips never embed.
+        let emb = if router::needs_vectors(conn, &g.query, router::Scope::Both)? {
+            embedder
+        } else {
+            None
+        };
+        let pack = router::query(conn, emb, &g.query, 10, 8000, true, None)?;
         let expected: Vec<String> = g
             .expect_ids
             .iter()

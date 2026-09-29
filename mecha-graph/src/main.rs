@@ -1462,12 +1462,31 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Embed { limit, batch } => {
             let embedder = embed::Embedder::default();
-            if !embedder.available() {
-                return Err(mecha_graph_core::Error::Embed(format!(
-                    "no embedding server at {} — start one with `llama-server -m <gguf> \
-                     --port 8081 --embeddings --pooling last --embd-normalize 2`",
-                    embedder.base_url
-                )));
+            match embedder.health_within(embed::AVAILABLE_TIMEOUT) {
+                embed::EmbedHealth::Ready => {}
+                embed::EmbedHealth::Absent(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "no embedding server at {} ({why}) — start one with `llama-server -m \
+                         <gguf> --port 8081 --embeddings --pooling last --embd-normalize 2`",
+                        embedder.base_url
+                    )));
+                }
+                // Something holds the port: starting a second server over it
+                // is the wrong advice (found on review).
+                embed::EmbedHealth::Failing(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "the embedding server at {} is there but not healthy ({why}) — check it \
+                         (mecha's own unit is `llama-embed`: `systemctl --user status llama-embed`) rather than starting another",
+                        embedder.base_url
+                    )));
+                }
+                embed::EmbedHealth::Misconfigured(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "the embedding URL {} cannot be used ({why}) — fix MECHA_GRAPH_EMBED_URL \
+                         or [llm] embed_url (it needs a scheme: http://127.0.0.1:8081)",
+                        embedder.base_url
+                    )));
+                }
             }
             // A width change means every stored vector is unusable, so the
             // tables are rebuilt and the whole corpus re-embedded. Say so
@@ -1534,7 +1553,12 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 return Ok(());
             }
             let embedder = embed::Embedder::default();
-            let emb = embedder.available().then_some(&embedder);
+            // A query that will embed nothing (an AGGREGATE over facts, or
+            // no text left after the tags) is not probed, so it starts no
+            // on-demand model; a LOOKUP is probed — it can fall through to
+            // recall.
+            let emb = (router::needs_vectors(&conn, &query, lens.scope)? && embedder.available())
+                .then_some(&embedder);
             let pack = router::query_lens(&conn, emb, &query, k, budget, private, Some("cli.query"), lens)?;
             if want_json(cli_json, cli_text) {
                 println!("{}", serde_json::to_string_pretty(&pack)?);

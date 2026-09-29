@@ -529,6 +529,36 @@ pub fn extract_tags(query: &str) -> (Vec<String>, String) {
 
 // ─── 3. Intent classification ────────────────────────────────────────────────
 
+/// Whether a query will embed anything — so a caller knows whether probing
+/// the embedding server is worth it, since the probe itself starts an
+/// on-demand model and resets its idle timer. Decided on the text the router
+/// itself uses: known `#tags` removed, unknown ones put back, exactly as
+/// [`query_lens`] does.
+///
+/// Two cases never embed, and only these (found on review):
+/// - **AGGREGATE with facts in scope**: answered from rollups, with no
+///   fall-through to recall. A LOOKUP is *not* one of them — when its rollup
+///   finds no row it falls through to recall, which must keep its vector arm
+///   rather than go keyword-only in silence.
+/// - **No text left to embed** (a tag-only query): recall answers it through
+///   `anchored_fallback` without embedding.
+pub fn needs_vectors(conn: &Connection, query: &str, scope: Scope) -> Result<bool> {
+    let (candidate_tags, mut text) = extract_tags(query);
+    for t in candidate_tags {
+        if !episode::tag_exists(conn, &t)? {
+            text = if text.is_empty() {
+                t
+            } else {
+                format!("{text} {t}")
+            };
+        }
+    }
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    Ok(!(scope.facts() && classify_intent(&text) == Intent::Aggregate))
+}
+
 pub fn classify_intent(query: &str) -> Intent {
     let q = query.to_lowercase();
     let lookup_markers = [
@@ -1278,6 +1308,25 @@ fn aggregate_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a query that will embed may probe (and so start) the embedding
+    /// server: a lookup keeps it, since it can fall through to recall.
+    #[test]
+    fn only_a_query_that_embeds_needs_vectors() {
+        let conn = crate::db::open_memory().unwrap();
+        // A lookup can fall through to recall, so it keeps the vector arm.
+        assert!(needs_vectors(&conn, "when did I last meet Mara", Scope::Both).unwrap());
+        assert!(needs_vectors(
+            &conn,
+            "what did we decide about the kelp model",
+            Scope::Both
+        )
+        .unwrap());
+        // Nothing to embed once the tags are filters.
+        assert!(!needs_vectors(&conn, "", Scope::Both).unwrap());
+        // An unknown tag goes back into the text, so it does embed.
+        assert!(needs_vectors(&conn, "#nosuchtag", Scope::Both).unwrap());
+    }
     use crate::db::open_memory;
     use crate::episode::{add_mention, upsert_episode, Episode};
     use crate::graph::{add_alias, get_or_create_person};

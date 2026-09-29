@@ -54,6 +54,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The embedding probe waits out a cold start.** `Embedder::available()`
+  gave up on `/health` after 1.5 s; the embedding server now runs on demand
+  behind a systemd socket (mecha's `scripts/llama/`), and a cold start takes
+  ~4 s, so a sleeping server read as absent and semantic search, `kg_search`
+  and `embed` fell back to keyword-only without a word. The probe now waits up
+  to 20 s (`embed::AVAILABLE_TIMEOUT`); only a refused connection or a 404 is
+  a fast "no" — a 503 (loading), a reset, a timeout or a 5xx is something
+  there, polled to the same deadline, as `llm.rs`'s `health()` keeps them
+  apart. Search no
+  longer re-probes per arm: the caller's gate is the probe, so one query waits
+  at most once, and an embedder that dies mid-run is an error rather than a
+  silently empty vector arm. In the TUI that error is a status line over the
+  keyword results — a sleeping server never closes the session. The TUI no
+  longer probes at launch (it would add the cold start to every launch and
+  wake the model for nothing); it probes on each Ctrl-E, and says "semantic
+  search unavailable" rather than labelling keyword results "semantic".
+  Permanent errors — a malformed URL, an unknown scheme — are a fast "no"; an
+  unresolvable host is polled, since a resolver blip is transient. A query
+  that will embed nothing — an AGGREGATE over facts, or a tag-only query — no
+  longer probes (`kg_search`, `mecha-graph query`, and the gold eval, so the
+  guard scores the path production runs), so it never starts the model; a
+  LOOKUP still probes, because it can fall through to recall.
+  `Embedder::health_within` keeps "nothing here" apart from "there and
+  failing", so `mecha-graph embed` no longer advises starting a second server
+  over one that holds the port, and the TUI's group view and semantic search
+  both probe on a 2 s budget and show the reason when the server is not
+  ready. `kg_search`, served one request at a time, probes on an 8 s budget and
+  believes a "not ready" for 30 s, so a server mid-load costs the budget at
+  most once per window instead of on every call. **Still quiet:** `kg_search` and `mecha-graph
+  query` return a keyword-only pack with no flag when the probe says no — the
+  pack's `flags` channel does not carry it yet.
+
 - **LLM calls against a llama-server router** (mecha's :8080 from
   2026-09-27): `served_model` read the router's placeholder `/props` alias
   (`llama-server`) as the served model and sent it on every request, which the

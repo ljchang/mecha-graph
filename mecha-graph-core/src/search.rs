@@ -164,6 +164,10 @@ pub fn known_sources(conn: &Connection) -> Result<Vec<String>> {
 /// each collapse the candidate set first and intersect when combined (§8.1
 /// filter-first); `include_private` gates the §10 sensitivity tiers (default
 /// retrieval excludes private+).
+///
+/// `Some(embedder)` means the caller already probed it with
+/// [`Embedder::available`]; a failure to embed is an error, not an empty
+/// vector arm.
 #[allow(clippy::too_many_arguments)]
 pub fn hybrid_episodes(
     conn: &Connection,
@@ -201,12 +205,16 @@ pub fn hybrid_episodes(
 
     let pool = k * 3; // over-fetch each arm before fusion
     let bm25 = bm25_ranked(conn, "fts_episode", query, cand_slice, pool)?;
+    // No probe here: the caller's `available()` gate made `embedder` what it
+    // is, and probing again per arm doubled the wait on a server that never
+    // came up (found on review). A server that dies mid-run is an error out
+    // of `embed_query`, not a silently empty vector arm.
     let vec = match embedder {
-        Some(e) if e.available() => {
+        Some(e) => {
             let qvec = e.embed_query(query)?;
             vec_ranked(conn, "vec_episode", "episode_id", &qvec, cand_slice, pool)?
         }
-        _ => vec![],
+        None => vec![],
     };
 
     let mut hits = rrf_fuse(&bm25, &vec, k * 2);
@@ -235,6 +243,9 @@ pub fn hybrid_episodes(
 /// enough that it never displaces a reviewed fact of equal relevance.
 pub const SHADOW_DISCOUNT: f64 = 0.8;
 
+/// `Some(embedder)` means the caller already probed it with
+/// [`Embedder::available`]; a failure to embed is an error, not an empty
+/// vector arm.
 pub fn hybrid_facts(
     conn: &Connection,
     embedder: Option<&Embedder>,
@@ -244,12 +255,16 @@ pub fn hybrid_facts(
 ) -> Result<Vec<Hit>> {
     let pool = k * 3;
     let bm25 = bm25_ranked(conn, "fts_fact", query, None, pool)?;
+    // No probe here: the caller's `available()` gate made `embedder` what it
+    // is, and probing again per arm doubled the wait on a server that never
+    // came up (found on review). A server that dies mid-run is an error out
+    // of `embed_query`, not a silently empty vector arm.
     let vec = match embedder {
-        Some(e) if e.available() => {
+        Some(e) => {
             let qvec = e.embed_query(query)?;
             vec_ranked(conn, "vec_fact", "fact_id", &qvec, None, pool)?
         }
-        _ => vec![],
+        None => vec![],
     };
     let mut hits = rrf_fuse(&bm25, &vec, k * 2);
 

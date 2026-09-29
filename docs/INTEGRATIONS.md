@@ -110,7 +110,11 @@ isolated.
   - chat/extraction — `MECHA_GRAPH_CHAT_URL` or `[llm] base_url`,
     default `http://127.0.0.1:8080`
   - embeddings — `MECHA_GRAPH_EMBED_URL` or `[llm] embed_url`,
-    default `http://127.0.0.1:8081`
+    default `http://127.0.0.1:8081`; on the owner's box that port is a
+    systemd socket that starts the model on first connection and stops it
+    after ten idle minutes (mecha's `scripts/llama/`), so a first request can
+    wait a cold start (~4 s) — `Embedder::health_within` waits it out, and a
+    503, reset or 5xx is "there, not ready", never "absent"
 - **Shared by default, never duplicated.** `Backend::resolve` probes
   `{base_url}/health`; if anything answers, it is used as-is (a 503 is a
   server loading a model, and is waited for, never spawned over) — as long as it

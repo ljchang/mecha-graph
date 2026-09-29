@@ -469,8 +469,11 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
 }
 
 pub fn run(conn: Connection, db_path: std::path::PathBuf) -> mecha_graph_core::Result<()> {
-    let embedder = mecha_graph_core::embed::Embedder::default();
-    let embedder = embedder.available().then_some(embedder);
+    // Not probed here: the embedding server runs on demand, so a probe at
+    // launch would add its cold start to every `mecha-graph tui` and load
+    // the model for someone who never presses Ctrl-E. `run_search` probes
+    // when a semantic search is asked for (found on review).
+    let embedder = Some(mecha_graph_core::embed::Embedder::default());
 
     let mut app = App {
         conn,
@@ -792,6 +795,29 @@ fn event_loop(
     }
 }
 
+/// What the TUI says when the embedding server is not ready — the reason
+/// kept, because "press again" is advice a permanently broken server never
+/// satisfies (found on review).
+fn embed_status(health: &mecha_graph_core::embed::EmbedHealth) -> String {
+    use mecha_graph_core::embed::EmbedHealth;
+    match health {
+        EmbedHealth::Ready => "embedding server ready".into(),
+        EmbedHealth::Absent(why) => format!("no embedding server ({why})"),
+        EmbedHealth::Failing(why) => format!(
+            "embedding server not ready ({why}) — if it is starting, try again in a moment; \
+             if this persists, check it (mecha's own unit: `systemctl --user status llama-embed`)"
+        ),
+        EmbedHealth::Misconfigured(why) => format!(
+            "the embedding URL cannot be used ({why}) — fix MECHA_GRAPH_EMBED_URL or [llm] embed_url"
+        ),
+    }
+}
+
+/// How long a Ctrl-E waits on the embedding server inside the key handler.
+/// Long enough for a server that is already up; a cold one is woken by the
+/// attempt and caught by the next Ctrl-E.
+const TUI_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run the router for the current input. `deep` adds the vector arm (ollama
 /// round-trip); the live path is BM25 + lookup/aggregate routing — instant.
 fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
@@ -863,25 +889,75 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
         app.search.list.select(if n == 0 { None } else { Some(0) });
         return Ok(());
     }
-    let embedder = if deep { app.embedder.as_ref() } else { None };
+    // Probed per semantic search, not once at launch: the server sleeps after
+    // ten idle minutes, so an answer from startup is stale by design. The
+    // first Ctrl-E pays the cold start; the ones after it find it awake.
+    //
+    // A short budget, not the 20 s one: this runs inside the key handler with
+    // no frame drawn, so a long wait would freeze the TUI (found on review).
+    // The probe's own request is what wakes an on-demand server, so a cold
+    // one answers "starting" here and is ready for the next Ctrl-E.
+    // And only for a query that will embed (`needs_vectors`), as `kg_search`
+    // and `mecha-graph query` gate: an AGGREGATE or a tag-only search would
+    // wake the model for nothing and then read as degraded when it is not
+    // (found on review).
+    let wants_vectors = deep && router::needs_vectors(&app.conn, &q, router::Scope::Both)?;
+    let health = if wants_vectors {
+        app.embedder
+            .as_ref()
+            .map(|e| e.health_within(TUI_PROBE_BUDGET))
+    } else {
+        None
+    };
+    let embedder = match health {
+        Some(mecha_graph_core::embed::EmbedHealth::Ready) => app.embedder.as_ref(),
+        _ => None,
+    };
+    let unavailable = wants_vectors && embedder.is_none();
+    let why = health.as_ref().map(embed_status).unwrap_or_default();
     let started = std::time::Instant::now();
-    let pack = router::query(
-        &app.conn,
-        embedder,
-        &q,
-        15,
-        6000,
-        app.search.show_private,
-        Some("tui.search"),
-    )?;
-    app.search.mode = if deep { "semantic" } else { "live" };
-    app.status = format!(
-        "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
-        pack.items.len(),
-        pack.intent,
-        app.search.mode,
-        started.elapsed().as_millis()
-    );
+    let run = |embedder| {
+        router::query(
+            &app.conn,
+            embedder,
+            &q,
+            15,
+            6000,
+            app.search.show_private,
+            Some("tui.search"),
+        )
+    };
+    // A server that answered the probe and then failed to embed is a status
+    // line and the keyword results, never an error out of the event loop:
+    // `reload_groups`'s convention, and the TUI is the correction channel a
+    // sleeping server must not close (found on review). Only an embedding
+    // failure is caught — a locked database is not the embedder's fault.
+    let (pack, semantic_failed) = match run(embedder) {
+        Ok(pack) => (pack, None),
+        Err(e @ mecha_graph_core::Error::Embed(_)) if embedder.is_some() => (run(None)?, Some(e)),
+        Err(e) => return Err(e),
+    };
+    // "semantic" only when a vector arm actually ran — never over keyword
+    // results, which would be a claim, not just silence.
+    app.search.mode = if embedder.is_some() && semantic_failed.is_none() {
+        "semantic"
+    } else {
+        "live"
+    };
+    app.status = match (&semantic_failed, unavailable) {
+        (Some(e), _) => format!(
+            "semantic search failed ({e}) — showing {} keyword items instead",
+            pack.items.len()
+        ),
+        (None, true) => format!("{why}; showing {} keyword items", pack.items.len()),
+        (None, false) => format!(
+            "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
+            pack.items.len(),
+            pack.intent,
+            app.search.mode,
+            started.elapsed().as_millis()
+        ),
+    };
     let n = pack.ambiguous.len() + pack.items.len();
     app.search.list.select(if n == 0 {
         None
@@ -969,19 +1045,38 @@ impl App {
             return Ok(());
         };
         let e = mecha_graph_core::embed::Embedder::default();
-        if !e.available() {
-            self.review.group_view = false;
-            self.review.cluster_view = true;
-            self.status = "embedding server not answering — groups need vectors".into();
-            return Ok(());
+        // The key handler's budget, not the 20 s one — this runs after every
+        // verdict while group view is on, and the server sleeps (found on
+        // review). A sleeping server is woken by the probe and ready for the
+        // next `g`.
+        match e.health_within(TUI_PROBE_BUDGET) {
+            mecha_graph_core::embed::EmbedHealth::Ready => {}
+            health => {
+                self.review.group_view = false;
+                self.review.cluster_view = true;
+                self.status = format!("groups need vectors — {}", embed_status(&health));
+                return Ok(());
+            }
         }
-        self.review.groups = mecha_graph_core::similar::groups_for_class(
+        // The probe said ready, but the server can stop between it and the
+        // embed: an embedding failure is a status line here too, never an
+        // error out of the event loop (found on review).
+        self.review.groups = match mecha_graph_core::similar::groups_for_class(
             &self.conn,
             &e,
             &proposer,
             &predicate,
             mecha_graph_core::similar::GROUP_THRESHOLD,
-        )?;
+        ) {
+            Ok(groups) => groups,
+            Err(err @ mecha_graph_core::Error::Embed(_)) => {
+                self.review.group_view = false;
+                self.review.cluster_view = true;
+                self.status = format!("groups need vectors — embedding failed ({err})");
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         let len = self.review.groups.len();
         let sel = self.review.group_list.selected().unwrap_or(0);
         self.review.group_list.select(if len == 0 {
