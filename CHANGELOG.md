@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The embedding probe waits out a cold start.** `Embedder::available()`
+  gave up on `/health` after 1.5 s; the embedding server now runs on demand
+  behind a systemd socket (mecha's `scripts/llama/`), and a cold start takes
+  ~4 s, so a sleeping server read as absent and semantic search, `kg_search`
+  and `embed` fell back to keyword-only without a word. The probe now waits up
+  to 20 s (`embed::AVAILABLE_TIMEOUT`); a server that is genuinely down still
+  answers "no" in bounded time.
+
 - **LLM calls against a llama-server router** (mecha's :8080 from
   2026-09-27): `served_model` read the router's placeholder `/props` alias
   (`llama-server`) as the served model and sent it on every request, which the

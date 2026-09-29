@@ -40,6 +40,11 @@ use std::time::Duration;
 /// chat model, and llama-server serves one model per process.
 pub const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:8081";
 
+/// How long [`Embedder::available`] waits for `/health`: a cold start of the
+/// on-demand server (model load, then its health gate) fits well inside it,
+/// and a server that is genuinely down still answers "no" in bounded time.
+pub const AVAILABLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Fallback when nothing is configured. 768 is what the store already holds
 /// (nomic-embed-text-v1.5), so an unconfigured install keeps working.
 pub const DEFAULT_EMBED_DIMS: usize = 768;
@@ -237,9 +242,18 @@ impl Embedder {
             .ok_or_else(|| Error::Embed("empty embedding batch".into()))
     }
 
+    /// Whether the embedding server answers `/health`.
+    ///
+    /// **Patient enough for a cold start.** Since 2026-09-29 the server behind
+    /// :8081 runs on demand: a systemd socket holds the port, and the first
+    /// connection starts the model and waits for it (~4 s measured, more under
+    /// load). This probe's own request is what wakes it, so a probe that gave
+    /// up at 1.5 s — as this one did — reported a sleeping server as absent,
+    /// and every caller that gates on it (semantic search per query,
+    /// `kg_search`, `embed`) quietly degraded to keyword-only.
     pub fn available(&self) -> bool {
         ureq::get(&format!("{}/health", self.base_url))
-            .timeout(Duration::from_millis(1500))
+            .timeout(AVAILABLE_TIMEOUT)
             .call()
             .is_ok()
     }
@@ -872,6 +886,43 @@ mod tests {
             dims_of("vec_rejected"),
             Some(1024),
             "re-aligned to siblings"
+        );
+    }
+
+    /// An on-demand server answers `/health` only after it has loaded. A
+    /// probe that gives up first reports a sleeping server as absent, and
+    /// every caller that gates on it degrades to keyword-only search without
+    /// a word — so this must hold for a server slower than the old 1.5 s cap.
+    #[test]
+    fn available_waits_out_a_cold_start() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                // Longer than the probe used to wait; well inside a cold start.
+                std::thread::sleep(Duration::from_millis(2500));
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(
+            e.available(),
+            "a server that answers after 2.5 s is up, not absent"
         );
     }
 
