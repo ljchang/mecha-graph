@@ -504,8 +504,9 @@ fn kg_search(
         }
     }
 
-    // Probed only when the router will use vectors: a LOOKUP or AGGREGATE
-    // would pay the budget and start the model for an answer from rollups.
+    // Probed only when the router will embed (`needs_vectors`): an AGGREGATE
+    // or a tag-only query would pay the budget and start the model for
+    // nothing. A LOOKUP is probed — it can fall through to recall.
     let emb = (router::needs_vectors(conn, query, scope)? && embedder_ready(embedder))
         .then_some(embedder);
     // Same window for both readers, or the comparison spans eras.

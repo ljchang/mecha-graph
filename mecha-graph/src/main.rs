@@ -1546,8 +1546,10 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 return Ok(());
             }
             let embedder = embed::Embedder::default();
-            // A LOOKUP or AGGREGATE never reaches the vector arm: no probe,
-            // and no on-demand model started for it.
+            // A query that will embed nothing (an AGGREGATE over facts, or
+            // no text left after the tags) is not probed, so it starts no
+            // on-demand model; a LOOKUP is probed — it can fall through to
+            // recall.
             let emb = (router::needs_vectors(&conn, &query, lens.scope)? && embedder.available())
                 .then_some(&embedder);
             let pack = router::query_lens(&conn, emb, &query, k, budget, private, Some("cli.query"), lens)?;

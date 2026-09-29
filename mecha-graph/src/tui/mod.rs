@@ -894,7 +894,12 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
     // no frame drawn, so a long wait would freeze the TUI (found on review).
     // The probe's own request is what wakes an on-demand server, so a cold
     // one answers "starting" here and is ready for the next Ctrl-E.
-    let health = if deep {
+    // And only for a query that will embed (`needs_vectors`), as `kg_search`
+    // and `mecha-graph query` gate: an AGGREGATE or a tag-only search would
+    // wake the model for nothing and then read as degraded when it is not
+    // (found on review).
+    let wants_vectors = deep && router::needs_vectors(&app.conn, &q, router::Scope::Both)?;
+    let health = if wants_vectors {
         app.embedder
             .as_ref()
             .map(|e| e.health_within(TUI_PROBE_BUDGET))
@@ -905,7 +910,7 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
         Some(mecha_graph_core::embed::EmbedHealth::Ready) => app.embedder.as_ref(),
         _ => None,
     };
-    let unavailable = deep && embedder.is_none();
+    let unavailable = wants_vectors && embedder.is_none();
     let why = health.as_ref().map(embed_status).unwrap_or_default();
     let started = std::time::Instant::now();
     let run = |embedder| {
