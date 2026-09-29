@@ -529,6 +529,17 @@ pub fn extract_tags(query: &str) -> (Vec<String>, String) {
 
 // ─── 3. Intent classification ────────────────────────────────────────────────
 
+/// Whether a query will reach the vector arm — so a caller knows whether
+/// probing the embedding server is worth it. A LOOKUP or AGGREGATE with facts
+/// in scope is answered from rollups with no embeddings (§8.1), so probing for
+/// it would only start an on-demand model for nothing and reset its idle
+/// timer (found on review). A lookup whose rollup finds no row still falls
+/// through to a small recall supplement; that supplement runs keyword-only,
+/// which is the price of not waking the model for every lookup.
+pub fn needs_vectors(query: &str, scope: Scope) -> bool {
+    !(scope.facts() && matches!(classify_intent(query), Intent::Lookup | Intent::Aggregate))
+}
+
 pub fn classify_intent(query: &str) -> Intent {
     let q = query.to_lowercase();
     let lookup_markers = [
@@ -1278,6 +1289,22 @@ fn aggregate_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LOOKUP or AGGREGATE over facts is answered from rollups, so it must
+    /// not probe (and start) the embedding server; a recall, or a lookup under
+    /// `evidence_only`, reaches the vector arm and may.
+    #[test]
+    fn only_a_query_that_reaches_the_vector_arm_needs_vectors() {
+        assert!(!needs_vectors("when did I last meet Mara", Scope::Both));
+        assert!(needs_vectors(
+            "when did I last meet Mara",
+            Scope::EvidenceOnly
+        ));
+        assert!(needs_vectors(
+            "what did we decide about the kelp model",
+            Scope::Both
+        ));
+    }
     use crate::db::open_memory;
     use crate::episode::{add_mention, upsert_episode, Episode};
     use crate::graph::{add_alias, get_or_create_person};

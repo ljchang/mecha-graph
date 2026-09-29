@@ -504,7 +504,9 @@ fn kg_search(
         }
     }
 
-    let emb = embedder_ready(embedder).then_some(embedder);
+    // Probed only when the router will use vectors: a LOOKUP or AGGREGATE
+    // would pay the budget and start the model for an answer from rollups.
+    let emb = (router::needs_vectors(query, scope) && embedder_ready(embedder)).then_some(embedder);
     // Same window for both readers, or the comparison spans eras.
     let window = match (args["since"].as_str(), args["until"].as_str()) {
         (None, None) => None,

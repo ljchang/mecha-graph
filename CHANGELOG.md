@@ -70,7 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer probes at launch (it would add the cold start to every launch and
   wake the model for nothing); it probes on each Ctrl-E, and says "semantic
   search unavailable" rather than labelling keyword results "semantic".
-  Permanent errors — a malformed URL, an unresolvable host — are a fast "no".
+  Permanent errors — a malformed URL, an unknown scheme — are a fast "no"; an
+  unresolvable host is polled, since a resolver blip is transient. A LOOKUP
+  or AGGREGATE query (`kg_search`, `mecha-graph query`) is answered from
+  rollups and no longer probes, so it never starts the model.
   `Embedder::health_within` keeps "nothing here" apart from "there and
   failing", so `mecha-graph embed` no longer advises starting a second server
   over one that holds the port, and the TUI's group view and semantic search
