@@ -272,9 +272,10 @@ impl Embedder {
     /// and every caller that gates on it quietly degraded to keyword-only.
     ///
     /// **Only "nothing here" is a fast answer.** A refused connection, a 404
-    /// (ollama answers `/health` so — not llama-server), a malformed URL, an
-    /// unknown scheme or a name that does not resolve can never become a
-    /// loaded model: [`EmbedHealth::Absent`] at once. Everything else — a 503
+    /// (ollama answers `/health` so — not llama-server), a malformed URL or an
+    /// unknown scheme can never become a loaded model: [`EmbedHealth::Absent`]
+    /// at once. A request the client itself refuses to send (a bad proxy, an
+    /// https-only policy) is [`EmbedHealth::Failing`] at once. Everything else — a 503
     /// while it loads, a reset or timeout from the socket's front end, a 5xx,
     /// a bad status line — is something there, polled to the deadline and
     /// reported as [`EmbedHealth::Failing`] if it never comes good. A 4xx
@@ -307,10 +308,24 @@ impl Embedder {
                         ureq::ErrorKind::ConnectionFailed
                             | ureq::ErrorKind::InvalidUrl
                             | ureq::ErrorKind::UnknownScheme
-                            | ureq::ErrorKind::Dns
                     ) =>
                 {
                     return EmbedHealth::Absent(t.to_string())
+                }
+                // The request never left the client and never will: a bad
+                // proxy setting, or an https-only policy against an http URL.
+                // Said at once, not polled for the whole budget. (DNS is not
+                // here: a resolver blip is transient, and `llm.rs` keeps only
+                // a refused connection as absence — found on review.)
+                Err(ureq::Error::Transport(t))
+                    if matches!(
+                        t.kind(),
+                        ureq::ErrorKind::InvalidProxyUrl
+                            | ureq::ErrorKind::ProxyUnauthorized
+                            | ureq::ErrorKind::InsecureRequestHttpsOnly
+                    ) =>
+                {
+                    return EmbedHealth::Failing(t.to_string())
                 }
                 Err(e) => {
                     last = e.to_string();

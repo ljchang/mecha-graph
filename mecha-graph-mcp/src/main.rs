@@ -403,6 +403,41 @@ fn kg_notes(conn: &Connection, args: &Value) -> mecha_graph_core::Result<Value> 
     Ok(serde_json::json!({ "notes": rows }))
 }
 
+/// How long one `kg_search` waits on the embedding server. This loop serves
+/// one request at a time, so the core's 20 s — sized for a CLI gate — would
+/// stall every tool call behind a server that is listening but not ready
+/// (found on review). A cold start of the on-demand server (~4 s) fits.
+const MCP_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long a "not ready" answer is believed before the next call probes
+/// again. Without it, a server mid-load or broken costs the full budget on
+/// *every* call; with it, at most once per window, and the calls in between
+/// go keyword-only at once.
+const NOT_READY_MEMO: std::time::Duration = std::time::Duration::from_secs(30);
+
+static LAST_NOT_READY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Whether `kg_search` may use the vector arm: probed on the MCP budget, a
+/// recent "not ready" remembered.
+fn embedder_ready(e: &embed::Embedder) -> bool {
+    let mut last = LAST_NOT_READY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.is_some_and(|t| t.elapsed() < NOT_READY_MEMO) {
+        return false;
+    }
+    match e.health_within(MCP_PROBE_BUDGET) {
+        embed::EmbedHealth::Ready => {
+            *last = None;
+            true
+        }
+        _ => {
+            *last = Some(std::time::Instant::now());
+            false
+        }
+    }
+}
+
 fn kg_search(
     conn: &Connection,
     embedder: &embed::Embedder,
@@ -469,7 +504,7 @@ fn kg_search(
         }
     }
 
-    let emb = embedder.available().then_some(embedder);
+    let emb = embedder_ready(embedder).then_some(embedder);
     // Same window for both readers, or the comparison spans eras.
     let window = match (args["since"].as_str(), args["until"].as_str()) {
         (None, None) => None,
@@ -1607,6 +1642,39 @@ mod tests {
     use super::*;
     use mecha_graph_core::db::open_memory;
     use mecha_graph_core::graph::{upsert_node, Node};
+
+    /// A recent "not ready" is believed, so a server mid-load does not cost
+    /// every `kg_search` the probe budget — and it expires, so a server that
+    /// came up is used again. The only test touching `LAST_NOT_READY`.
+    #[test]
+    fn a_recent_not_ready_is_remembered_and_expires() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let mut e = embed::Embedder::default();
+        e.base_url = format!("http://127.0.0.1:{port}");
+
+        *LAST_NOT_READY.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(!embedder_ready(&e), "a fresh 'not ready' is believed");
+
+        *LAST_NOT_READY.lock().unwrap() = std::time::Instant::now()
+            .checked_sub(NOT_READY_MEMO + std::time::Duration::from_secs(1));
+        assert!(embedder_ready(&e), "an expired one is probed again");
+        assert!(LAST_NOT_READY.lock().unwrap().is_none());
+    }
 
     #[test]
     fn episode_upsert_is_idempotent_on_source_id() {

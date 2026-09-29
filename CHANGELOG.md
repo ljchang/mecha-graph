@@ -75,7 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing", so `mecha-graph embed` no longer advises starting a second server
   over one that holds the port, and the TUI's group view and semantic search
   both probe on a 2 s budget and show the reason when the server is not
-  ready. **Still quiet:** `kg_search` and `mecha-graph
+  ready. `kg_search`, served one request at a time, probes on an 8 s budget and
+  believes a "not ready" for 30 s, so a server mid-load costs the budget at
+  most once per window instead of on every call. **Still quiet:** `kg_search` and `mecha-graph
   query` return a keyword-only pack with no flag when the probe says no — the
   pack's `flags` channel does not carry it yet.
 
