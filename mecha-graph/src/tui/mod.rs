@@ -805,7 +805,10 @@ fn embed_status(health: &mecha_graph_core::embed::EmbedHealth) -> String {
         EmbedHealth::Absent(why) => format!("no embedding server ({why})"),
         EmbedHealth::Failing(why) => format!(
             "embedding server not ready ({why}) — if it is starting, try again in a moment; \
-             if this persists, `systemctl --user status llama-embed`"
+             if this persists, check it (mecha's own unit: `systemctl --user status llama-embed`)"
+        ),
+        EmbedHealth::Misconfigured(why) => format!(
+            "the embedding URL cannot be used ({why}) — fix MECHA_GRAPH_EMBED_URL or [llm] embed_url"
         ),
     }
 }

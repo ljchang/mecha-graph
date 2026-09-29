@@ -55,6 +55,9 @@ pub enum EmbedHealth {
     /// Something is there and did not come good in time: do not start a
     /// second one over it — look at the one that is there.
     Failing(String),
+    /// The configured URL cannot be used at all: fix the setting
+    /// (`MECHA_GRAPH_EMBED_URL`, `[llm] embed_url`).
+    Misconfigured(String),
 }
 
 /// Fallback when nothing is configured. 768 is what the store already holds
@@ -271,10 +274,11 @@ impl Embedder {
     /// up at 1.5 s — as this one did — reported a sleeping server as absent,
     /// and every caller that gates on it quietly degraded to keyword-only.
     ///
-    /// **Only "nothing here" is a fast answer.** A refused connection, a 404
-    /// (ollama answers `/health` so — not llama-server), a malformed URL or an
-    /// unknown scheme can never become a loaded model: [`EmbedHealth::Absent`]
-    /// at once. A request the client itself refuses to send (a bad proxy, an
+    /// **Only "nothing here" is a fast answer.** A refused connection or a 404
+    /// (ollama answers `/health` so — not llama-server) is
+    /// [`EmbedHealth::Absent`] at once; a malformed URL or an unknown scheme
+    /// is [`EmbedHealth::Misconfigured`] at once — it can never become a
+    /// loaded model, and the fix is the setting, not a server. A request the client itself refuses to send (a bad proxy, an
     /// https-only policy) is [`EmbedHealth::Failing`] at once. Everything else — a 503
     /// while it loads, a reset or timeout from the socket's front end, a 5xx,
     /// a bad status line — is something there, polled to the deadline and
@@ -302,15 +306,20 @@ impl Embedder {
                 Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
                     return EmbedHealth::Failing(format!("/health answered HTTP {code}"))
                 }
+                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
+                    return EmbedHealth::Absent(t.to_string())
+                }
+                // Not a server's answer at all but the URL itself — a missing
+                // scheme (`localhost:8081`), a typo. Neither "start one" nor
+                // "look at the one there" is the right advice; the setting is
+                // (found on review).
                 Err(ureq::Error::Transport(t))
                     if matches!(
                         t.kind(),
-                        ureq::ErrorKind::ConnectionFailed
-                            | ureq::ErrorKind::InvalidUrl
-                            | ureq::ErrorKind::UnknownScheme
+                        ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme
                     ) =>
                 {
-                    return EmbedHealth::Absent(t.to_string())
+                    return EmbedHealth::Misconfigured(t.to_string())
                 }
                 // The request never left the client and never will: a bad
                 // proxy setting, or an https-only policy against an http URL.
@@ -1143,7 +1152,8 @@ mod tests {
         ));
     }
 
-    /// A malformed URL can never become a loaded model: "no", at once.
+    /// A malformed URL can never become a loaded model: "no", at once — and
+    /// named as the setting's fault, not a missing server.
     #[test]
     fn available_is_a_fast_no_for_a_malformed_url() {
         let e = Embedder {
@@ -1156,6 +1166,10 @@ mod tests {
         let t = std::time::Instant::now();
         assert!(!e.available());
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(matches!(
+            e.health_within(Duration::from_secs(5)),
+            EmbedHealth::Misconfigured(_)
+        ));
     }
 
     /// The other direction: nothing listening is "no", at once — not after

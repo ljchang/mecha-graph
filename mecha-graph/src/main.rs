@@ -1476,7 +1476,14 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
                 embed::EmbedHealth::Failing(why) => {
                     return Err(mecha_graph_core::Error::Embed(format!(
                         "the embedding server at {} is there but not healthy ({why}) — check it \
-                         (`systemctl --user status llama-embed`) rather than starting another",
+                         (mecha's own unit is `llama-embed`: `systemctl --user status llama-embed`) rather than starting another",
+                        embedder.base_url
+                    )));
+                }
+                embed::EmbedHealth::Misconfigured(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "the embedding URL {} cannot be used ({why}) — fix MECHA_GRAPH_EMBED_URL \
+                         or [llm] embed_url (it needs a scheme: http://127.0.0.1:8081)",
                         embedder.base_url
                     )));
                 }
