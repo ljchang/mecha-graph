@@ -1462,12 +1462,24 @@ fn run(cli: Cli) -> mecha_graph_core::Result<()> {
 
         Command::Embed { limit, batch } => {
             let embedder = embed::Embedder::default();
-            if !embedder.available() {
-                return Err(mecha_graph_core::Error::Embed(format!(
-                    "no embedding server at {} — start one with `llama-server -m <gguf> \
-                     --port 8081 --embeddings --pooling last --embd-normalize 2`",
-                    embedder.base_url
-                )));
+            match embedder.health_within(embed::AVAILABLE_TIMEOUT) {
+                embed::EmbedHealth::Ready => {}
+                embed::EmbedHealth::Absent(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "no embedding server at {} ({why}) — start one with `llama-server -m \
+                         <gguf> --port 8081 --embeddings --pooling last --embd-normalize 2`",
+                        embedder.base_url
+                    )));
+                }
+                // Something holds the port: starting a second server over it
+                // is the wrong advice (found on review).
+                embed::EmbedHealth::Failing(why) => {
+                    return Err(mecha_graph_core::Error::Embed(format!(
+                        "the embedding server at {} is there but not healthy ({why}) — check it \
+                         (`systemctl --user status llama-embed`) rather than starting another",
+                        embedder.base_url
+                    )));
+                }
             }
             // A width change means every stored vector is unusable, so the
             // tables are rebuilt and the whole corpus re-embedded. Say so

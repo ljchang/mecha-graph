@@ -795,6 +795,11 @@ fn event_loop(
     }
 }
 
+/// How long a Ctrl-E waits on the embedding server inside the key handler.
+/// Long enough for a server that is already up; a cold one is woken by the
+/// attempt and caught by the next Ctrl-E.
+const TUI_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run the router for the current input. `deep` adds the vector arm (ollama
 /// round-trip); the live path is BM25 + lookup/aggregate routing — instant.
 fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
@@ -869,12 +874,27 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
     // Probed per semantic search, not once at launch: the server sleeps after
     // ten idle minutes, so an answer from startup is stale by design. The
     // first Ctrl-E pays the cold start; the ones after it find it awake.
-    let embedder = if deep {
-        app.embedder.as_ref().filter(|e| e.available())
+    //
+    // A short budget, not the 20 s one: this runs inside the key handler with
+    // no frame drawn, so a long wait would freeze the TUI (found on review).
+    // The probe's own request is what wakes an on-demand server, so a cold
+    // one answers "starting" here and is ready for the next Ctrl-E.
+    let health = if deep {
+        app.embedder
+            .as_ref()
+            .map(|e| e.health_within(TUI_PROBE_BUDGET))
     } else {
         None
     };
+    let embedder = match health {
+        Some(mecha_graph_core::embed::EmbedHealth::Ready) => app.embedder.as_ref(),
+        _ => None,
+    };
     let unavailable = deep && embedder.is_none();
+    let waking = matches!(
+        health,
+        Some(mecha_graph_core::embed::EmbedHealth::Failing(_))
+    );
     let started = std::time::Instant::now();
     let run = |embedder| {
         router::query(
@@ -909,9 +929,14 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
             "semantic search failed ({e}) — showing {} keyword items instead",
             pack.items.len()
         ),
+        (None, true) if waking => format!(
+            "embedding server starting — press Ctrl-E again in a moment; showing {} \
+             keyword items",
+            pack.items.len()
+        ),
         (None, true) => format!(
-            "semantic search unavailable — the embedding server is not answering; \
-             showing {} keyword items",
+            "semantic search unavailable — no embedding server answering; showing {} \
+             keyword items",
             pack.items.len()
         ),
         (None, false) => format!(

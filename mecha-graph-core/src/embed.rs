@@ -45,6 +45,18 @@ pub const DEFAULT_EMBED_URL: &str = "http://127.0.0.1:8081";
 /// and a server that is genuinely down still answers "no" in bounded time.
 pub const AVAILABLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What [`Embedder::health_within`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbedHealth {
+    /// `/health` answered 2xx.
+    Ready,
+    /// Nothing that could become an embedding server: start one.
+    Absent(String),
+    /// Something is there and did not come good in time: do not start a
+    /// second one over it — look at the one that is there.
+    Failing(String),
+}
+
 /// Fallback when nothing is configured. 768 is what the store already holds
 /// (nomic-embed-text-v1.5), so an unconfigured install keeps working.
 pub const DEFAULT_EMBED_DIMS: usize = 768;
@@ -242,51 +254,61 @@ impl Embedder {
             .ok_or_else(|| Error::Embed("empty embedding batch".into()))
     }
 
-    /// Whether the embedding server answers `/health`.
+    /// Whether the embedding server answers `/health` within
+    /// [`AVAILABLE_TIMEOUT`]. [`Embedder::health_within`] says why not.
+    pub fn available(&self) -> bool {
+        matches!(self.health_within(AVAILABLE_TIMEOUT), EmbedHealth::Ready)
+    }
+
+    /// What `/health` says within `budget`, keeping "nothing here" apart from
+    /// "there and failing" — `llm.rs`'s `health()` split, kept rather than
+    /// collapsed to a bool so a caller can say which (found on review).
     ///
     /// **Patient enough for a cold start.** Since 2026-09-29 the server behind
     /// :8081 runs on demand: a systemd socket holds the port, and the first
     /// connection starts the model and waits for it (~4 s measured, more under
     /// load). This probe's own request is what wakes it, so a probe that gave
     /// up at 1.5 s — as this one did — reported a sleeping server as absent,
-    /// and every caller that gates on it (semantic search per query,
-    /// `kg_search`, `embed`) quietly degraded to keyword-only.
+    /// and every caller that gates on it quietly degraded to keyword-only.
     ///
-    /// **Only "nothing here" is a fast no.** A refused connection, a 404 or a
-    /// transport error that is not I/O (a bad URL, an unresolvable name) ends
-    /// the probe at once; a 503 (loading — `llm.rs`'s `Health::Loading`,
-    /// `docs/INTEGRATIONS.md`'s policy for the same binary on :8080), a reset,
-    /// a timeout or a 5xx is something there, and is polled to the same
-    /// deadline (found on review).
-    pub fn available(&self) -> bool {
-        let deadline = std::time::Instant::now() + AVAILABLE_TIMEOUT;
+    /// **Only "nothing here" is a fast answer.** A refused connection, a 404
+    /// (ollama answers `/health` so — not llama-server), a malformed URL, an
+    /// unknown scheme or a name that does not resolve can never become a
+    /// loaded model: [`EmbedHealth::Absent`] at once. Everything else — a 503
+    /// while it loads, a reset or timeout from the socket's front end, a 5xx,
+    /// a bad status line — is something there, polled to the deadline and
+    /// reported as [`EmbedHealth::Failing`] if it never comes good.
+    pub fn health_within(&self, budget: Duration) -> EmbedHealth {
+        let deadline = std::time::Instant::now() + budget;
+        let mut last = String::from("no answer");
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return false;
+                return EmbedHealth::Failing(last);
             }
             match ureq::get(&format!("{}/health", self.base_url))
                 .timeout(left)
                 .call()
             {
-                Ok(_) => return true,
-                // Nothing listening, or something that is not llama-server
-                // (ollama answers /health 404): absent, and said at once.
-                Err(ureq::Error::Status(404, _)) => return false,
-                // A transport error is "something there" only if it is I/O —
-                // a reset, a timeout. A refused connection, a malformed URL,
-                // an unknown scheme or a name that does not resolve can never
-                // become a loaded model, so polling them for the whole
-                // deadline would turn a typo into a 20 s stall (found on
-                // review).
-                Err(ureq::Error::Transport(t)) if t.kind() != ureq::ErrorKind::Io => return false,
-                // Everything else is something *there*: a 503 while it
-                // loads, a reset or a timeout from the socket's front end
-                // during a cold start, a 5xx. `llm.rs`'s `Health::Unknown`
-                // keeps "there and failing" apart from "nothing here" for
-                // the same reason (found on review), so it is waited out to
-                // the deadline, never read as absence in a millisecond.
-                Err(_) => std::thread::sleep(Duration::from_millis(250).min(left)),
+                Ok(_) => return EmbedHealth::Ready,
+                Err(ureq::Error::Status(404, _)) => {
+                    return EmbedHealth::Absent("answers /health 404 — not llama-server".into())
+                }
+                Err(ureq::Error::Transport(t))
+                    if matches!(
+                        t.kind(),
+                        ureq::ErrorKind::ConnectionFailed
+                            | ureq::ErrorKind::InvalidUrl
+                            | ureq::ErrorKind::UnknownScheme
+                            | ureq::ErrorKind::Dns
+                    ) =>
+                {
+                    return EmbedHealth::Absent(t.to_string())
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    std::thread::sleep(Duration::from_millis(250).min(left));
+                }
             }
         }
     }
@@ -1013,6 +1035,56 @@ mod tests {
             timeout: Duration::from_secs(5),
         };
         assert!(e.available(), "a reset mid-start is not absence");
+    }
+
+    /// A server that holds the port and keeps failing is `Failing` — so a
+    /// caller can say "look at the one that is there" rather than advise
+    /// starting a second server over it.
+    #[test]
+    fn a_server_answering_502_is_failing_not_absent() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(matches!(
+            e.health_within(Duration::from_millis(800)),
+            EmbedHealth::Failing(_)
+        ));
+    }
+
+    #[test]
+    fn nothing_listening_is_absent() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = Embedder {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        assert!(matches!(
+            e.health_within(Duration::from_secs(5)),
+            EmbedHealth::Absent(_)
+        ));
     }
 
     /// A malformed URL can never become a loaded model: "no", at once.

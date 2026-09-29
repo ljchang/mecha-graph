@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake the model for nothing); it probes on each Ctrl-E, and says "semantic
   search unavailable" rather than labelling keyword results "semantic".
   Permanent errors — a malformed URL, an unresolvable host — are a fast "no".
+  `Embedder::health_within` keeps "nothing here" apart from "there and
+  failing", so `mecha-graph embed` no longer advises starting a second server
+  over one that holds the port. **Still quiet:** `kg_search` and `mecha-graph
+  query` return a keyword-only pack with no flag when the probe says no — the
+  pack's `flags` channel does not carry it yet.
 
 - **LLM calls against a llama-server router** (mecha's :8080 from
   2026-09-27): `served_model` read the router's placeholder `/props` alias
