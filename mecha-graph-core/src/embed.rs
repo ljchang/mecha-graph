@@ -252,8 +252,9 @@ impl Embedder {
     /// and every caller that gates on it (semantic search per query,
     /// `kg_search`, `embed`) quietly degraded to keyword-only.
     ///
-    /// **Only "nothing here" is a fast no.** A refused connection or a 404
-    /// ends the probe at once; a 503 (loading — `llm.rs`'s `Health::Loading`,
+    /// **Only "nothing here" is a fast no.** A refused connection, a 404 or a
+    /// transport error that is not I/O (a bad URL, an unresolvable name) ends
+    /// the probe at once; a 503 (loading — `llm.rs`'s `Health::Loading`,
     /// `docs/INTEGRATIONS.md`'s policy for the same binary on :8080), a reset,
     /// a timeout or a 5xx is something there, and is polled to the same
     /// deadline (found on review).
@@ -272,9 +273,13 @@ impl Embedder {
                 // Nothing listening, or something that is not llama-server
                 // (ollama answers /health 404): absent, and said at once.
                 Err(ureq::Error::Status(404, _)) => return false,
-                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::ConnectionFailed => {
-                    return false
-                }
+                // A transport error is "something there" only if it is I/O —
+                // a reset, a timeout. A refused connection, a malformed URL,
+                // an unknown scheme or a name that does not resolve can never
+                // become a loaded model, so polling them for the whole
+                // deadline would turn a typo into a 20 s stall (found on
+                // review).
+                Err(ureq::Error::Transport(t)) if t.kind() != ureq::ErrorKind::Io => return false,
                 // Everything else is something *there*: a 503 while it
                 // loads, a reset or a timeout from the socket's front end
                 // during a cold start, a 5xx. `llm.rs`'s `Health::Unknown`
@@ -1008,6 +1013,21 @@ mod tests {
             timeout: Duration::from_secs(5),
         };
         assert!(e.available(), "a reset mid-start is not absence");
+    }
+
+    /// A malformed URL can never become a loaded model: "no", at once.
+    #[test]
+    fn available_is_a_fast_no_for_a_malformed_url() {
+        let e = Embedder {
+            base_url: "http//127.0.0.1:8081".into(),
+            model: "test-embed".into(),
+            dims: 4,
+            max_chars: 1000,
+            timeout: Duration::from_secs(5),
+        };
+        let t = std::time::Instant::now();
+        assert!(!e.available());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     /// The other direction: nothing listening is "no", at once — not after

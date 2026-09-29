@@ -66,7 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer re-probes per arm: the caller's gate is the probe, so one query waits
   at most once, and an embedder that dies mid-run is an error rather than a
   silently empty vector arm. In the TUI that error is a status line over the
-  keyword results — a sleeping server never closes the session.
+  keyword results — a sleeping server never closes the session. The TUI no
+  longer probes at launch (it would add the cold start to every launch and
+  wake the model for nothing); it probes on each Ctrl-E, and says "semantic
+  search unavailable" rather than labelling keyword results "semantic".
+  Permanent errors — a malformed URL, an unresolvable host — are a fast "no".
 
 - **LLM calls against a llama-server router** (mecha's :8080 from
   2026-09-27): `served_model` read the router's placeholder `/props` alias

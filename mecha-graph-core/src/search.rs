@@ -164,11 +164,11 @@ pub fn known_sources(conn: &Connection) -> Result<Vec<String>> {
 /// each collapse the candidate set first and intersect when combined (§8.1
 /// filter-first); `include_private` gates the §10 sensitivity tiers (default
 /// retrieval excludes private+).
-#[allow(clippy::too_many_arguments)]
 ///
 /// `Some(embedder)` means the caller already probed it with
 /// [`Embedder::available`]; a failure to embed is an error, not an empty
 /// vector arm.
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_episodes(
     conn: &Connection,
     embedder: Option<&Embedder>,

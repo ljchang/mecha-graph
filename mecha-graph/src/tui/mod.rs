@@ -469,8 +469,11 @@ fn empty_fact_fields() -> Vec<(&'static str, LineEdit)> {
 }
 
 pub fn run(conn: Connection, db_path: std::path::PathBuf) -> mecha_graph_core::Result<()> {
-    let embedder = mecha_graph_core::embed::Embedder::default();
-    let embedder = embedder.available().then_some(embedder);
+    // Not probed here: the embedding server runs on demand, so a probe at
+    // launch would add its cold start to every `mecha-graph tui` and load
+    // the model for someone who never presses Ctrl-E. `run_search` probes
+    // when a semantic search is asked for (found on review).
+    let embedder = Some(mecha_graph_core::embed::Embedder::default());
 
     let mut app = App {
         conn,
@@ -863,7 +866,15 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
         app.search.list.select(if n == 0 { None } else { Some(0) });
         return Ok(());
     }
-    let embedder = if deep { app.embedder.as_ref() } else { None };
+    // Probed per semantic search, not once at launch: the server sleeps after
+    // ten idle minutes, so an answer from startup is stale by design. The
+    // first Ctrl-E pays the cold start; the ones after it find it awake.
+    let embedder = if deep {
+        app.embedder.as_ref().filter(|e| e.available())
+    } else {
+        None
+    };
+    let unavailable = deep && embedder.is_none();
     let started = std::time::Instant::now();
     let run = |embedder| {
         router::query(
@@ -876,28 +887,34 @@ fn run_search(app: &mut App, deep: bool) -> mecha_graph_core::Result<()> {
             Some("tui.search"),
         )
     };
-    // The embedder was probed once, at startup, and the server behind it
-    // sleeps after ten idle minutes — so a semantic search can fail on a
-    // stale `Some`. That is a status line and the keyword results, never an
-    // error out of the event loop: `reload_groups`'s convention, and the TUI
-    // is the correction channel a sleeping server must not close (found on
-    // review).
+    // A server that answered the probe and then failed to embed is a status
+    // line and the keyword results, never an error out of the event loop:
+    // `reload_groups`'s convention, and the TUI is the correction channel a
+    // sleeping server must not close (found on review). Only an embedding
+    // failure is caught — a locked database is not the embedder's fault.
     let (pack, semantic_failed) = match run(embedder) {
         Ok(pack) => (pack, None),
-        Err(e) if embedder.is_some() => (run(None)?, Some(e)),
+        Err(e @ mecha_graph_core::Error::Embed(_)) if embedder.is_some() => (run(None)?, Some(e)),
         Err(e) => return Err(e),
     };
-    app.search.mode = if deep && semantic_failed.is_none() {
+    // "semantic" only when a vector arm actually ran — never over keyword
+    // results, which would be a claim, not just silence.
+    app.search.mode = if embedder.is_some() && semantic_failed.is_none() {
         "semantic"
     } else {
         "live"
     };
-    app.status = match &semantic_failed {
-        Some(e) => format!(
+    app.status = match (&semantic_failed, unavailable) {
+        (Some(e), _) => format!(
             "semantic search failed ({e}) — showing {} keyword items instead",
             pack.items.len()
         ),
-        None => format!(
+        (None, true) => format!(
+            "semantic search unavailable — the embedding server is not answering; \
+             showing {} keyword items",
+            pack.items.len()
+        ),
+        (None, false) => format!(
             "{} items · intent {:?} · {} · {:.0}ms — Ctrl-E semantic search",
             pack.items.len(),
             pack.intent,
